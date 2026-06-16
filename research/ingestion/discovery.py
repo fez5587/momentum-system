@@ -15,6 +15,7 @@ silent — they land as queryable rows in Postgres.
 
 from __future__ import annotations
 
+import os
 import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
@@ -35,21 +36,59 @@ class DiscoveryResult:
     errors: list[str] = field(default_factory=list)
 
 
+# Common leveraged / inverse ETFs & ETNs. The strategy targets small-cap stocks,
+# not these; they pollute a sub-$20 most-actives screen. Extend via DISCOVER_EXCLUDE.
+LEVERAGED_ETFS = {
+    "SOXL", "SOXS", "TQQQ", "SQQQ", "TNA", "TZA", "SPXL", "SPXS", "SPXU", "UPRO",
+    "UVXY", "SVXY", "VIXY", "TSLL", "TSLQ", "TSLS", "TSLZ", "NVDL", "NVD", "NVDU",
+    "NVDD", "BITO", "BITX", "BITI", "ETHU", "ETHD", "FNGU", "FNGD", "LABU", "LABD",
+    "YINN", "YANG", "FAS", "FAZ", "UDOW", "SDOW", "TMF", "TMV", "BOIL", "KOLD",
+    "UCO", "SCO", "JNUG", "JDST", "NUGT", "DUST", "GUSH", "DRIP", "MSTU", "MSTX",
+    "MSTZ", "CONL", "AMDL", "GGLL", "AAPU", "AAPD", "AMZU", "METU", "QQQU",
+}
+
+
+def _excluded_symbols() -> set[str]:
+    extra = {
+        s.strip().upper()
+        for s in os.environ.get("DISCOVER_EXCLUDE", "").split(",")
+        if s.strip()
+    }
+    return LEVERAGED_ETFS | extra
+
+
 def screen_universe(
     client,
     price_min: float = 1.0,
     price_max: float = 20.0,
     top: int = 20,
+    exclude_etfs: bool = True,
+    retries: int = 3,
 ) -> list[str]:
-    """The sub-$20 most-actives universe (empty list if the screener is down)."""
+    """Sub-$20 most-actives universe with leveraged ETFs filtered out.
+
+    Retries on a transient empty result (the screener can briefly rate-limit),
+    so a hiccup doesn't collapse the watchlist. Returns an empty list only if
+    the screener stays unavailable; the caller then uses its own fallback.
+    Requests extra headroom so we still land ~`top` stocks after the ETF filter.
+    """
     if client is None:
         return []
-    try:
-        return discover_active_symbols(
-            client, top=top, price_min=price_min, price_max=price_max
-        )
-    except Exception:  # noqa: BLE001 - screener can need a paid feed
-        return []
+    names: list[str] = []
+    for attempt in range(max(1, retries)):
+        try:
+            names = discover_active_symbols(
+                client, top=top * 2, price_min=price_min, price_max=price_max
+            )
+        except Exception:  # noqa: BLE001 - screener can need a paid feed
+            names = []
+        if names:
+            break
+        if attempt < retries - 1:
+            time.sleep(1.5)
+    if exclude_etfs and names:
+        names = [s for s in names if s not in _excluded_symbols()]
+    return names[:top]
 
 
 def run_discovery(

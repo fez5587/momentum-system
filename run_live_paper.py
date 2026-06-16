@@ -54,7 +54,13 @@ from storage.event_store import EventStore
 from trading_execution import ExecutionSettings, TradingExecutionService
 from trading_mode import TradingModeSettings
 
-DEFAULT_SYMBOLS = ["AAPL", "TSLA", "AMD", "NVDA", "SNDL"]
+# Fallback watchlist used ONLY if the sub-$20 screener is unavailable. Liquid
+# small-caps that usually sit in the $1-20 band — NOT mega-caps (which the
+# watcher's price band would just filter out, leaving nothing to trade).
+DEFAULT_SYMBOLS = [
+    "SOFI", "GRAB", "NU", "AAL", "PLUG", "RIOT",
+    "MARA", "SNDL", "ACHR", "NOK", "SOUN", "BBAI",
+]
 
 
 def _flag(name: str, default: str = "1") -> bool:

@@ -137,6 +137,8 @@ class TradingExecutionService:
         # armed (submitted, awaiting fill) entries we may need to cancel.
         # order_id -> {symbol, entry_price, broker_order_id, armed_at, checks}
         self._armed: dict[str, dict] = {}
+        # daily-loss circuit breaker: once tripped, no new entries this session
+        self._halted = False
 
     # -- pipeline -----------------------------------------------------------
 
@@ -160,9 +162,60 @@ class TradingExecutionService:
             if p.get("symbol")
         }
 
+    def _daily_loss_breach(self) -> bool:
+        """True once the day's loss hits the circuit-breaker threshold.
+
+        Compares broker account equity to the prior-session close
+        (account.last_equity). Once tripped, stays tripped for the session so a
+        bounce can't re-open the floodgates. If equity can't be read, does NOT
+        block (fail-open on a data hiccup, not on a real loss).
+        """
+        if self._halted:
+            return True
+        max_loss = abs(float(self.settings.max_daily_loss_pct or 0.0))
+        if max_loss <= 0:
+            return False
+        client = getattr(self.executor, "client", None)
+        if client is None:
+            return False
+        try:
+            acct = client.get_account()
+            equity = float(acct.get("equity"))
+            baseline = float(acct.get("last_equity") or equity)
+        except Exception:  # noqa: BLE001 - don't halt trading on a data hiccup
+            return False
+        if baseline <= 0:
+            return False
+        pnl_pct = (equity - baseline) / baseline
+        if pnl_pct <= -max_loss:
+            self._halted = True
+            self.store.emit(
+                RiskRuleTriggeredEvent(
+                    timestamp=datetime.now(),
+                    mode=self.mode,
+                    correlation_id=self.session_id,
+                    message=(
+                        f"Daily-loss circuit breaker tripped: {pnl_pct:+.2%} "
+                        f"(limit -{max_loss:.0%}) — halting new entries"
+                    ),
+                    rule_type="daily_loss",
+                    rule_value=max_loss,
+                    current_state={
+                        "equity": equity,
+                        "baseline_equity": baseline,
+                        "pnl_pct": round(pnl_pct, 4),
+                    },
+                    action_taken="halted_new_entries",
+                )
+            )
+        return self._halted
+
     def request_approvals_for_ready_signals(self) -> list[str]:
         """Turn fresh ready signals into approval requests. Returns order ids."""
         if not self.settings.enabled:
+            return []
+
+        if self._daily_loss_breach():
             return []
 
         if self._open_position_count() >= self.settings.max_concurrent_positions:
