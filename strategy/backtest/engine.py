@@ -64,6 +64,9 @@ class BacktestEngine:
         target_r: float = 2.0,
         warmup_bars: int = 15,
         eval_every: int = 5,
+        ready_score_pct: float = 60.0,
+        criteria=None,
+        min_bars: int = 10,
     ):
         self.config = config or Config()
         self.bt: BacktestConfig = self.config.backtest
@@ -71,6 +74,9 @@ class BacktestEngine:
         self.target_r = target_r
         self.warmup_bars = warmup_bars
         self.eval_every = eval_every
+        self.ready_score_pct = ready_score_pct
+        self.criteria = criteria
+        self.min_bars = min_bars
 
     def _entry_costs(self, price: float, quantity: int) -> tuple[float, float]:
         slip = price * self.bt.slippage.base_spread_pct
@@ -136,6 +142,9 @@ class BacktestEngine:
                     previous_close=previous_close,
                     avg_daily_volume=avg_daily_volume,
                     evaluation_time=eval_time,
+                    ready_score_pct=self.ready_score_pct,
+                    criteria=self.criteria,
+                    min_bars=self.min_bars,
                 )
                 result.evaluations += 1
                 if evaluation.status == "ready" and evaluation.setups:

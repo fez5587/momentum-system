@@ -36,6 +36,7 @@ def evaluate_setup(
     evaluation_time: datetime | None = None,
     entry_cutoff: EntryCutoffConfig | None = None,
     ready_score_pct: float = 60.0,
+    min_bars: int = MIN_BARS,
 ) -> SetupEvaluationResult:
     """Evaluate a symbol's session bars for a momentum setup.
 
@@ -48,9 +49,9 @@ def evaluate_setup(
     weights = weights or CriteriaWeights()
     evaluation_time = evaluation_time or datetime.now()
 
-    if bars is None or bars.empty or len(bars) < MIN_BARS:
+    if bars is None or bars.empty or len(bars) < min_bars:
         return _blocked(
-            reason=f"insufficient_data ({0 if bars is None else len(bars)} bars, need {MIN_BARS})",
+            reason=f"insufficient_data ({0 if bars is None else len(bars)} bars, need {min_bars})",
             evaluation_time=evaluation_time,
         )
 

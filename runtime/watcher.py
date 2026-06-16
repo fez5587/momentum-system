@@ -187,6 +187,7 @@ class Watcher:
                     avg_daily_volume=candidate.avg_daily_volume,
                     ready_score_pct=self.config.ready_score_pct,
                     evaluation_time=eval_time,
+                    min_bars=self.config.min_bars,
                 )
                 result.evaluated += 1
 
