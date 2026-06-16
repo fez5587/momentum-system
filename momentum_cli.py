@@ -286,17 +286,80 @@ def inspect_criteria(symbol: str):
         return
     ts, payload = rows[0]
     p = json.loads(payload)
-    console.print(f"[bold]{symbol.upper()}[/bold]  score={p.get('success_score_pct')}%  "
-                  f"passed={p.get('passed_criteria')}/{p.get('total_criteria')}  [dim]{ts}[/dim]")
     cr = p.get("criteria_results", {})
+    status = cr.get("status", "?")
+    sc = {"ready": "green", "blocked": "red", "late": "yellow"}.get(status, "white")
+    gap = cr.get("gap_pct")
+    rvol = cr.get("relative_volume")
+    gap_s = f"{gap:+.1%}" if isinstance(gap, (int, float)) else str(gap)
+    rvol_s = f"{rvol:.1f}x" if isinstance(rvol, (int, float)) else str(rvol)
+    console.print(
+        f"[bold]{symbol.upper()}[/bold]  [{sc}]{status.upper()}[/{sc}]  "
+        f"score={p.get('success_score_pct')}%  passed={p.get('passed_criteria')}/{p.get('total_criteria')}  "
+        f"gap={gap_s}  rvol={rvol_s}  [dim]{ts}[/dim]"
+    )
+    if cr.get("reason"):
+        console.print(f"[dim]reason:[/dim] {cr['reason']}")
     table = Table(box=box.SIMPLE)
     table.add_column("criterion", style="bold")
     table.add_column("result")
-    if isinstance(cr, dict):
-        for name, val in cr.items():
-            ok = val if isinstance(val, bool) else bool(val)
-            table.add_row(name, "[green]pass[/green]" if ok else "[red]fail[/red]")
+    table.add_column("reason", overflow="fold")
+    detail = cr.get("detail", [])
+    if detail:
+        for d in detail:
+            ok = d.get("passed")
+            table.add_row(d.get("name", "?"),
+                          "[green]pass[/green]" if ok else "[red]fail[/red]",
+                          d.get("reason") or "")
+    else:  # older events without detail
+        for n in cr.get("passed", []):
+            table.add_row(n, "[green]pass[/green]", "")
+        for n in cr.get("failed", []):
+            table.add_row(n, "[red]fail[/red]", "")
     console.print(table)
+
+
+@inspect_app.command("signals")
+def inspect_signals(limit: int = 25):
+    """Ready signals + the latest per-symbol evaluation board (gap/rvol/status)."""
+    con = _con()
+    console.print("[bold]READY signals[/bold]")
+    rows = con.execute(
+        "SELECT timestamp, message FROM events WHERE event_type='signal_ready' "
+        "ORDER BY timestamp DESC LIMIT ?", [limit]).fetchall()
+    if rows:
+        t = Table(box=box.SIMPLE)
+        t.add_column("time", style="cyan"); t.add_column("signal")
+        for ts, msg in rows:
+            t.add_row(str(ts), msg or "")
+        console.print(t)
+    else:
+        console.print("[yellow]no ready signals yet (none, or after the 10:30 ET cutoff)[/yellow]")
+
+    console.print("\n[bold]latest evaluations[/bold] (most recent per symbol)")
+    rows = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='criteria_evaluated' "
+        "ORDER BY timestamp DESC LIMIT 400").fetchall()
+    seen: dict = {}
+    for (pj,) in rows:
+        p = json.loads(pj)
+        sym = p.get("symbol")
+        if sym and sym not in seen:
+            cr = p.get("criteria_results", {})
+            seen[sym] = (p.get("success_score_pct") or 0, cr.get("status"),
+                         cr.get("gap_pct"), cr.get("relative_volume"))
+    if not seen:
+        console.print("[yellow]no evaluations yet (needs minute bars + a watcher pass)[/yellow]")
+        return
+    t = Table(box=box.SIMPLE)
+    for c in ("symbol", "status", "score", "gap", "rvol"):
+        t.add_column(c, justify="left" if c == "symbol" else "right")
+    for sym, (score, status, gap, rvol) in sorted(seen.items(), key=lambda x: -(x[1][0] or 0)):
+        color = {"ready": "green", "late": "yellow", "blocked": "red"}.get(status, "white")
+        t.add_row(sym, f"[{color}]{status}[/{color}]", f"{score}%",
+                  f"{gap:+.1%}" if isinstance(gap, (int, float)) else str(gap),
+                  f"{rvol:.1f}x" if isinstance(rvol, (int, float)) else str(rvol))
+    console.print(t)
 
 
 if __name__ == "__main__":

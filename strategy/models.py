@@ -71,3 +71,7 @@ class SetupEvaluationResult(BaseModel):
         default_factory=list, description="Names of failed criteria"
     )
     setups: list[dict] = Field(default_factory=list, description="Detected setups")
+    criteria_detail: list[dict] = Field(
+        default_factory=list,
+        description="Per-criterion breakdown: {name, passed, reason}",
+    )

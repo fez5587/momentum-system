@@ -204,6 +204,11 @@ class Watcher:
                         criteria_results={
                             "passed": evaluation.criteria_names_passed,
                             "failed": evaluation.criteria_names_failed,
+                            "detail": evaluation.criteria_detail,
+                            "gap_pct": evaluation.gap_pct,
+                            "relative_volume": evaluation.relative_volume,
+                            "status": evaluation.status,
+                            "reason": evaluation.reason,
                         },
                         total_criteria=evaluation.criteria_total,
                         passed_criteria=evaluation.criteria_passed,
@@ -212,6 +217,9 @@ class Watcher:
                             "symbol": symbol,
                             "success_score_pct": evaluation.success_score_pct,
                             "status": evaluation.status,
+                            "reason": evaluation.reason,
+                            "gap_pct": evaluation.gap_pct,
+                            "relative_volume": evaluation.relative_volume,
                         },
                     )
                 )

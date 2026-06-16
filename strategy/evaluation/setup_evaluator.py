@@ -166,6 +166,9 @@ def evaluate_setup(
         success_score_pct=round(score_pct, 2),
         criteria_names_passed=passed_names,
         criteria_names_failed=failed_names,
+        criteria_detail=[
+            {"name": r.name, "passed": r.passed, "reason": r.reason} for r in results
+        ],
         setups=setups,
     )
 
