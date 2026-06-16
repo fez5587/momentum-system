@@ -65,6 +65,12 @@ class AlpacaPaperClient:
     def _data(self, method: str, path: str, **kw):
         return self._request(method, f"{self.settings.data_base_url}{path}", **kw)
 
+    @staticmethod
+    def _chunked(items: list[str], size: int = 100):
+        """Yield symbol batches; Alpaca caps multi-symbol requests (~100)."""
+        for i in range(0, len(items), size):
+            yield items[i : i + size]
+
     # -- trading API -------------------------------------------------------
 
     def get_account(self) -> dict:
@@ -127,35 +133,39 @@ class AlpacaPaperClient:
         limit: int = 10_000,
         feed: str | None = None,
     ) -> dict[str, list[dict]]:
-        """Fetch 1-minute bars for symbols, following pagination tokens."""
+        """Fetch 1-minute bars, batching symbols (cap-safe) + following pagination."""
         all_bars: dict[str, list[dict]] = {s: [] for s in symbols}
-        page_token = None
-        while True:
-            params = {
-                "symbols": ",".join(symbols),
-                "timeframe": "1Min",
-                "start": start_iso,
-                "end": end_iso,
-                "limit": limit,
-                "feed": feed or self.settings.feed,
-                "adjustment": "raw",
-                "page_token": page_token,
-            }
-            payload = self._data("GET", "/v2/stocks/bars", params=params)
-            for symbol, bars in (payload.get("bars") or {}).items():
-                all_bars.setdefault(symbol, []).extend(bars or [])
-            page_token = payload.get("next_page_token")
-            if not page_token:
-                break
+        for chunk in self._chunked(symbols, 100):
+            page_token = None
+            while True:
+                params = {
+                    "symbols": ",".join(chunk),
+                    "timeframe": "1Min",
+                    "start": start_iso,
+                    "end": end_iso,
+                    "limit": limit,
+                    "feed": feed or self.settings.feed,
+                    "adjustment": "raw",
+                    "page_token": page_token,
+                }
+                payload = self._data("GET", "/v2/stocks/bars", params=params)
+                for symbol, bars in (payload.get("bars") or {}).items():
+                    all_bars.setdefault(symbol, []).extend(bars or [])
+                page_token = payload.get("next_page_token")
+                if not page_token:
+                    break
         return all_bars
 
     def get_latest_trades(self, symbols: list[str]) -> dict[str, dict]:
-        payload = self._data(
-            "GET",
-            "/v2/stocks/trades/latest",
-            params={"symbols": ",".join(symbols), "feed": self.settings.feed},
-        )
-        return payload.get("trades") or {}
+        trades: dict[str, dict] = {}
+        for chunk in self._chunked(symbols, 100):
+            payload = self._data(
+                "GET",
+                "/v2/stocks/trades/latest",
+                params={"symbols": ",".join(chunk), "feed": self.settings.feed},
+            )
+            trades.update(payload.get("trades") or {})
+        return trades
 
     def get_most_actives(self, top: int = 20, by: str = "volume") -> list[dict]:
         payload = self._data(
@@ -168,17 +178,28 @@ class AlpacaPaperClient:
     def get_daily_bars(
         self, symbols: list[str], start_iso: str, end_iso: str | None = None
     ) -> dict[str, list[dict]]:
-        payload = self._data(
-            "GET",
-            "/v2/stocks/bars",
-            params={
-                "symbols": ",".join(symbols),
-                "timeframe": "1Day",
-                "start": start_iso,
-                "end": end_iso,
-                "limit": 10_000,
-                "feed": self.settings.feed,
-                "adjustment": "raw",
-            },
-        )
-        return payload.get("bars") or {}
+        """Daily bars, batching symbols (cap-safe) + following pagination."""
+        all_bars: dict[str, list[dict]] = {}
+        for chunk in self._chunked(symbols, 100):
+            page_token = None
+            while True:
+                payload = self._data(
+                    "GET",
+                    "/v2/stocks/bars",
+                    params={
+                        "symbols": ",".join(chunk),
+                        "timeframe": "1Day",
+                        "start": start_iso,
+                        "end": end_iso,
+                        "limit": 10_000,
+                        "feed": self.settings.feed,
+                        "adjustment": "raw",
+                        "page_token": page_token,
+                    },
+                )
+                for symbol, bars in (payload.get("bars") or {}).items():
+                    all_bars.setdefault(symbol, []).extend(bars or [])
+                page_token = payload.get("next_page_token")
+                if not page_token:
+                    break
+        return all_bars

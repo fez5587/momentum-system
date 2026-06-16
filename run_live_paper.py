@@ -373,6 +373,12 @@ def main(argv: list[str] | None = None) -> int:
         # pulls their bars and the watcher evaluates them
         added = [s for s in res.universe if s not in symbols]
         symbols.extend(added)
+        # Keep the watchlist BOUNDED so it rotates toward current movers instead
+        # of growing all session. (Ingestion is now batched so an over-cap list
+        # no longer 400s, but an unbounded list is still wasteful and stale.)
+        max_uni = int(os.environ.get("WATCHER_MAX_UNIVERSE", "80"))
+        if len(symbols) > max_uni:
+            del symbols[: len(symbols) - max_uni]
         return (f"universe={len(res.universe)} gappers={len(res.gappers)}"
                 + (f" +{len(added)} new" if added else ""))
 
