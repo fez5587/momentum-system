@@ -13,7 +13,7 @@ def store_setup_event(con, symbol: str, session_date, result: dict) -> str:
     best = setups[0] if setups else {}
     con.execute(
         """
-        INSERT OR REPLACE INTO setup_events
+        INSERT INTO setup_events
             (setup_id, symbol, setup_time, session_date, setup_name,
              entry_reference_price, invalidation_price, gap_pct, relative_volume)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)

@@ -65,6 +65,23 @@ def _now_session_date():
     return session_date
 
 
+def _db_target_desc() -> str:
+    """Human-readable Postgres target for the boot log (password masked)."""
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        if "://" in url and "@" in url:
+            scheme, rest = url.split("://", 1)
+            creds, host = rest.split("@", 1)
+            user = creds.split(":", 1)[0]
+            return f"{scheme}://{user}:***@{host}"
+        return url
+    host = os.environ.get("PGHOST", "localhost")
+    port = os.environ.get("PGPORT", "5432")
+    db = os.environ.get("PGDATABASE", "momentum")
+    user = os.environ.get("PGUSER", "")
+    return f"postgresql://{user}@{host}:{port}/{db}"
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Momentum live paper-trading loop")
     parser.add_argument("--once", action="store_true", help="run one pass and exit")
@@ -188,7 +205,7 @@ def main(argv: list[str] | None = None) -> int:
     symbols: list[str] = rt["symbols"]
     client = rt["client"]
 
-    print(f"[boot] session={rt['session_id']} event_db={rt['event_db']}")
+    print(f"[boot] session={rt['session_id']} db={_db_target_desc()}")
     print(f"[boot] watching: {', '.join(symbols)}")
     if not rt["has_keys"]:
         print("[boot] no ALPACA_API_KEY/SECRET — dry mode: ingestion, sync and "
