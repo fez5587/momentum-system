@@ -130,6 +130,16 @@ class AlpacaPaperExecutor:
 
         broker_order_id = raw.get("id")
         status = raw.get("status")
+
+        # An empty/odd 200 body with no order id is not a real submission — don't
+        # return ok=True and let it be armed as an untrackable resting order.
+        if not broker_order_id:
+            self._emit_cancelled(request, f"broker returned no order id (status={status})")
+            return ExecutionResult(
+                ok=False, order_id=request.order_id, status="error",
+                error="no broker order id", raw=raw,
+            )
+
         self.store.emit(
             OrderSubmittedEvent(
                 timestamp=datetime.now(),
@@ -156,25 +166,38 @@ class AlpacaPaperExecutor:
             )
         )
 
-        if status == "filled":
+        # Record ANY fill (partial or full), not only an exact 'filled' status,
+        # so positions / P&L never under-report real shares.
+        filled_qty = int(float(raw.get("filled_qty") or 0))
+        if filled_qty > 0:
             fill_price = float(raw.get("filled_avg_price") or 0) or None
             self.store.emit(
                 OrderFilledEvent(
                     timestamp=datetime.now(),
                     mode=self.mode,
                     correlation_id=self.session_id,
-                    message=f"Filled {request.symbol} @ {fill_price}",
+                    message=f"Filled {request.symbol} {filled_qty} @ {fill_price}",
                     symbol=request.symbol,
                     order_id=request.order_id,
                     fill_price=fill_price or 0.0,
-                    fill_quantity=int(float(raw.get("filled_qty") or 0)),
+                    fill_quantity=filled_qty,
                     payload={
                         "symbol": request.symbol,
                         "order_id": request.order_id,
                         "fill_price": fill_price,
-                        "fill_quantity": int(float(raw.get("filled_qty") or 0)),
+                        "fill_quantity": filled_qty,
                     },
                 )
+            )
+
+        # Terminal-failure statuses are NOT live orders: report ok=False so the
+        # caller never arms a rejected/expired order as a resting entry.
+        if status in {"rejected", "canceled", "cancelled", "expired",
+                      "done_for_day", "suspended", "stopped"}:
+            self._emit_cancelled(request, f"broker {status}")
+            return ExecutionResult(
+                ok=False, order_id=request.order_id,
+                broker_order_id=broker_order_id, status=status, raw=raw,
             )
 
         return ExecutionResult(

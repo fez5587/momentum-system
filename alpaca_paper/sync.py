@@ -14,6 +14,7 @@ from storage.event_schema import (
     AccountOrdersUpdatedEvent,
     AccountPositionsUpdatedEvent,
     AccountSummaryUpdatedEvent,
+    BrokerHealthChangedEvent,
     EventMode,
 )
 from storage.event_store import EventStore
@@ -36,11 +37,27 @@ class AlpacaPaperSync:
         self.session_id = session_id
         self.mode = mode
 
+    def _emit_health(self, reason: str) -> None:
+        """Make a broker sync failure VISIBLE (else stale snapshots look current)."""
+        self.store.emit(
+            BrokerHealthChangedEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=f"alpaca_paper sync degraded: {reason}",
+                broker_name=BROKER_NAME,
+                previous_health="healthy",
+                new_health="degraded",
+                health_reason=reason,
+            )
+        )
+
     def sync_account(self) -> dict | None:
         try:
             account = self.client.get_account()
-        except Exception:
+        except Exception as exc:
             logger.exception("alpaca account sync failed")
+            self._emit_health(f"account: {exc}")
             return None
         account_id = str(account.get("account_number") or account.get("id") or "paper")
         self.store.emit(
@@ -63,8 +80,9 @@ class AlpacaPaperSync:
     def sync_positions(self) -> list[dict] | None:
         try:
             raw = self.client.get_positions()
-        except Exception:
+        except Exception as exc:
             logger.exception("alpaca positions sync failed")
+            self._emit_health(f"positions: {exc}")
             return None
         positions = [
             {
@@ -95,8 +113,9 @@ class AlpacaPaperSync:
     def sync_orders(self, status: str = "all", limit: int = 50) -> list[dict] | None:
         try:
             raw = self.client.get_orders(status=status, limit=limit)
-        except Exception:
+        except Exception as exc:
             logger.exception("alpaca orders sync failed")
+            self._emit_health(f"orders: {exc}")
             return None
         orders = [
             {

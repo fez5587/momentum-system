@@ -335,8 +335,9 @@ def main(argv: list[str] | None = None) -> int:
     def step_sync():
         if not rt["sync"]:
             return "skipped (no keys)"
-        rt["sync"].sync_all()
-        return "ok"
+        res = rt["sync"].sync_all()
+        failed = [k for k, v in res.items() if v is None]
+        return "ok" if not failed else f"DEGRADED ({', '.join(failed)})"
 
     def step_execute():
         if not rt["execution"]:

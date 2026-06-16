@@ -142,6 +142,8 @@ class TradingExecutionService:
         self._armed: dict[str, dict] = {}
         # daily-loss circuit breaker: once tripped, no new entries this session
         self._halted = False
+        # consecutive equity-read failures; after a few we fail CLOSED (halt)
+        self._equity_read_failures = 0
 
     # -- pipeline -----------------------------------------------------------
 
@@ -189,10 +191,12 @@ class TradingExecutionService:
         # 2) market-close open positions
         client = getattr(self.executor, "client", None)
         for symbol in sorted(self._held_symbols()):
+            if client is None or not hasattr(client, "close_position"):
+                result["errors"].append(f"close {symbol}: no broker client to flatten")
+                continue
             try:
-                if client is not None and hasattr(client, "close_position"):
-                    client.close_position(symbol)
-                result["closed_positions"].append(symbol)
+                client.close_position(symbol)
+                result["closed_positions"].append(symbol)  # only on a confirmed close
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(f"close {symbol}: {exc}")
         return result
@@ -215,10 +219,38 @@ class TradingExecutionService:
             return False
         try:
             acct = client.get_account()
-            equity = float(acct.get("equity"))
+            equity_raw = acct.get("equity")
+            if equity_raw is None:
+                raise ValueError("account 'equity' field missing")
+            equity = float(equity_raw)
             baseline = float(acct.get("last_equity") or equity)
-        except Exception:  # noqa: BLE001 - don't halt trading on a data hiccup
-            return False
+            self._equity_read_failures = 0
+        except Exception as exc:  # noqa: BLE001
+            self._equity_read_failures += 1
+            logger.warning(
+                "equity read failed (%d consecutive): %s",
+                self._equity_read_failures, exc,
+            )
+            # FAIL CLOSED: if equity is unreadable repeatedly, stop opening risk
+            # rather than silently disabling the most important safety control.
+            if self._equity_read_failures >= 3 and not self._halted:
+                self._halted = True
+                self.store.emit(
+                    RiskRuleTriggeredEvent(
+                        timestamp=datetime.now(),
+                        mode=self.mode,
+                        correlation_id=self.session_id,
+                        message=(
+                            f"Equity unreadable {self._equity_read_failures}x — "
+                            "failing CLOSED, halting new entries"
+                        ),
+                        rule_type="equity_unreadable",
+                        rule_value=float(self._equity_read_failures),
+                        current_state={"failures": self._equity_read_failures},
+                        action_taken="halted_new_entries",
+                    )
+                )
+            return self._halted
         if baseline <= 0:
             return False
         pnl_pct = (equity - baseline) / baseline
@@ -230,13 +262,18 @@ class TradingExecutionService:
                 else {"closed_positions": [], "cancelled_entries": 0}
             )
             extra = ""
+            action = "halted_new_entries"
             if self.settings.flatten_on_breach:
                 n_closed = len(flat["closed_positions"])
                 n_cancel = flat["cancelled_entries"]
+                flat_errs = flat.get("errors") or []
                 extra = (
                     f" — flattened {n_closed} position(s), "
                     f"cancelled {n_cancel} unfilled entr{'y' if n_cancel == 1 else 'ies'}"
                 )
+                if flat_errs:
+                    extra += f"; FLATTEN INCOMPLETE: {flat_errs}"
+                action = "halted_flatten_incomplete" if flat_errs else "halted_and_flattened"
             self.store.emit(
                 RiskRuleTriggeredEvent(
                     timestamp=datetime.now(),
@@ -254,9 +291,7 @@ class TradingExecutionService:
                         "pnl_pct": round(pnl_pct, 4),
                         "flatten": flat,
                     },
-                    action_taken="halted_and_flattened"
-                    if self.settings.flatten_on_breach
-                    else "halted_new_entries",
+                    action_taken=action,
                 )
             )
         return self._halted
@@ -374,7 +409,14 @@ class TradingExecutionService:
         # If the entry didn't fill immediately (a resting limit at the trigger),
         # arm it so expire_stale_entries() can back out on timeout or a break
         # below the entry. Market orders that fill on submit are never armed.
-        if result.ok and result.status not in {"filled", "cancelled"} and request.entry_price:
+        # Only arm genuinely OPEN resting entries — never a filled, partial, or
+        # rejected order (a rejected entry would otherwise occupy a position slot
+        # forever and a partial would be backed out while real shares are held).
+        if (
+            result.ok
+            and result.status in {"new", "accepted", "pending_new", "held", "accepted_for_bidding"}
+            and request.entry_price
+        ):
             self._armed[order_id] = {
                 "symbol": request.symbol,
                 "entry_price": float(request.entry_price),
@@ -435,6 +477,23 @@ class TradingExecutionService:
                     quantity = int(abs(float(p.get("quantity") or 0)))
         if symbol not in held or not quantity:
             return {"ok": False, "error": f"no open position for {symbol}"}
+        # Prefer close_position: closes the FULL position regardless of long/short
+        # sign and fractional qty. A plain 'sell' of abs(qty) would DOUBLE a short
+        # position, and int-truncation would leave residual shares un-flat.
+        client = getattr(self.executor, "client", None)
+        if client is not None and hasattr(client, "close_position"):
+            try:
+                raw = client.close_position(symbol) or {}
+                return {
+                    "ok": True,
+                    "order_id": str(raw.get("id") or f"close-{symbol}"),
+                    "broker_order_id": raw.get("id"),
+                    "status": raw.get("status") or "closing",
+                    "error": None,
+                    "reason": reason,
+                }
+            except Exception as exc:  # noqa: BLE001
+                return {"ok": False, "error": str(exc), "reason": reason}
         request = ExecutionRequest(symbol=symbol, side="sell", quantity=quantity)
         result = self.executor.execute(request)
         return {

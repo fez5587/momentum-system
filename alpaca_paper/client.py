@@ -79,9 +79,14 @@ class AlpacaPaperClient:
     def get_positions(self) -> list[dict]:
         return self._trading("GET", "/positions")
 
-    def get_orders(self, status: str = "all", limit: int = 100) -> list[dict]:
+    def get_orders(
+        self, status: str = "all", limit: int = 100, nested: bool = True
+    ) -> list[dict]:
+        # nested=true includes bracket child legs (stop/target) so working risk
+        # isn't under-reported in the orders snapshot.
         return self._trading(
-            "GET", "/orders", params={"status": status, "limit": limit}
+            "GET", "/orders",
+            params={"status": status, "limit": limit, "nested": str(nested).lower()},
         )
 
     def submit_order(
