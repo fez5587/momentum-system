@@ -138,9 +138,18 @@ def doctor():
     try:
         ev = _events_of(con, module="discovery", stage="completed")
         if ev:
-            m = json.loads(ev[0][2]).get("metrics", {})
-            _row(results, "discovery", "PASS",
-                 f"{len(m.get('universe', []))} sub-$20 names, {len(m.get('gappers', []))} gappers @ {ev[0][0]}")
+            payload = json.loads(ev[0][2])
+            m = payload.get("metrics", {})
+            n_uni, n_gap = len(m.get("universe", [])), len(m.get("gappers", []))
+            errs = payload.get("errors", [])
+            if n_uni == 0:
+                _row(results, "discovery", "FAIL",
+                     f"screener returned 0 names @ {ev[0][0]} — check Alpaca screener/limits"
+                     + (f"; {errs}" if errs else ""))
+            else:
+                _row(results, "discovery", "PASS" if not errs else "WARN",
+                     f"{n_uni} sub-$20 names, {n_gap} gappers @ {ev[0][0]}"
+                     + (f"; errors={errs}" if errs else ""))
         else:
             _row(results, "discovery", "WARN", "no discovery events yet (run the app)")
     except Exception as e:

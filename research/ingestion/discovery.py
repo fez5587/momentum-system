@@ -168,6 +168,12 @@ def run_discovery(
     for ticker in result.news:
         if ticker not in result.universe:
             result.universe.append(ticker)
+    if not result.universe:
+        # Make a dead screener LOUD (this was silent for a whole session once):
+        # surfaces in the discovery event's errors and `momentum doctor`.
+        result.errors.append(
+            "screener returned 0 names (Alpaca cap/limit, or no qualifying movers)"
+        )
 
     # Backfill daily history for the universe so gap%/RVOL have a baseline.
     if backfill_daily and result.universe and client is not None:

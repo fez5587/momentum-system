@@ -13,6 +13,7 @@ hardcoded ``is_regular_hours = TRUE`` on every row. Here we:
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -22,6 +23,8 @@ REGULAR_OPEN = time(9, 30)
 REGULAR_CLOSE = time(16, 0)
 PREMARKET_OPEN = time(4, 0)
 AFTERHOURS_CLOSE = time(20, 0)
+
+logger = logging.getLogger(__name__)
 
 
 def classify_session(ts_utc: datetime) -> tuple[date, bool, bool, bool]:
@@ -251,5 +254,6 @@ def discover_active_symbols(
             if len(in_band) >= top:
                 break
         return in_band
-    except Exception:  # noqa: BLE001 - screener needs a paid feed sometimes
+    except Exception as exc:  # noqa: BLE001 - screener needs a paid feed sometimes
+        logger.warning("most-actives screener failed: %s", exc)
         return []
