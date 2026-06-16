@@ -255,5 +255,11 @@ def discover_active_symbols(
                 break
         return in_band
     except Exception as exc:  # noqa: BLE001 - screener needs a paid feed sometimes
-        logger.warning("most-actives screener failed: %s", exc)
+        status = getattr(exc, "status", None)
+        if status in (401, 403):
+            logger.error(
+                "most-actives screener AUTH/ENTITLEMENT failure (HTTP %s) — check "
+                "ALPACA keys / data plan; this is NOT 'no movers': %s", status, exc)
+        else:
+            logger.warning("most-actives screener failed (HTTP %s): %s", status, exc)
         return []

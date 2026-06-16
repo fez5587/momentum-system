@@ -160,7 +160,12 @@ def build_runtime(args: argparse.Namespace) -> dict:
             input_count=0,
             output_count=len(symbols),
             metrics={"source": symbols_source, "symbols": symbols},
-            errors=[],
+            errors=(
+                []
+                if symbols_source != "fallback"
+                else [{"error": "screener returned 0 names at boot — using fallback "
+                       "watchlist; check Alpaca screener / data plan"}]
+            ),
         )
     )
 

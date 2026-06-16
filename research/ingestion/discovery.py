@@ -15,6 +15,7 @@ silent — they land as queryable rows in Postgres.
 
 from __future__ import annotations
 
+import logging
 import os
 import time
 from dataclasses import dataclass, field
@@ -27,6 +28,8 @@ from research.ingestion.market_data import (
 from research.ingestion.rss import ingest_all_feeds
 from research.ingestion.signals import scan_gappers, store_scanner_snapshot
 from storage.event_schema import EventMode, ModuleTickEvent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -128,7 +131,8 @@ def news_candidates(
             "ORDER BY fetched_at DESC LIMIT 500",
             [cutoff],
         ).fetchall()
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("news_candidates query failed (DB fault?): %s", exc)
         return []
     seen: set = set()
     out: list[str] = []
