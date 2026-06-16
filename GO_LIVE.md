@@ -10,14 +10,19 @@ it at the open.
   and valid `ALPACA_API_KEY` / `ALPACA_SECRET_KEY`.
 - Linux venv at `/home/philip/.venvs/momentum`.
 
-## 1. Start it (observe mode — safe, no orders)
+## 1. Start it (LIVE PAPER TRADING — enabled)
 ```bash
 cd /mnt/c/code/momentum
 PYTHONPATH=. /home/philip/.venvs/momentum/bin/python run_live_paper.py --no-dashboard
 ```
-What it does each loop: **discover** sub-$20 most-actives (every 5 min) →
-**ingest** their 1-min bars (every 60s) → **watch**/evaluate (every 30s) → emit
-events to Postgres. Stop with **Ctrl-C** (graceful).
+Each loop: **discover** sub-$20 most-actives, ETF-filtered (every 5 min) →
+**ingest** 1-min bars (every 60s) → **watch**/evaluate (every 30s) → on a ready
+signal, **auto-arm a bracket order** to your Alpaca paper account → **sync**
+account/positions → **guard** unfilled entries. Stop with **Ctrl-C** (graceful).
+
+Guardrails (`.env`): 1% risk/trade, max 3 concurrent, 2R targets, and a
+**-3% daily-loss circuit breaker** that halts new entries. Trading window
+**9:30–10:35 ET**.
 
 > Start it a few minutes before 9:30 ET so the premarket screen + daily backfill
 > are warm at the open.
@@ -40,21 +45,21 @@ $M inspect events --limit 30
 Or point **pgAdmin** at the `momentum` DB: `events`, `daily_bars`,
 `minute_bars`, `scanner_snapshots` are all live.
 
-## 4. Enable paper trading (only when you're ready)
-Observe mode places **no orders**. To let it trade your Alpaca **paper** account,
-set in `.env` and restart:
+## 4. Trading is ENABLED — how to dial it back
+`.env` already has live paper trading on, with guardrails:
 ```
 TRADING_EXECUTION_ENABLED=1
 ALPACA_PAPER_SYNC_ENABLED=1
-TRADING_AUTO_APPROVE=1      # 1 = auto-arm bracket orders; 0 = approve manually
+TRADING_AUTO_APPROVE=1            # auto-arm bracket orders (hands-off)
+TRADING_MAX_DAILY_LOSS_PCT=0.03  # -3% daily-loss circuit breaker (implemented + verified)
+TRADING_RISK_PER_TRADE_PCT=0.01  # 1% of equity per trade
+TRADING_MAX_CONCURRENT_POSITIONS=3
 ```
-With `TRADING_AUTO_APPROVE=0` you approve each signal in the dashboard (drop
-`--no-dashboard`; it serves at `http://127.0.0.1:8765`). Risk per trade,
-concurrency, and the reward multiple are the `TRADING_*` vars in `.env`.
-
-> ⚠️ Known gap: the **daily-loss circuit breaker is NOT implemented**
-> (`TRADING_MAX_DAILY_LOSS_PCT` is parsed but unused). If you enable execution,
-> manage daily loss manually. (Surfaced by `momentum_cli.py doctor`.)
+- **Manual approval instead of auto:** `TRADING_AUTO_APPROVE=0`, drop
+  `--no-dashboard`, approve each signal at `http://127.0.0.1:8765`.
+- **Observe only (no orders):** `TRADING_EXECUTION_ENABLED=0`.
+- The breaker halts **new** entries at -3%; it does **not** auto-flatten open
+  positions — exit those from the dashboard.
 
 ## 5. Tuning (env vars)
 | var | default | meaning |
@@ -79,7 +84,9 @@ PY
 ## Known limitations (honest)
 - `quality_score` is a constant 1.0, `float_rotation` is 0.0, `spread_pct` is
   null — these fields are not real metrics yet.
-- Discovery can include leveraged ETFs (SOXS/TZA/TSLL/NVD); no ETF filter yet.
+- The circuit breaker halts new entries but does not auto-flatten open positions.
 - News-catalyst discovery (RSS) exists but isn't wired into the watchlist.
 - Free Alpaca **IEX** data is thinner than SIP, especially premarket — some
-  sub-$20 names will show few/no bars until volume picks up.
+  sub-$20 names show few/no bars until volume builds.
+- The screener can briefly rate-limit; discovery retries and falls back to a
+  liquid sub-$20 list, so the watchlist stays tradeable.
