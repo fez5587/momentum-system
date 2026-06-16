@@ -102,7 +102,8 @@ def evaluate_setup(
             "pullback",
             structure.setup_type
             in (SetupType.FIRST_PULLBACK, SetupType.BULL_FLAG, SetupType.GAP_AND_GO,
-                SetupType.HOD_BREAK, SetupType.CONTINUATION_FALLBACK)
+                SetupType.HOD_BREAK, SetupType.CONTINUATION_FALLBACK,
+                SetupType.OPENING_RANGE_BREAK)
             and structure.is_valid,
             "pullback/consolidation structure",
         ),

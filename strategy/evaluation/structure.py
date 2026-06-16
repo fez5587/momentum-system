@@ -16,6 +16,7 @@ class SetupType(Enum):
     """Types of momentum setups."""
 
     GAP_AND_GO = "gap_and_go"
+    OPENING_RANGE_BREAK = "opening_range_break"
     FIRST_PULLBACK = "first_pullback"
     BULL_FLAG = "bull_flag"
     HOD_BREAK = "hod_break"
@@ -529,6 +530,66 @@ def detect_continuation_fallback(
     )
 
 
+def detect_opening_range_breakout(
+    bars: pd.DataFrame,
+    orb_bars: int = 5,
+    min_range_pct: float = 0.004,
+    min_break_pct: float = 0.0,
+) -> StructureDetectionResult:
+    """Opening-range breakout — the EARLY trigger.
+
+    Fires minutes after the open instead of waiting for a pullback to form: the
+    opening range is the high/low of the first ``orb_bars`` regular-hours bars
+    (09:30-09:3x); a later bar closing above that high, on at least opening-range
+    average volume, is the breakout. Entry = OR high, stop = OR low.
+    """
+    if "is_regular_hours" in bars.columns:
+        rth = bars[bars["is_regular_hours"] == True]  # noqa: E712
+        if rth.empty:
+            return StructureDetectionResult(
+                SetupType.OPENING_RANGE_BREAK, False, reason="no regular-hours bars")
+        rth = rth.reset_index(drop=True)
+    else:
+        rth = bars.reset_index(drop=True)
+
+    if len(rth) < orb_bars + 1:
+        return StructureDetectionResult(
+            SetupType.OPENING_RANGE_BREAK, False, reason="opening range not complete")
+
+    orb = rth.iloc[:orb_bars]
+    orb_high = float(orb["high"].max())
+    orb_low = float(orb["low"].min())
+    if orb_high <= 0 or (orb_high - orb_low) / orb_high < min_range_pct:
+        return StructureDetectionResult(
+            SetupType.OPENING_RANGE_BREAK, False, reason="opening range too tight")
+
+    after = rth.iloc[orb_bars:]
+    last_close = float(after["close"].iloc[-1])
+    if last_close < orb_high * (1.0 + min_break_pct):
+        return StructureDetectionResult(
+            SetupType.OPENING_RANGE_BREAK, False, reason="no opening-range break yet")
+
+    orb_vol = float(orb["volume"].mean()) if "volume" in orb.columns else 0.0
+    break_vol = float(after["volume"].iloc[-1]) if "volume" in after.columns else 0.0
+    vol_ok = orb_vol <= 0 or break_vol >= 0.8 * orb_vol
+
+    stop = orb_low * 0.995
+    if stop >= orb_high:
+        return StructureDetectionResult(
+            SetupType.OPENING_RANGE_BREAK, False, reason="invalid ORB risk geometry")
+
+    extension = (last_close - orb_high) / orb_high
+    quality = 0.4 + min(0.4, extension / 0.02 * 0.4) + (0.2 if vol_ok else 0.0)
+    return StructureDetectionResult(
+        setup_type=SetupType.OPENING_RANGE_BREAK,
+        is_valid=True,
+        breakout_level=orb_high,
+        stop_level=float(stop),
+        quality_score=float(max(0.0, min(1.0, quality))),
+        reason=None,
+    )
+
+
 def classify_setup(
     bars: pd.DataFrame,
     premarket_high: float | None = None,
@@ -549,6 +610,7 @@ def classify_setup(
         StructureDetectionResult for best valid setup
     """
     detectors = [
+        detect_opening_range_breakout(bars),
         detect_bull_flag(bars, min_impulse_pct=0.015),
         detect_first_pullback(bars, max_pullback_depth_pct=0.6),
         detect_gap_and_go(bars, premarket_high, min_gap_pct=0.02),
