@@ -18,12 +18,13 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from research.ingestion.market_data import (
     discover_active_symbols,
     ingest_daily_history,
 )
+from research.ingestion.rss import ingest_all_feeds
 from research.ingestion.signals import scan_gappers, store_scanner_snapshot
 from storage.event_schema import EventMode, ModuleTickEvent
 
@@ -32,6 +33,7 @@ from storage.event_schema import EventMode, ModuleTickEvent
 class DiscoveryResult:
     universe: list[str] = field(default_factory=list)   # screened $1-20 most-actives
     gappers: list = field(default_factory=list)         # ranked GapperCandidate list
+    news: list[str] = field(default_factory=list)       # catalyst-driven tickers from news
     daily_rows: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -91,6 +93,54 @@ def screen_universe(
     return names[:top]
 
 
+def _news_feeds() -> dict[str, str]:
+    """Parse NEWS_FEEDS env: 'name1=url1,name2=url2'. Empty -> news disabled."""
+    feeds: dict[str, str] = {}
+    for part in os.environ.get("NEWS_FEEDS", "").split(","):
+        part = part.strip()
+        if "=" in part:
+            name, url = part.split("=", 1)
+            if name.strip() and url.strip():
+                feeds[name.strip()] = url.strip()
+    return feeds
+
+
+def news_candidates(
+    con, feeds: dict[str, str] | None = None, lookback_hours: int = 12, limit: int = 15
+) -> list[str]:
+    """Catalyst-driven candidates: tickers mentioned in recently ingested news.
+
+    No-op (returns []) unless news feeds are configured (NEWS_FEEDS env or the
+    ``feeds`` arg). Never raises — news is an enhancement, not a dependency.
+    """
+    feeds = feeds if feeds is not None else _news_feeds()
+    if not feeds:
+        return []
+    try:
+        ingest_all_feeds(con, feeds)
+    except Exception:  # noqa: BLE001
+        pass
+    cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+    try:
+        rows = con.execute(
+            "SELECT raw_tickers FROM raw_news_items "
+            "WHERE raw_tickers <> '' AND fetched_at >= ? "
+            "ORDER BY fetched_at DESC LIMIT 500",
+            [cutoff],
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return []
+    seen: set = set()
+    out: list[str] = []
+    for (raw_tickers,) in rows:
+        for ticker in (raw_tickers or "").split(","):
+            ticker = ticker.strip().upper()
+            if ticker and ticker not in seen:
+                seen.add(ticker)
+                out.append(ticker)
+    return out[:limit]
+
+
 def run_discovery(
     store,
     research_con,
@@ -113,6 +163,11 @@ def run_discovery(
     result.universe = screen_universe(
         client, price_min=price_min, price_max=price_max, top=top
     )
+    # catalyst-driven candidates from recent news (active only if NEWS_FEEDS set)
+    result.news = news_candidates(research_con)
+    for ticker in result.news:
+        if ticker not in result.universe:
+            result.universe.append(ticker)
 
     # Backfill daily history for the universe so gap%/RVOL have a baseline.
     if backfill_daily and result.universe and client is not None:
@@ -155,6 +210,7 @@ def run_discovery(
             metrics={
                 "price_band": [price_min, price_max],
                 "universe": result.universe,
+                "news": result.news,
                 "gappers": [
                     {
                         "symbol": g.symbol,

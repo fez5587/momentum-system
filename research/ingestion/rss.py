@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 PARSER_VERSION = "rss-v2"
 TICKER_RE = re.compile(r"\((?:NASDAQ|NYSE|AMEX|OTC)[:\s]+([A-Z]{1,5})\)")
+CASHTAG_RE = re.compile(r"\$([A-Z]{1,5})\b")
 
 
 @dataclass
@@ -63,7 +64,8 @@ def parse_rss(xml_bytes: bytes) -> list[dict]:
 
 
 def extract_tickers(text: str) -> list[str]:
-    return sorted(set(TICKER_RE.findall(text or "")))
+    text = text or ""
+    return sorted(set(TICKER_RE.findall(text)) | set(CASHTAG_RE.findall(text)))
 
 
 def ingest_rss_feed(

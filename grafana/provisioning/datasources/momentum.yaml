@@ -1,0 +1,18 @@
+apiVersion: 1
+datasources:
+  - name: Momentum
+    uid: momentum_pg
+    type: postgres
+    access: proxy
+    # The Postgres on your LAN. From a Grafana container, 127.0.0.1 is the
+    # container itself, so point at the host's LAN IP (or host.docker.internal).
+    url: 192.168.1.5:5432
+    user: admin
+    jsonData:
+      database: momentum
+      sslmode: disable
+      postgresVersion: 1500
+    secureJsonData:
+      password: password
+    isDefault: true
+    editable: true

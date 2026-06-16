@@ -35,15 +35,18 @@ ready. So watch the first hour.
 ## 3. Monitor (any terminal, or remotely)
 ```bash
 M="PYTHONPATH=. /home/philip/.venvs/momentum/bin/python momentum_cli.py"
+$M watch                  # LIVE auto-refreshing board — the real-time view
 $M doctor                 # PASS/WARN/FAIL across every stage
-$M inspect signals        # ready board + per-symbol gap/rvol/status (the main view)
+$M inspect signals        # ready board + per-symbol gap/rvol/status
 $M inspect bars           # per-symbol bar counts + freshness (are bars flowing?)
 $M inspect criteria RGNT  # full per-criterion reasons for one symbol
 $M inspect discovery      # current sub-$20 universe + ranked gappers
 $M inspect events --limit 30
 ```
-Or point **pgAdmin** at the `momentum` DB: `events`, `daily_bars`,
-`minute_bars`, `scanner_snapshots` are all live.
+Or point **pgAdmin** at the `momentum` DB (`events`, `daily_bars`,
+`minute_bars`, `scanner_snapshots` are all live). For a polished **remote
+dashboard**: `cd grafana && docker compose up -d` → http://localhost:3000
+(see `grafana/README.md`).
 
 ## 4. Trading is ENABLED — how to dial it back
 `.env` already has live paper trading on, with guardrails:
