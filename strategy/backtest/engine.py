@@ -30,6 +30,7 @@ class Trade:
     exit_reason: str | None = None
     realized_pnl: float | None = None
     r_multiple: float | None = None
+    setup_type: str | None = None
 
 
 @dataclass
@@ -175,6 +176,7 @@ class BacktestEngine:
                             stop_price=round(stop, 4),
                             target_price=round(entry + self.target_r * risk, 4),
                             quantity=sizing.position_size,
+                            setup_type=setup.get("setup_type"),
                         )
                         open_trade.realized_pnl = -commission
                         i += 1  # consumed next bar for entry

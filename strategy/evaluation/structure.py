@@ -4,6 +4,7 @@ Implements bull flag, first pullback, and gap-and-go pattern detection
 based on Ross Cameron momentum strategy specifications.
 """
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -609,24 +610,36 @@ def classify_setup(
     Returns:
         StructureDetectionResult for best valid setup
     """
+    # The opening-range breakout is the early, profitable setup — the parameter
+    # sweep over real gapper sessions found it is the ONLY setup with positive
+    # expectancy (+0.25R), while the slower patterns (bull_flag, continuation,
+    # gap_and_go) lose and fire ~15-20 min later. So prefer it whenever it's
+    # valid, rather than letting a higher-"quality"-but-slower pattern override
+    # an early breakout.
+    # STRATEGY_SETUPS (comma-separated setup values) restricts which setups may
+    # fire. The sweep showed opening_range_break is the only profitable one, so
+    # set STRATEGY_SETUPS=opening_range_break to trade ORB-only. Empty = all.
+    enabled = {s.strip() for s in os.environ.get("STRATEGY_SETUPS", "").split(",") if s.strip()}
+
+    orb = detect_opening_range_breakout(bars)
+    if (orb.is_valid and orb.quality_score >= min_quality_score
+            and (not enabled or "opening_range_break" in enabled)):
+        return orb
+
     detectors = [
-        detect_opening_range_breakout(bars),
         detect_bull_flag(bars, min_impulse_pct=0.015),
         detect_first_pullback(bars, max_pullback_depth_pct=0.6),
         detect_gap_and_go(bars, premarket_high, min_gap_pct=0.02),
         detect_hod_break(bars, session_high),
         detect_continuation_fallback(bars),
     ]
-
-    # Filter valid setups meeting quality threshold
     valid_setups = [
-        s for s in detectors if s.is_valid and s.quality_score >= min_quality_score
+        s for s in detectors
+        if s.is_valid and s.quality_score >= min_quality_score
+        and (not enabled or s.setup_type.value in enabled)
     ]
-
     if not valid_setups:
         return StructureDetectionResult(
             setup_type=SetupType.NONE, is_valid=False, reason="No valid setup detected"
         )
-
-    # Return highest quality setup
     return max(valid_setups, key=lambda s: s.quality_score)

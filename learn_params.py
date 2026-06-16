@@ -49,9 +49,19 @@ def load_sessions(con):
             bars = bars[bars["is_regular_hours"] == True].reset_index(drop=True)  # noqa: E712
         if len(bars) < 20:
             continue
-        out.append((symbol, sess, bars,
-                    query_previous_close(con, symbol, sess),
-                    query_avg_daily_volume(con, symbol, sess)))
+        pc = query_previous_close(con, symbol, sess)
+        adv = query_avg_daily_volume(con, symbol, sess)
+        # Mimic the LIVE scanner: only keep sessions that actually gapped up or
+        # traded elevated volume. Otherwise the backtest trades non-movers the
+        # live discovery would never surface, burying the real gappers' edge.
+        try:
+            gap = (float(bars["open"].iloc[0]) - pc) / pc if pc else 0.0
+            day_rvol = (float(bars["volume"].sum()) / adv) if adv else 0.0
+        except Exception:  # noqa: BLE001
+            gap, day_rvol = 0.0, 0.0
+        if not (gap >= 0.03 or day_rvol >= 2.0):
+            continue
+        out.append((symbol, sess, bars, pc, adv))
     return out
 
 
@@ -99,10 +109,10 @@ def main():
               "Backfill more RTH sessions for a robust optimum.\n")
 
     grid = {
-        "warmup": [3, 5, 8, 12],
-        "min_bars": [3, 5, 8],
-        "eval_every": [1, 3],
-        "ready": [50, 60],
+        "warmup": [3, 6, 12],
+        "min_bars": [3, 6],
+        "eval_every": [1, 5],
+        "ready": [55, 65],
         "gap_min": [0.05],
         "rvol_min": [2.0],
     }
