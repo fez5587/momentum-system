@@ -46,9 +46,10 @@ from research.ingestion.market_data import (
 )
 from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
+from research.ingestion.discovery import run_discovery, screen_universe
 from research.multi_schema import open_research_db
 from runtime.watcher import Watcher, WatcherConfig
-from storage.event_schema import EventMode
+from storage.event_schema import EventMode, ModuleTickEvent
 from storage.event_store import EventStore
 from trading_execution import ExecutionSettings, TradingExecutionService
 from trading_mode import TradingModeSettings
@@ -108,9 +109,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
     """Wire up every component; safe without API keys."""
     load_dotenv()
 
-    symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
-    if not symbols:
-        symbols = DEFAULT_SYMBOLS
+    explicit_symbols = [s.strip().upper() for s in args.symbols.split(",") if s.strip()]
 
     alpaca_settings = AlpacaPaperSettings.from_env()
     has_keys = alpaca_settings.is_configured
@@ -122,6 +121,42 @@ def build_runtime(args: argparse.Namespace) -> dict:
     research_con = open_research_db("market")
 
     session_id = f"paper-{_now_session_date().isoformat()}-{uuid.uuid4().hex[:6]}"
+
+    # Watchlist resolution. Explicit --symbols/WATCHER_SYMBOLS win; otherwise
+    # discover the sub-$20 most-actives universe via the screener (the strategy
+    # targets $1-20 small-caps, not the hardcoded mega-cap fallback). Falls back
+    # to DEFAULT_SYMBOLS only if the screener is unavailable.
+    price_min = float(os.environ.get("WATCHER_PRICE_MIN", "1"))
+    price_max = float(os.environ.get("WATCHER_PRICE_MAX", "20"))
+    discover_top = int(os.environ.get("DISCOVER_TOP", "20"))
+    if explicit_symbols:
+        symbols = explicit_symbols
+        symbols_source = "explicit"
+    elif client is not None and _flag("DISCOVER_ON_START", "1"):
+        discovered = screen_universe(
+            client, price_min=price_min, price_max=price_max, top=discover_top
+        )
+        symbols = discovered or list(DEFAULT_SYMBOLS)
+        symbols_source = "screener" if discovered else "fallback"
+    else:
+        symbols = list(DEFAULT_SYMBOLS)
+        symbols_source = "fallback"
+
+    store.emit(
+        ModuleTickEvent(
+            timestamp=datetime.now(),
+            mode=EventMode.PAPER,
+            correlation_id=session_id,
+            message=f"watchlist resolved via {symbols_source}: {len(symbols)} symbols",
+            module="discovery",
+            stage="boot",
+            duration_ms=0.0,
+            input_count=0,
+            output_count=len(symbols),
+            metrics={"source": symbols_source, "symbols": symbols},
+            errors=[],
+        )
+    )
 
     watcher = Watcher(
         store,
@@ -187,6 +222,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
 
     return {
         "symbols": symbols,
+        "symbols_source": symbols_source,
         "client": client,
         "has_keys": has_keys,
         "store": store,
@@ -206,7 +242,7 @@ def main(argv: list[str] | None = None) -> int:
     client = rt["client"]
 
     print(f"[boot] session={rt['session_id']} db={_db_target_desc()}")
-    print(f"[boot] watching: {', '.join(symbols)}")
+    print(f"[boot] watching ({rt['symbols_source']}): {', '.join(symbols)}")
     if not rt["has_keys"]:
         print("[boot] no ALPACA_API_KEY/SECRET — dry mode: ingestion, sync and "
               "order submission are skipped; watcher runs on existing data")
@@ -263,6 +299,21 @@ def main(argv: list[str] | None = None) -> int:
         if not client:
             return "skipped (no keys)"
         res = ingest_live_minute_bars(rt["research_con"], client, symbols, lookback_minutes=lookback)
+        rt["store"].emit(
+            ModuleTickEvent(
+                timestamp=datetime.now(),
+                mode=EventMode.PAPER,
+                correlation_id=rt["session_id"],
+                message=f"ingested {res.minute_rows} minute rows across {len(res.symbols)} symbols",
+                module="ingestion",
+                stage="completed",
+                duration_ms=0.0,
+                input_count=len(symbols),
+                output_count=res.minute_rows,
+                metrics={"per_symbol": res.per_symbol, "symbols_with_data": res.symbols},
+                errors=[{"error": e} for e in res.errors],
+            )
+        )
         return f"{res.minute_rows} minute rows" + (f", errors={res.errors}" if res.errors else "")
 
     def step_watch():
@@ -302,7 +353,27 @@ def main(argv: list[str] | None = None) -> int:
             f"{b['symbol']} ({b['reason']})" for b in backed
         )
 
+    def step_discover():
+        if not client:
+            return "skipped (no keys)"
+        res = run_discovery(
+            rt["store"], rt["research_con"], client, _now_session_date(),
+            mode=EventMode.PAPER, correlation_id=rt["session_id"],
+            price_min=float(os.environ.get("WATCHER_PRICE_MIN", "1")),
+            price_max=float(os.environ.get("WATCHER_PRICE_MAX", "20")),
+            top=int(os.environ.get("DISCOVER_TOP", "20")),
+        )
+        # fold newly-screened names into the live watchlist so the next ingest
+        # pulls their bars and the watcher evaluates them
+        added = [s for s in res.universe if s not in symbols]
+        symbols.extend(added)
+        return (f"universe={len(res.universe)} gappers={len(res.gappers)}"
+                + (f" +{len(added)} new" if added else ""))
+
     scheduler = Scheduler()
+    scheduler.add("discover", step_discover,
+                  float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
+                  enabled=_flag("DISCOVER_ENABLED", "1"))
     scheduler.add("ingest", step_ingest, float(os.environ.get("LIVE_BARS_INTERVAL_SECONDS", "60")),
                   enabled=_flag("LIVE_BARS_ENABLED", "1"))
     scheduler.add("watch", step_watch, float(os.environ.get("WATCHER_INTERVAL_SECONDS", "30")),
@@ -319,7 +390,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("ingest", "watch", "sync", "execute"):
+        for name in ("discover", "ingest", "watch", "sync", "execute"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

@@ -47,6 +47,9 @@ class IngestionResult:
     daily_rows: int = 0
     symbols: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # per-symbol rows written this pass (incl. 0 for requested-but-empty symbols),
+    # so "are bars collected?" is answerable per symbol, not just in aggregate.
+    per_symbol: dict = field(default_factory=dict)
 
 
 def upsert_minute_bars(
@@ -163,6 +166,7 @@ def ingest_live_minute_bars(
     result = IngestionResult()
     if not symbols:
         return result
+    result.per_symbol = {s: 0 for s in symbols}
     now = datetime.now(timezone.utc)
     start = now - timedelta(minutes=lookback_minutes)
     end = now - timedelta(seconds=30)
@@ -179,6 +183,7 @@ def ingest_live_minute_bars(
     for symbol, bars in bars_by_symbol.items():
         try:
             count = upsert_minute_bars(con, symbol, bars)
+            result.per_symbol[symbol] = count
             if count:
                 result.minute_rows += count
                 result.symbols.append(symbol)
