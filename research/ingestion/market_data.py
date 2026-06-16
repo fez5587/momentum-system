@@ -242,7 +242,7 @@ def discover_active_symbols(
         symbols = [a["symbol"] for a in actives if a.get("symbol")]
         if not symbols:
             return []
-        trades = client.get_latest_trades(symbols[:50])
+        trades = client.get_latest_trades(symbols)  # batched internally; price them all
         in_band = []
         for symbol in symbols:
             trade = trades.get(symbol)
