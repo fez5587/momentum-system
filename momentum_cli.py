@@ -362,5 +362,99 @@ def inspect_signals(limit: int = 25):
     console.print(t)
 
 
+def _latest_eval_board(con) -> dict:
+    """Most-recent evaluation per symbol: {sym: (score, status, gap, rvol, reason)}."""
+    rows = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='criteria_evaluated' "
+        "ORDER BY timestamp DESC LIMIT 800").fetchall()
+    seen: dict = {}
+    for (pj,) in rows:
+        p = json.loads(pj)
+        sym = p.get("symbol")
+        if sym and sym not in seen:
+            cr = p.get("criteria_results", {})
+            seen[sym] = (p.get("success_score_pct") or 0, cr.get("status"),
+                         cr.get("gap_pct"), cr.get("relative_volume"), cr.get("reason"))
+    return seen
+
+
+def _render_board(con):
+    """Build the live monitoring board renderable."""
+    from datetime import datetime
+    from rich.console import Group
+    from rich.panel import Panel
+
+    acct = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='account_summary_updated' "
+        "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    eq = "—"
+    if acct:
+        eq = json.loads(acct[0][0]).get("total_equity", "—")
+
+    seen = _latest_eval_board(con)
+    ready = [s for s, v in seen.items() if v[1] == "ready"]
+    et = Table(box=box.SIMPLE_HEAVY, expand=True)
+    for c, j in (("symbol", "left"), ("status", "center"), ("score", "right"),
+                 ("gap", "right"), ("rvol", "right"), ("why", "left")):
+        et.add_column(c, justify=j, no_wrap=(c != "why"))
+    for sym, (score, status, gap, rvol, reason) in sorted(seen.items(), key=lambda x: -(x[1][0] or 0))[:28]:
+        color = {"ready": "bold green", "late": "yellow", "blocked": "red"}.get(status, "white")
+        et.add_row(
+            sym, f"[{color}]{(status or '?').upper()}[/{color}]", f"{score:.0f}%",
+            f"{gap:+.1%}" if isinstance(gap, (int, float)) else "-",
+            f"{rvol:.1f}x" if isinstance(rvol, (int, float)) else "-",
+            (reason or "")[:46])
+
+    sig = con.execute("SELECT timestamp, message FROM events WHERE event_type='signal_ready' "
+                      "ORDER BY timestamp DESC LIMIT 6").fetchall()
+    st = Table(title="ready signals", box=box.SIMPLE)
+    st.add_column("time", style="cyan"); st.add_column("signal", overflow="fold")
+    for ts, m in sig:
+        st.add_row(str(ts)[11:19], m or "")
+
+    pos_ev = con.execute("SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
+                         "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    pt = Table(title="open positions", box=box.SIMPLE)
+    pt.add_column("symbol"); pt.add_column("qty", justify="right"); pt.add_column("uPnL", justify="right")
+    if pos_ev:
+        for p in (json.loads(pos_ev[0][0]).get("positions") or []):
+            upl = p.get("unrealized_pl")
+            pt.add_row(str(p.get("symbol")), str(p.get("quantity") or p.get("qty") or ""),
+                       f"{float(upl):+.2f}" if upl not in (None, "") else "-")
+
+    risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
+                       "ORDER BY timestamp DESC LIMIT 4").fetchall()
+    rt = Table(title="risk events", box=box.SIMPLE)
+    rt.add_column("time", style="cyan"); rt.add_column("rule", overflow="fold")
+    for ts, m in risk:
+        rt.add_row(str(ts)[11:19], m or "")
+
+    header = Panel(
+        f"[bold]momentum live[/bold]   equity [green]{eq}[/green]   "
+        f"{datetime.now().strftime('%H:%M:%S')}   "
+        f"{len(seen)} evaluated · [bold green]{len(ready)} ready[/bold green]   "
+        f"[dim](window 9:30–10:35 ET · Ctrl-C to exit)[/dim]",
+        style="cyan")
+    return Group(header, et, st, pt, rt)
+
+
+@app.command()
+def watch(interval: float = 3.0, once: bool = typer.Option(False, help="render one frame and exit")):
+    """LIVE board: the symbols being evaluated + their determinations, refreshing."""
+    import time as _t
+    from rich.live import Live
+    con = _con()
+    if once:
+        console.print(_render_board(con))
+        return
+    try:
+        with Live(_render_board(con), console=console, screen=True, refresh_per_second=2) as live:
+            while True:
+                _t.sleep(max(0.5, interval))
+                live.update(_render_board(con))
+    except KeyboardInterrupt:
+        pass
+
+
 if __name__ == "__main__":
     app()
