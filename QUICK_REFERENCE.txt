@@ -1,0 +1,268 @@
+================================================================================
+                     MOMENTUM SYSTEM - QUICK REFERENCE
+================================================================================
+
+PHASE 1 (✅ COMPLETE): Core Infrastructure
+────────────────────────────────────────────────────────────────────────────
+
+What was built:
+  ✓ core/contracts.py         Module I/O contracts (5 modules × 2 types each)
+  ✓ core/telemetry.py         Metric collection + event emission
+  ✓ core/validation.py        Data validation (schema, ranges, checksums, rules)
+  ✓ 3 new event types        (ModuleTickEvent, DataValidationEvent, SymbolEvaluationDetailEvent)
+
+Why it matters:
+  BEFORE: ingest_live_minute_bars() → [silence] → "did it work?"
+  AFTER:  "500 bars collected, 0 validation failures, completed in 245ms"
+
+Key classes:
+  TelemetryCollector        Record what's happening during execution
+  TelemetryEmitter          Emit events to event store + callbacks
+  ModuleMetrics             duration_ms, input_count, output_count, custom_metrics
+  SchemaValidator           Check required fields and types
+  BarDataValidator          Pre-built OHLCV validation
+
+Quick import:
+  from core.telemetry import TelemetryCollector, emit_module_tick
+  from core.validation import SchemaValidator, BarDataValidator
+
+Quick usage:
+  collector = TelemetryCollector("evaluation")
+  collector.record_input(5)
+  collector.record_metric("gap_pct", 2.5)
+  metrics = collector.finalize()
+  emit_module_tick("evaluation", "completed", metrics)
+
+================================================================================
+
+PHASE 2 (📍 NEXT): Module Instrumentation (~4 hours)
+────────────────────────────────────────────────────────────────────────────
+
+What you'll do:
+  1. Wrap ingest_live_minute_bars() with TelemetryCollector
+  2. Wrap evaluate_setup() with telemetry + SymbolEvaluationDetailEvent
+  3. Wrap research, execution, broker modules
+  4. Update run_live_paper.py to initialize emitter
+  5. Test and verify events appear in event store
+
+Each module will emit:
+  ✓ ModuleTickEvent at completion (duration, counts, metrics)
+  ✓ DataValidationEvent when data validated
+  ✓ SymbolEvaluationDetailEvent for each evaluation stage (evaluation module only)
+
+See: PHASE2_PREVIEW.md for exact code examples
+
+================================================================================
+
+PHASE 3 (🔲 TODO): Inspection Dashboard API (~6 hours)
+────────────────────────────────────────────────────────────────────────────
+
+Build: api/inspection.py with REST endpoints
+
+Endpoints:
+  GET  /api/inspection/modules              module metrics table
+  GET  /api/inspection/pipeline              pipeline flow diagram data
+  GET  /api/inspection/symbol/:symbol        eval timeline for symbol
+  GET  /api/inspection/data-quality          validation report
+  GET  /api/inspection/events               SSE stream of events
+  GET  /api/inspection/module/:m/history     last N executions
+
+Projections to build:
+  query_module_performance()
+  query_symbol_evaluation_detail(symbol)
+  query_data_quality_snapshot()
+  query_pipeline_stats(session_id)
+
+================================================================================
+
+PHASE 4 (🔲 TODO): React Dashboard (~8 hours)
+────────────────────────────────────────────────────────────────────────────
+
+Build: api/inspection/ directory with React SPA
+
+Features:
+  □ Pipeline diagram (Mermaid auto-layout)
+  □ Module performance grid (5x5 table with metrics)
+  □ Symbol inspector (search + expandable stages)
+  □ Sparkline charts (OHLCV with entry/stop lines)
+  □ Event timeline (live feed with filtering)
+  □ Data quality report (heatmap + validation stats)
+  □ Live SSE updates + polling fallback
+  □ Mobile responsive
+
+Port: http://127.0.0.1:8011 (separate from execution dashboard :8010)
+
+================================================================================
+
+PHASES 5-8 (OPTIONAL): Refactoring & Testing
+────────────────────────────────────────────────────────────────────────────
+
+Phase 5: Module refactoring into explicit contracts
+  modules/ingestion.py, research.py, evaluation.py, execution.py, broker.py
+
+Phase 6: Module-level testing
+  tests/modules/test_*.py (one per module)
+  Fixtures for synthetic data (bull_flag_bars, fading_bars, etc.)
+
+Phase 7: Dry-run mode + synthetic data
+  python run_live_paper.py --dry-run --bars-provider synthetic:bull_flag
+
+Phase 8: Rich TUI (terminal UI)
+  python run_live_paper.py --tui
+  (useful for SSH, CI/CD, no browser needed)
+
+================================================================================
+
+CURRENT FILES CREATED
+────────────────────────────────────────────────────────────────────────────
+
+Core:
+  core/__init__.py
+  core/contracts.py                          5 module contracts
+  core/telemetry.py                          Metric collection + emission
+  core/validation.py                         Multi-layer validation
+
+Extended:
+  storage/event_schema.py                    +3 event types
+
+Documentation:
+  README_ARCHITECTURE_REDESIGN.md            Start here! Big picture
+  BUILD_SUMMARY.md                           All 8 phases + timeline
+  PHASE1_IMPLEMENTATION.md                   How Phase 1 works
+  PHASE2_PREVIEW.md                          Exact Phase 2 code examples
+  INSPECTION_ROADMAP.md                      What you'll see after Phase 4
+  QUICK_REFERENCE.txt                        This file
+
+Old (no longer needed):
+  ARCHITECTURE_VISUAL.html                   Old static visualization
+  SYSTEM_FLOW.txt                            Old text flow diagram
+  DATA_TRANSFORMATIONS.md                    Old transformation doc
+
+================================================================================
+
+TIMELINE
+────────────────────────────────────────────────────────────────────────────
+
+Week 1:
+  Phase 1: Core infrastructure               ✅ DONE (~2 hours)
+  Phase 2: Module instrumentation            📍 START (~4 hours)
+
+Week 2:
+  Phase 3: Inspection API backend            (~6 hours)
+  Phase 4: React dashboard frontend          (~8 hours)
+
+Week 3:
+  Phase 5: Module refactoring                (~6 hours)
+  Phase 6: Testing framework                 (~5 hours)
+
+Week 4:
+  Phase 7: Dry-run mode                      (~4 hours)
+  Phase 8: TUI (optional)                    (~3 hours)
+
+Total: ~4 weeks for full implementation, or ~2 weeks for core (1-4)
+
+================================================================================
+
+SUCCESS METRICS
+────────────────────────────────────────────────────────────────────────────
+
+After Phase 4, you'll be able to:
+
+  ✓ Open http://127.0.0.1:8011 (inspection dashboard)
+  ✓ See real-time module pipeline (ingestion → research → eval → exec → broker)
+  ✓ Search for a symbol → see complete evaluation journey
+  ✓ Understand why AAPL is blocked (exact stage, metric, threshold)
+  ✓ View timestamps, metrics, and raw data for each stage
+  ✓ See live event stream
+  ✓ Access data quality report
+
+Time to answer "why isn't AAPL signaling?" → 10 seconds (was 30 minutes)
+
+================================================================================
+
+KEY INSIGHTS
+────────────────────────────────────────────────────────────────────────────
+
+The System Used to Work Like:
+  Alpaca API → [silence] → Signal ready → [silence] → Order submitted
+  ❓ Were bars validated?
+  ❓ Which criterion failed?
+  ❓ How long did evaluation take?
+  ❓ What was the gap%?
+
+The System Will Work Like:
+  Alpaca API → ModuleTickEvent(500 rows in, 245ms) → Signal ready
+             → SymbolEvaluationDetailEvent(gap_checked: 2.1% ✓)
+             → SymbolEvaluationDetailEvent(rvol_calculated: 1.2x ✗)
+             → SymbolEvaluationDetailEvent(score: 48% < 60%)
+             → Order rejected (criteria not met)
+
+  Dashboard shows all of this in real-time
+
+================================================================================
+
+NEXT IMMEDIATE STEPS
+────────────────────────────────────────────────────────────────────────────
+
+1. Read README_ARCHITECTURE_REDESIGN.md          (10 minutes)
+2. Read BUILD_SUMMARY.md                         (20 minutes)
+3. Review PHASE1_IMPLEMENTATION.md               (15 minutes)
+4. Skim PHASE2_PREVIEW.md for code examples      (10 minutes)
+5. Decide: Start Phase 2 or want clarifications?
+
+If starting Phase 2:
+  Use PHASE2_PREVIEW.md as your code template
+  Follow task list in BUILD_SUMMARY.md
+  Test after each module (verify events in DB)
+  Expected time: ~4 hours
+
+================================================================================
+
+QUESTIONS?
+────────────────────────────────────────────────────────────────────────────
+
+Common questions answered in:
+
+  "How do I use TelemetryCollector?"
+    → PHASE1_IMPLEMENTATION.md, "Usage Pattern" section
+
+  "What does Phase 2 code look like?"
+    → PHASE2_PREVIEW.md, Examples 1-4
+
+  "What will the dashboard show me?"
+    → INSPECTION_ROADMAP.md, "Real-Time Module Dashboard" section
+
+  "Can I test modules independently?"
+    → Phase 6, coming soon (BUILD_SUMMARY.md)
+
+  "How do I run without API keys?"
+    → Phase 7, --dry-run mode (BUILD_SUMMARY.md)
+
+  "Where do I look if ingestion fails?"
+    → Inspection dashboard, Module Grid, click "ingestion", see error
+
+  "How do I know bars are being collected?"
+    → ModuleTickEvent shows input_count after Phase 2
+
+  "How do I verify research data?"
+    → DataValidationEvent after Phase 2, dashboard after Phase 4
+
+================================================================================
+
+READY TO START?
+────────────────────────────────────────────────────────────────────────────
+
+Phase 1 is complete. You have the foundation.
+
+Phase 2 is ~4 hours of work:
+  - Wrap 5 modules with TelemetryCollector
+  - Add validation checkpoints
+  - Emit completion events
+  - Test
+
+After Phase 2, you'll start seeing telemetry events in your event store.
+After Phase 4, you'll have a fully functional inspection dashboard.
+
+Let's go!
+
+================================================================================

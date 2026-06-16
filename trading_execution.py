@@ -1,0 +1,466 @@
+"""Trading execution service (Milestone 4/5 glue).
+
+Connects ready signals to broker execution with risk controls and an
+approval workflow:
+
+    signal_ready
+      -> risk checks (sizing, max concurrent, daily-loss circuit breaker)
+      -> order_approval_requested
+      -> [manual approval in the dashboard]  or  [auto-approve]
+      -> order_approved -> broker submit -> order_submitted (+ filled)
+
+Exit orders close existing broker positions on demand.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime
+
+from alpaca_paper.execution import (
+    AlpacaPaperExecutor,
+    ExecutionRequest,
+)
+from storage.event_schema import (
+    EventMode,
+    OrderApprovalRequestedEvent,
+    OrderApprovedEvent,
+    OrderRejectedEvent,
+    RiskRuleTriggeredEvent,
+)
+from storage.event_store import EventStore
+from storage.projections import (
+    query_account_positions_snapshot,
+    query_approval_queue,
+    query_ready_signals_snapshot,
+)
+from strategy.risk.position_sizing import (
+    PositionSizingConfig,
+    calculate_position_size,
+)
+from trading_mode import TradingModeSettings
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ExecutionSettings:
+    enabled: bool = True
+    auto_approve: bool = False
+    max_orders_per_tick: int = 1
+    max_concurrent_positions: int = 3
+    risk_per_trade_pct: float = 0.01
+    default_equity: float = 100_000.0
+    max_daily_loss_pct: float = 0.03
+    # --- entry mechanism (Ross-Cameron-style; all tunable) -----------------
+    # reward target as a multiple of risk (entry + reward_multiple * (entry-stop))
+    reward_multiple: float = 2.0
+    # how the entry order is placed: "limit" rests at the entry trigger so an
+    # unfilled order is a real, cancellable state; "market" fills immediately
+    entry_order_type: str = "limit"
+    # cancel an unfilled entry after this many minutes of resting (the "back
+    # out" time box; ~1 bar == 1 minute). 0 disables the timeout. Wall-clock
+    # based, so the invalidation guard can run far more often than this.
+    entry_timeout_bars: int = 2
+    # cancel an unfilled entry if price trades back below the entry trigger by
+    # this fraction (e.g. 0.0 = any break below entry; 0.005 = 0.5% below).
+    # Set to a negative number to disable price-break invalidation.
+    entry_invalidate_pct: float = 0.0
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
+        values = dict(os.environ)
+        if env is not None:
+            values.update(env)
+
+        def flag(key: str, default: str) -> bool:
+            return values.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
+
+        order_type = values.get("TRADING_ENTRY_ORDER_TYPE", "limit").strip().lower()
+        if order_type not in {"limit", "market"}:
+            order_type = "limit"
+
+        return cls(
+            enabled=flag("TRADING_EXECUTION_ENABLED", "1"),
+            auto_approve=flag("TRADING_AUTO_APPROVE", "0"),
+            max_orders_per_tick=int(values.get("TRADING_MAX_ORDERS_PER_TICK", "1")),
+            max_concurrent_positions=int(
+                values.get("TRADING_MAX_CONCURRENT_POSITIONS", "3")
+            ),
+            risk_per_trade_pct=float(values.get("TRADING_RISK_PER_TRADE_PCT", "0.01")),
+            default_equity=float(values.get("TRADING_DEFAULT_EQUITY", "100000")),
+            max_daily_loss_pct=float(values.get("TRADING_MAX_DAILY_LOSS_PCT", "0.03")),
+            reward_multiple=float(values.get("TRADING_REWARD_MULTIPLE", "2.0")),
+            entry_order_type=order_type,
+            entry_timeout_bars=int(values.get("TRADING_ENTRY_TIMEOUT_BARS", "2")),
+            entry_invalidate_pct=float(
+                values.get("TRADING_ENTRY_INVALIDATE_PCT", "0.0")
+            ),
+        )
+
+
+class TradingExecutionService:
+    """Drives the signal -> approval -> order pipeline each tick."""
+
+    def __init__(
+        self,
+        store: EventStore,
+        executor: AlpacaPaperExecutor | None = None,
+        settings: ExecutionSettings | None = None,
+        trading_mode: TradingModeSettings | None = None,
+        session_id: str | None = None,
+        equity: float | None = None,
+        price_provider=None,
+        now_fn=None,
+    ):
+        self.store = store
+        self.settings = settings or ExecutionSettings.from_env()
+        self.trading_mode = trading_mode or TradingModeSettings.from_env()
+        self.session_id = session_id
+        self.equity = equity or self.settings.default_equity
+        self.executor = executor or AlpacaPaperExecutor(
+            store, session_id=session_id
+        )
+        self.mode = EventMode.PAPER
+        # optional callable: symbol -> latest price, used to invalidate unfilled
+        # entries that break back below the entry trigger before filling
+        self.price_provider = price_provider
+        # injectable clock so the entry timeout is wall-clock based (and so the
+        # invalidation check can run far more often than the timeout window
+        # without changing the timeout's meaning); tests pass a fake clock
+        self._now = now_fn or datetime.now
+        # signals we've already requested approval for this session
+        self._requested_symbols: set[str] = set()
+        # armed (submitted, awaiting fill) entries we may need to cancel.
+        # order_id -> {symbol, entry_price, broker_order_id, armed_at, checks}
+        self._armed: dict[str, dict] = {}
+
+    # -- pipeline -----------------------------------------------------------
+
+    def _open_position_count(self) -> int:
+        snapshots = query_account_positions_snapshot(
+            self.store, broker_name=self.executor.broker_name
+        )
+        if not snapshots:
+            return 0
+        return len(snapshots[-1].get("positions") or [])
+
+    def _held_symbols(self) -> set[str]:
+        snapshots = query_account_positions_snapshot(
+            self.store, broker_name=self.executor.broker_name
+        )
+        if not snapshots:
+            return set()
+        return {
+            str(p.get("symbol"))
+            for p in snapshots[-1].get("positions") or []
+            if p.get("symbol")
+        }
+
+    def request_approvals_for_ready_signals(self) -> list[str]:
+        """Turn fresh ready signals into approval requests. Returns order ids."""
+        if not self.settings.enabled:
+            return []
+
+        if self._open_position_count() >= self.settings.max_concurrent_positions:
+            self.store.emit(
+                RiskRuleTriggeredEvent(
+                    timestamp=datetime.now(),
+                    mode=self.mode,
+                    correlation_id=self.session_id,
+                    message="Max concurrent positions reached — no new entries",
+                    rule_type="max_concurrent_positions",
+                    rule_value=float(self.settings.max_concurrent_positions),
+                    current_state={"open_positions": self._open_position_count()},
+                    action_taken="skipped_new_entries",
+                )
+            )
+            return []
+
+        held = self._held_symbols()
+        pending = {row["symbol"] for row in query_approval_queue(self.store)}
+        signals = query_ready_signals_snapshot(self.store, session_id=self.session_id)
+
+        created: list[str] = []
+        for signal in signals:
+            if len(created) >= self.settings.max_orders_per_tick:
+                break
+            symbol = signal["symbol"]
+            if symbol in held or symbol in pending or symbol in self._requested_symbols:
+                continue
+            entry = signal.get("entry_price")
+            stop = signal.get("stop_loss_price")
+            if not entry or not stop or stop >= entry:
+                continue
+
+            sizing = calculate_position_size(
+                float(entry),
+                float(stop),
+                equity=self.equity,
+                config=PositionSizingConfig(
+                    risk_per_trade_pct=self.settings.risk_per_trade_pct,
+                    default_equity=self.settings.default_equity,
+                ),
+            )
+            if sizing.position_size <= 0:
+                continue
+
+            entry_f = float(entry)
+            stop_f = float(stop)
+            risk_per_share = entry_f - stop_f
+            request = ExecutionRequest(
+                symbol=symbol,
+                side="buy",
+                quantity=sizing.position_size,
+                entry_price=entry_f,
+                stop_loss_price=stop_f,
+                take_profit_price=round(
+                    entry_f + self.settings.reward_multiple * risk_per_share, 2
+                ),
+                order_type=self.settings.entry_order_type,
+            )
+            approval_mode = "auto" if self.settings.auto_approve else "manual"
+            self.store.emit(
+                OrderApprovalRequestedEvent(
+                    timestamp=datetime.now(),
+                    mode=self.mode,
+                    correlation_id=self.session_id,
+                    message=(
+                        f"Approval requested ({approval_mode}): buy "
+                        f"{request.quantity} {symbol} @ ~{entry} stop {stop}"
+                    ),
+                    order_id=request.order_id,
+                    symbol=symbol,
+                    requested_by="trading_execution",
+                    approval_mode=approval_mode,
+                    execution_mode=self.trading_mode.execution_mode,
+                    execution_request=request.to_payload(),
+                )
+            )
+            self._requested_symbols.add(symbol)
+            created.append(request.order_id)
+            logger.info("approval requested for %s (%s)", symbol, request.order_id)
+
+        return created
+
+    def approve_order(
+        self, order_id: str, approved_by: str = "dashboard", notes: str | None = None
+    ) -> dict:
+        """Approve a pending order and execute it."""
+        entry = self._find_pending(order_id)
+        if entry is None:
+            return {"ok": False, "error": f"order {order_id} not pending"}
+        request = ExecutionRequest.from_payload(entry["execution_request"])
+        self.store.emit(
+            OrderApprovedEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=f"Order {order_id} approved by {approved_by}",
+                order_id=order_id,
+                symbol=request.symbol,
+                approved_by=approved_by,
+                approval_notes=notes,
+            )
+        )
+        result = self.executor.execute(request)
+        # If the entry didn't fill immediately (a resting limit at the trigger),
+        # arm it so expire_stale_entries() can back out on timeout or a break
+        # below the entry. Market orders that fill on submit are never armed.
+        if result.ok and result.status not in {"filled", "cancelled"} and request.entry_price:
+            self._armed[order_id] = {
+                "symbol": request.symbol,
+                "entry_price": float(request.entry_price),
+                "broker_order_id": result.broker_order_id,
+                "armed_at": self._now(),
+                "checks": 0,
+            }
+        return {
+            "ok": result.ok,
+            "order_id": order_id,
+            "broker_order_id": result.broker_order_id,
+            "status": result.status,
+            "error": result.error,
+        }
+
+    def reject_order(
+        self, order_id: str, rejected_by: str = "dashboard", reason: str = "manual"
+    ) -> dict:
+        entry = self._find_pending(order_id)
+        if entry is None:
+            return {"ok": False, "error": f"order {order_id} not pending"}
+        self.store.emit(
+            OrderRejectedEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=f"Order {order_id} rejected by {rejected_by}: {reason}",
+                order_id=order_id,
+                symbol=entry.get("symbol") or "",
+                rejected_by=rejected_by,
+                rejection_reason=reason,
+            )
+        )
+        # allow the symbol to re-signal later
+        self._requested_symbols.discard(entry.get("symbol") or "")
+        return {"ok": True, "order_id": order_id}
+
+    def process_auto_approvals(self) -> list[dict]:
+        """Auto-approve any pending requests marked approval_mode=auto."""
+        results = []
+        for entry in query_approval_queue(self.store):
+            if entry.get("approval_mode") == "auto":
+                results.append(
+                    self.approve_order(entry["order_id"], approved_by="auto")
+                )
+        return results
+
+    def submit_exit_order(self, symbol: str, reason: str = "manual_exit") -> dict:
+        """Close an open broker position for symbol with a market sell."""
+        held = self._held_symbols()
+        quantity = None
+        snapshots = query_account_positions_snapshot(
+            self.store, broker_name=self.executor.broker_name
+        )
+        if snapshots:
+            for p in snapshots[-1].get("positions") or []:
+                if str(p.get("symbol")) == symbol:
+                    quantity = int(abs(float(p.get("quantity") or 0)))
+        if symbol not in held or not quantity:
+            return {"ok": False, "error": f"no open position for {symbol}"}
+        request = ExecutionRequest(symbol=symbol, side="sell", quantity=quantity)
+        result = self.executor.execute(request)
+        return {
+            "ok": result.ok,
+            "order_id": request.order_id,
+            "broker_order_id": result.broker_order_id,
+            "status": result.status,
+            "error": result.error,
+            "reason": reason,
+        }
+
+    def _filled_order_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for e in self.store.query_events(event_type="order_filled", limit=None):
+            payload = json.loads(e.get("payload_json", "{}"))
+            if payload.get("order_id"):
+                ids.add(str(payload["order_id"]))
+        return ids
+
+    def _cancelled_order_ids(self) -> set[str]:
+        ids: set[str] = set()
+        for e in self.store.query_events(event_type="order_cancelled", limit=None):
+            payload = json.loads(e.get("payload_json", "{}"))
+            if payload.get("order_id"):
+                ids.add(str(payload["order_id"]))
+        return ids
+
+    def expire_stale_entries(self) -> list[dict]:
+        """Back out of unfilled entries that timed out or broke their trigger.
+
+        This is the disciplined other half of auto-arming: once a setup is
+        recognized we enter with conviction, but if the fill never comes (the
+        move didn't follow through) we don't sit there forever — we cancel on a
+        time box or when price falls back through the entry, freeing risk
+        budget and the concurrent-position slot for the next setup.
+
+        Safe to call as often as you like: the price-break check uses the live
+        ``price_provider`` each call, while the timeout is wall-clock based, so
+        running this every few seconds reacts fast without shortening the
+        timeout window.
+        """
+        if not self._armed:
+            return []
+
+        filled = self._filled_order_ids()
+        cancelled = self._cancelled_order_ids()
+        invalidate_pct = self.settings.entry_invalidate_pct
+        timeout_bars = self.settings.entry_timeout_bars
+        now = self._now()
+        actions: list[dict] = []
+
+        for order_id in list(self._armed):
+            armed = self._armed[order_id]
+            symbol = armed["symbol"]
+
+            # already resolved at the broker -> stop tracking
+            if order_id in filled:
+                self._armed.pop(order_id, None)
+                continue
+            if order_id in cancelled:
+                self._armed.pop(order_id, None)
+                self._requested_symbols.discard(symbol)
+                continue
+
+            armed["checks"] += 1
+            reason = None
+
+            # (a) price-break invalidation: traded back below the entry trigger.
+            # Uses the live last-trade price, so this reacts tick-by-tick rather
+            # than waiting for a bar to close.
+            if invalidate_pct >= 0 and self.price_provider is not None:
+                try:
+                    last = self.price_provider(symbol)
+                except Exception:  # noqa: BLE001
+                    last = None
+                if last is not None:
+                    threshold = armed["entry_price"] * (1.0 - invalidate_pct)
+                    if float(last) < threshold:
+                        reason = (
+                            f"entry invalidated: {float(last):.4f} < trigger "
+                            f"{threshold:.4f}"
+                        )
+
+            # (b) time box: unfilled for too long (wall-clock minutes ~ bars)
+            if reason is None and timeout_bars > 0:
+                elapsed_min = (now - armed["armed_at"]).total_seconds() / 60.0
+                if elapsed_min >= timeout_bars:
+                    reason = f"entry timed out: unfilled {elapsed_min:.1f} min"
+
+            if reason is not None:
+                self.executor.cancel_entry(
+                    order_id, armed.get("broker_order_id"), symbol, reason
+                )
+                self.store.emit(
+                    RiskRuleTriggeredEvent(
+                        timestamp=datetime.now(),
+                        mode=self.mode,
+                        correlation_id=self.session_id,
+                        message=f"Backed out of {symbol} entry — {reason}",
+                        rule_type="entry_backout",
+                        rule_value=float(timeout_bars),
+                        current_state={
+                            "symbol": symbol,
+                            "order_id": order_id,
+                            "checks": armed["checks"],
+                        },
+                        action_taken="cancelled_unfilled_entry",
+                    )
+                )
+                self._armed.pop(order_id, None)
+                self._requested_symbols.discard(symbol)
+                actions.append({"order_id": order_id, "symbol": symbol, "reason": reason})
+
+        return actions
+
+    def tick(self) -> dict:
+        """One execution pass: expire stale entries, request approvals, auto-execute."""
+        backed_out = self.expire_stale_entries()
+        requested = self.request_approvals_for_ready_signals()
+        auto = self.process_auto_approvals() if self.settings.auto_approve else []
+        return {
+            "approvals_requested": requested,
+            "auto_executed": auto,
+            "backed_out": backed_out,
+        }
+
+    # -- helpers --------------------------------------------------------------
+
+    def _find_pending(self, order_id: str) -> dict | None:
+        for entry in query_approval_queue(self.store):
+            if str(entry.get("order_id")) == str(order_id):
+                return entry
+        return None

@@ -1,0 +1,598 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Momentum — Trading Control Room</title>
+<style>
+  :root {
+    --bg: #0b0e14;
+    --panel: #11151f;
+    --panel-2: #161b28;
+    --border: #1f2636;
+    --text: #d7dce6;
+    --muted: #76809a;
+    --accent: #4f9cf9;
+    --green: #2fbf71;
+    --red: #e5484d;
+    --amber: #f5a524;
+    --purple: #b89ad6;
+    --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.5 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 14px;
+    padding: 12px 22px;
+    border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #10141e, #0b0e14);
+    position: sticky; top: 0; z-index: 20;
+  }
+  header h1 { font-size: 16px; font-weight: 650; letter-spacing: .4px; }
+  header h1 span { color: var(--accent); }
+  .badge {
+    font: 600 11px/1 var(--mono); letter-spacing: .8px; text-transform: uppercase;
+    padding: 5px 10px; border-radius: 4px; border: 1px solid;
+  }
+  .badge.paper { color: var(--accent); border-color: #2a4a78; background: #12243d; }
+  .badge.live  { color: #ff8589; border-color: #6e2226; background: #341417; }
+  .spacer { flex: 1; }
+  .stamp { color: var(--muted); font: 12px var(--mono); }
+  .conn { display: flex; align-items: center; gap: 7px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background .3s; }
+  .dot.live { background: var(--green); box-shadow: 0 0 8px rgba(47,191,113,.6); animation: pulse 2s infinite; }
+  .dot.err { background: var(--red); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .45; } }
+  .hdr-btn {
+    font: 600 11px var(--mono); letter-spacing: .5px;
+    background: var(--panel-2); color: var(--muted);
+    border: 1px solid var(--border); border-radius: 4px;
+    padding: 5px 9px; cursor: pointer;
+  }
+  .hdr-btn.on { color: var(--accent); border-color: #2a4a78; }
+
+  /* P&L strip */
+  .pnl-strip {
+    display: flex; gap: 0; flex-wrap: wrap;
+    border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .pnl-cell {
+    flex: 1; min-width: 120px;
+    padding: 10px 18px;
+    border-right: 1px solid var(--border);
+  }
+  .pnl-cell .label { font: 600 10px var(--mono); text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
+  .pnl-cell .value { font: 650 20px var(--mono); margin-top: 3px; }
+  .pos { color: var(--green); } .neg { color: var(--red); }
+
+  main {
+    display: grid; grid-template-columns: repeat(12, 1fr);
+    gap: 14px; padding: 16px 22px 56px; max-width: 1600px; margin: 0 auto;
+  }
+  .panel {
+    grid-column: span 6; background: var(--panel);
+    border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+  }
+  .panel.full { grid-column: span 12; }
+  .panel h2 {
+    font-size: 12px; font-weight: 650; letter-spacing: 1px; text-transform: uppercase;
+    color: var(--muted); padding: 11px 14px; border-bottom: 1px solid var(--border);
+    background: var(--panel-2); display: flex; align-items: center; gap: 8px;
+  }
+  .count { font: 600 11px var(--mono); background: var(--border); color: var(--text); border-radius: 10px; padding: 1px 8px; }
+  .hint { margin-left: auto; font: 500 10px var(--mono); color: var(--muted); letter-spacing: .3px; text-transform: none; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; font: 600 11px var(--mono); text-transform: uppercase; letter-spacing: .6px; color: var(--muted); padding: 8px 14px; border-bottom: 1px solid var(--border); }
+  td { padding: 8px 14px; border-bottom: 1px solid #151a26; font-size: 13px; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .num { font-family: var(--mono); }
+  .sym { font: 600 13px var(--mono); color: #e9edf5; }
+  .empty { color: var(--muted); padding: 18px 14px; font-size: 13px; }
+  .pill { display: inline-block; font: 600 10px var(--mono); text-transform: uppercase; letter-spacing: .6px; padding: 3px 8px; border-radius: 3px; }
+  .pill.ready { background: #12362a; color: var(--green); }
+  .pill.watching { background: #14283f; color: var(--accent); }
+  .pill.blocked { background: #38221a; color: var(--amber); }
+  .pill.late { background: #2a2330; color: var(--purple); }
+  .pill.discovered { background: #1c2230; color: var(--muted); }
+  .pill.long { background: #12362a; color: var(--green); }
+  .pill.short { background: #3a191c; color: #ff8589; }
+
+  button { font: 600 12px -apple-system, "Segoe UI", sans-serif; border: 1px solid transparent; border-radius: 5px; padding: 6px 12px; cursor: pointer; transition: filter .12s; }
+  button:hover { filter: brightness(1.18); }
+  button:disabled { opacity: .45; cursor: default; }
+  .btn-approve { background: #15452f; color: #6ee7a8; border-color: #1f6b48; }
+  .btn-reject { background: #3c1d20; color: #ff9296; border-color: #6e2226; }
+  .btn-exit { background: #3a2a12; color: #ffc456; border-color: #6b4e1f; }
+  .actions { display: flex; gap: 6px; }
+
+  /* sparkline canvas */
+  .spark { display: block; width: 132px; height: 38px; }
+  .spark-wrap { position: relative; }
+  .spark-meta { font: 500 9px var(--mono); color: var(--muted); margin-top: 1px; }
+
+  /* expandable criteria row */
+  .expandable { cursor: pointer; }
+  .expandable:hover { background: #131826; }
+  .caret { display: inline-block; width: 10px; color: var(--muted); transition: transform .15s; }
+  .caret.open { transform: rotate(90deg); }
+  .criteria-cell { padding: 0 !important; background: #0d111a; }
+  .criteria-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 7px; padding: 12px 16px; }
+  .crit { display: flex; align-items: center; gap: 7px; font: 500 12px var(--mono); }
+  .crit .mark { width: 15px; height: 15px; border-radius: 3px; display: grid; place-items: center; font-size: 10px; font-weight: 700; flex-shrink: 0; }
+  .crit.pass .mark { background: #12362a; color: var(--green); }
+  .crit.fail .mark { background: #38221a; color: var(--amber); }
+  .crit.skip .mark { background: #1c2230; color: var(--muted); }
+  .crit.fail { color: #c9a98a; }
+  .crit.skip { color: var(--muted); }
+
+  /* risk preview chip */
+  .risk { font: 500 11px var(--mono); color: var(--muted); }
+  .risk b { color: var(--text); font-weight: 600; }
+
+  /* activity feed */
+  .feed-row { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid #151a26; font: 500 12px var(--mono); }
+  .feed-row:last-child { border-bottom: none; }
+  .feed-dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+  .feed-time { color: var(--muted); font-size: 11px; min-width: 64px; }
+
+  .toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel-2); border: 1px solid var(--border); border-left: 3px solid var(--accent); padding: 11px 16px; border-radius: 6px; font-size: 13px; max-width: 380px; opacity: 0; transform: translateY(8px); transition: all .25s; pointer-events: none; z-index: 50; }
+  .toast.show { opacity: 1; transform: none; }
+  .toast.err { border-left-color: var(--red); }
+  .toast.ok { border-left-color: var(--green); }
+  .acct-row { display: flex; gap: 26px; padding: 12px 14px; flex-wrap: wrap; }
+  .metric { min-width: 120px; }
+  .metric .label { font: 600 10px var(--mono); text-transform: uppercase; letter-spacing: .7px; color: var(--muted); }
+  .metric .value { font: 600 17px var(--mono); margin-top: 2px; }
+
+  .inject { display: flex; gap: 6px; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  .inject input { flex: 1; background: #0d111a; border: 1px solid var(--border); border-radius: 5px; color: var(--text); padding: 6px 10px; font: 600 12px var(--mono); text-transform: uppercase; }
+  .inject input:focus { outline: none; border-color: var(--accent); }
+  .inject button { background: #14283f; color: var(--accent); border-color: #2a4a78; }
+
+  /* keyboard help overlay */
+  .kbd-help { position: fixed; inset: 0; background: rgba(6,8,12,.82); display: none; place-items: center; z-index: 60; }
+  .kbd-help.show { display: grid; }
+  .kbd-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 24px 28px; max-width: 420px; }
+  .kbd-card h3 { font-size: 14px; margin-bottom: 14px; letter-spacing: .5px; }
+  .kbd-card .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; color: var(--muted); }
+  kbd { background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 2px 7px; font: 600 12px var(--mono); color: var(--text); }
+  @media (max-width: 1040px) { .panel { grid-column: span 12; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>MOMENTUM <span>/ control room</span></h1>
+  <span id="mode-badge" class="badge paper">PAPER</span>
+  <div class="spacer"></div>
+  <button id="sound-toggle" class="hdr-btn" title="Toggle signal alert sound">SOUND OFF</button>
+  <button id="kbd-toggle" class="hdr-btn" title="Keyboard shortcuts (?)">KEYS</button>
+  <div class="conn"><div id="conn-dot" class="dot"></div><span id="stamp" class="stamp">connecting...</span></div>
+</header>
+
+<div class="pnl-strip" id="pnl-strip">
+  <div class="pnl-cell"><div class="label">Total P&amp;L</div><div class="value num" id="pnl-total">—</div></div>
+  <div class="pnl-cell"><div class="label">Realized</div><div class="value num" id="pnl-realized">—</div></div>
+  <div class="pnl-cell"><div class="label">Unrealized</div><div class="value num" id="pnl-unrealized">—</div></div>
+  <div class="pnl-cell"><div class="label">Win Rate</div><div class="value num" id="pnl-winrate">—</div></div>
+  <div class="pnl-cell"><div class="label">Avg R</div><div class="value num" id="pnl-avgr">—</div></div>
+  <div class="pnl-cell"><div class="label">Open / Closed</div><div class="value num" id="pnl-counts">—</div></div>
+</div>
+
+<main>
+  <section class="panel full">
+    <h2>Account <span id="acct-count" class="count">0</span></h2>
+    <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Approval Queue <span id="aq-count" class="count">0</span><span class="hint">A approve top &middot; R reject top</span></h2>
+    <div id="approval-queue"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Ready Signals <span id="rs-count" class="count">0</span></h2>
+    <div id="ready-signals"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Open Positions <span id="pos-count" class="count">0</span></h2>
+    <div id="positions"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Watch States <span id="ws-count" class="count">0</span><span class="hint">click a row for criteria</span></h2>
+    <div class="inject">
+      <input id="inject-input" placeholder="add symbol..." maxlength="6" autocomplete="off">
+      <button id="inject-btn">Watch</button>
+    </div>
+    <div id="watch-states"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Activity Feed <span id="feed-count" class="count">0</span></h2>
+    <div id="feed"></div>
+  </section>
+
+  <section class="panel">
+    <h2>Order Lifecycle <span id="ol-count" class="count">0</span></h2>
+    <div id="order-lifecycle"></div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+
+<div id="kbd-help" class="kbd-help">
+  <div class="kbd-card">
+    <h3>Keyboard shortcuts</h3>
+    <div class="row"><span>Approve top of queue</span><kbd>A</kbd></div>
+    <div class="row"><span>Reject top of queue</span><kbd>R</kbd></div>
+    <div class="row"><span>Toggle alert sound</span><kbd>S</kbd></div>
+    <div class="row"><span>Focus add-symbol box</span><kbd>/</kbd></div>
+    <div class="row"><span>Show / hide this help</span><kbd>?</kbd></div>
+    <div class="row"><span>Close help</span><kbd>Esc</kbd></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const fmt = (v, dp = 2) => (v === null || v === undefined || v === "" || isNaN(+v)) ? "—" : (+v).toFixed(dp);
+const money = (v) => (v === null || v === undefined || isNaN(+v)) ? "—" : (v < 0 ? "-$" : "$") + Math.abs(+v).toLocaleString("en-US", {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const timeOf = (ts) => { try { return new Date(ts).toLocaleTimeString(); } catch { return "—"; } };
+const signed = (el, v) => {
+  el.textContent = (v === null || v === undefined || isNaN(+v)) ? "—" : money(v);
+  el.className = "value num " + (+v > 0 ? "pos" : +v < 0 ? "neg" : "");
+};
+
+let latest = null;
+let soundOn = false;
+let lastSignalKey = "";
+const expanded = new Set();
+const barsCache = {};
+
+let toastTimer;
+function toast(msg, kind) {
+  const t = $("toast");
+  t.textContent = msg;
+  t.className = "toast show" + (kind ? " " + kind : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => t.classList.remove("show"), 4000);
+}
+
+let audioCtx;
+function beep() {
+  if (!soundOn) return;
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1320].forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = "sine"; osc.frequency.value = freq;
+      const t0 = audioCtx.currentTime + i * 0.12;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.25, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.18);
+      osc.connect(gain); gain.connect(audioCtx.destination);
+      osc.start(t0); osc.stop(t0 + 0.2);
+    });
+  } catch (e) {}
+}
+
+async function post(path, body) {
+  try {
+    const r = await fetch(path, { method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body) });
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok || data.ok === false) toast(data.error || ("failed (" + r.status + ")"), "err");
+    else toast(data.status ? ("OK — " + data.status) : (data.symbol ? "Added " + data.symbol : "Done"), "ok");
+  } catch (e) { toast("network error: " + e.message, "err"); }
+}
+const approve = (id) => post("/api/trading/approvals/approve", {order_id: id, approved_by: "dashboard"});
+const reject  = (id) => post("/api/trading/approvals/reject",  {order_id: id, reason: "dashboard_reject"});
+const exitPos = (sym) => { if (confirm("Submit market exit for " + sym + "?")) post("/api/trading/exit-order", {symbol: sym}); };
+
+function drawSpark(canvas, bars, entry, stop) {
+  const dpr = window.devicePixelRatio || 1;
+  const W = 132, H = 38;
+  canvas.width = W * dpr; canvas.height = H * dpr;
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  if (!bars || bars.length < 2) {
+    ctx.fillStyle = "#76809a"; ctx.font = "9px monospace";
+    ctx.fillText("no bars", 6, 22); return;
+  }
+  const closes = bars.map(b => b.c);
+  const levels = [entry, stop].filter(v => v != null && !isNaN(v));
+  const lo = Math.min.apply(null, closes.concat(levels));
+  const hi = Math.max.apply(null, closes.concat(levels));
+  const pad = (hi - lo) * 0.12 || 0.1;
+  const min = lo - pad, max = hi + pad;
+  const x = (i) => 2 + i * (W - 4) / (closes.length - 1);
+  const y = (v) => H - 3 - (v - min) / (max - min) * (H - 6);
+
+  const refLine = (v, color) => {
+    if (v == null || isNaN(v)) return;
+    ctx.strokeStyle = color; ctx.globalAlpha = 0.5; ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]); ctx.beginPath();
+    ctx.moveTo(2, y(v)); ctx.lineTo(W - 2, y(v)); ctx.stroke();
+    ctx.setLineDash([]); ctx.globalAlpha = 1;
+  };
+  refLine(entry, "#4f9cf9");
+  refLine(stop, "#e5484d");
+
+  const up = closes[closes.length - 1] >= closes[0];
+  ctx.strokeStyle = up ? "#2fbf71" : "#e5484d";
+  ctx.lineWidth = 1.5; ctx.beginPath();
+  closes.forEach((c, i) => i ? ctx.lineTo(x(i), y(c)) : ctx.moveTo(x(i), y(c)));
+  ctx.stroke();
+
+  ctx.lineTo(x(closes.length - 1), H); ctx.lineTo(x(0), H); ctx.closePath();
+  ctx.globalAlpha = 0.10; ctx.fillStyle = up ? "#2fbf71" : "#e5484d";
+  ctx.fill(); ctx.globalAlpha = 1;
+
+  ctx.fillStyle = up ? "#2fbf71" : "#e5484d";
+  ctx.beginPath(); ctx.arc(x(closes.length - 1), y(closes[closes.length - 1]), 2, 0, 7); ctx.fill();
+}
+
+async function loadBars(symbol, entry, stop, canvas) {
+  const cached = barsCache[symbol];
+  if (cached && (Date.now() - cached.fetchedAt < 8000)) { drawSpark(canvas, cached.bars, entry, stop); return; }
+  try {
+    const r = await fetch("/api/bars?symbol=" + encodeURIComponent(symbol) + "&minutes=40");
+    const data = await r.json();
+    barsCache[symbol] = { bars: data.bars || [], fetchedAt: Date.now() };
+    drawSpark(canvas, data.bars || [], entry, stop);
+  } catch (e) { drawSpark(canvas, [], entry, stop); }
+}
+
+function riskChip(req) {
+  const qty = +req.quantity || 0, entry = +req.entry_price || 0, stop = +req.stop_loss_price || 0;
+  if (!qty || !entry || !stop) return "";
+  const perShare = Math.abs(entry - stop);
+  const dollarRisk = perShare * qty;
+  const notional = entry * qty;
+  return '<span class="risk">risk <b>' + money(dollarRisk) + '</b> &middot; ' + qty + 'sh &middot; notional <b>' + money(notional) + '</b> &middot; stop <b>' + (perShare/entry*100).toFixed(1) + '%</b></span>';
+}
+
+function table(headers, rows) {
+  if (!rows.length) return null;
+  return "<table><thead><tr>" + headers.map(h => "<th>" + h + "</th>").join("") + "</tr></thead><tbody>" + rows.join("") + "</tbody></table>";
+}
+function fill(id, html, emptyMsg) { $(id).innerHTML = html || '<div class="empty">' + emptyMsg + "</div>"; }
+
+async function toggleCriteria(symbol) {
+  if (expanded.has(symbol)) expanded.delete(symbol); else expanded.add(symbol);
+  if (latest) renderWatch(latest.watch_states || []);
+  if (expanded.has(symbol)) {
+    try {
+      const r = await fetch("/api/criteria?symbol=" + encodeURIComponent(symbol));
+      const host = document.querySelector('[data-crit="' + CSS.escape(symbol) + '"]');
+      if (host) host.innerHTML = renderCriteriaGrid(await r.json());
+    } catch (e) {}
+  }
+}
+function renderCriteriaGrid(data) {
+  if (!data.criteria || !data.criteria.length)
+    return '<div class="empty" style="padding:12px 16px">No criteria evaluated yet.</div>';
+  const cells = data.criteria.map(c => {
+    const cls = c.passed === true ? "pass" : c.passed === false ? "fail" : "skip";
+    const mark = c.passed === true ? "✓" : c.passed === false ? "✕" : "·";
+    return '<div class="crit ' + cls + '"><span class="mark">' + mark + '</span>' + esc(c.label) + '</div>';
+  }).join("");
+  const score = data.score != null ? 'score ' + (+data.score).toFixed(0) + '% &middot; ' + data.passed_count + '/' + data.total_count + ' &middot; ' + esc(data.status||"") : "";
+  return '<div class="criteria-grid">' + cells + '</div><div class="spark-meta" style="padding:0 16px 10px">' + score + '</div>';
+}
+
+function renderWatch(ws) {
+  $("ws-count").textContent = ws.length;
+  if (!ws.length) { fill("watch-states", null, "Watcher has not evaluated any symbols yet."); return; }
+  const rows = ws.map(w => {
+    const isOpen = expanded.has(w.symbol);
+    const main = '<tr class="expandable" onclick="toggleCriteria(\'' + esc(w.symbol) + '\')">' +
+      '<td><span class="caret ' + (isOpen ? "open" : "") + '">▶</span> <span class="sym">' + esc(w.symbol) + '</span></td>' +
+      '<td><span class="pill ' + esc(w.state || "discovered") + '">' + esc(w.state || "—") + '</span></td>' +
+      '<td class="num">' + fmt(w.last_score, 0) + (w.last_score != null ? "%" : "") + '</td>' +
+      '<td style="color:var(--muted)">' + esc(w.state_reason || "") + '</td>' +
+      '<td class="num">' + timeOf(w.last_transition_at || w.last_criteria_at) + '</td></tr>';
+    const detail = isOpen
+      ? '<tr><td class="criteria-cell" colspan="5"><div data-crit="' + esc(w.symbol) + '"><div class="empty" style="padding:12px 16px">loading...</div></div></td></tr>'
+      : "";
+    return main + detail;
+  });
+  fill("watch-states", table(["Symbol", "State", "Score", "Reason", "Updated"], rows), "");
+  expanded.forEach(async (symbol) => {
+    const host = document.querySelector('[data-crit="' + CSS.escape(symbol) + '"]');
+    if (host && host.querySelector(".empty")) {
+      try { host.innerHTML = renderCriteriaGrid(await (await fetch("/api/criteria?symbol=" + encodeURIComponent(symbol))).json()); }
+      catch (e) {}
+    }
+  });
+}
+
+function render(d) {
+  latest = d;
+
+  const live = d.execution_mode === "schwab_live";
+  const badge = $("mode-badge");
+  badge.textContent = live ? "LIVE · SCHWAB" : "PAPER · ALPACA";
+  badge.className = "badge " + (live ? "live" : "paper");
+
+  const p = d.pnl || {};
+  signed($("pnl-total"), p.total_pnl);
+  signed($("pnl-realized"), p.realized_pnl);
+  signed($("pnl-unrealized"), p.unrealized_pnl);
+  $("pnl-winrate").textContent = p.win_rate != null ? (p.win_rate * 100).toFixed(0) + "%" : "—";
+  $("pnl-winrate").className = "value num";
+  $("pnl-avgr").textContent = p.avg_r_multiple != null ? p.avg_r_multiple.toFixed(2) + "R" : "—";
+  $("pnl-avgr").className = "value num " + (p.avg_r_multiple > 0 ? "pos" : p.avg_r_multiple < 0 ? "neg" : "");
+  $("pnl-counts").textContent = (p.open_positions != null ? p.open_positions : 0) + " / " + (p.closed_trades != null ? p.closed_trades : 0);
+  $("pnl-counts").className = "value num";
+
+  const accts = d.accounts || [];
+  $("acct-count").textContent = accts.length;
+  if (accts.length) {
+    $("accounts").innerHTML = accts.map(a =>
+      '<div class="metric"><div class="label">' + esc(a.broker_name) + ' &middot; ' + esc(a.account_id) + '</div><div class="value">' + money(a.total_equity != null ? a.total_equity : a.net_liquidating_value) + '</div></div>' +
+      '<div class="metric"><div class="label">Cash</div><div class="value">' + money(a.cash_balance) + '</div></div>' +
+      '<div class="metric"><div class="label">Buying Power</div><div class="value">' + money(a.buying_power) + '</div></div>' +
+      '<div class="metric"><div class="label">Synced</div><div class="value" style="font-size:13px">' + timeOf(a.timestamp) + '</div></div>'
+    ).join("");
+  } else {
+    $("accounts").innerHTML = '<span class="empty">No account snapshot yet — waiting for broker sync.</span>';
+  }
+
+  const aq = d.approval_queue || [];
+  $("aq-count").textContent = aq.length;
+  fill("approval-queue", table(
+    ["Symbol", "Side", "Risk preview", "Mode", "Actions"],
+    aq.map(q => {
+      const r = q.execution_request || {};
+      return '<tr><td class="sym">' + esc(q.symbol) + '</td>' +
+        '<td><span class="pill ' + (r.side === "sell" ? "short" : "long") + '">' + esc(r.side || "buy") + '</span></td>' +
+        '<td>' + riskChip(r) + '</td>' +
+        '<td class="num">' + esc(q.approval_mode || "manual") + '</td>' +
+        '<td><div class="actions">' +
+        '<button class="btn-approve" onclick="approve(\'' + esc(q.order_id) + '\')">Approve</button>' +
+        '<button class="btn-reject" onclick="reject(\'' + esc(q.order_id) + '\')">Reject</button>' +
+        '</div></td></tr>';
+    })
+  ), "No pending approvals.");
+
+  const rs = d.ready_signals || [];
+  $("rs-count").textContent = rs.length;
+  fill("ready-signals", table(
+    ["Symbol", "Chart", "Setup", "Entry", "Stop", "Qual", "Time"],
+    rs.map(s => '<tr><td class="sym">' + esc(s.symbol) + '</td>' +
+      '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(s.symbol) + '" data-entry="' + (s.entry_price != null ? s.entry_price : "") + '" data-stop="' + (s.stop_loss_price != null ? s.stop_loss_price : "") + '"></canvas></td>' +
+      '<td>' + esc(s.signal_type || "—") + '</td>' +
+      '<td class="num">' + fmt(s.entry_price) + '</td>' +
+      '<td class="num">' + fmt(s.stop_loss_price) + '</td>' +
+      '<td class="num">' + fmt(s.quality_score) + '</td>' +
+      '<td class="num">' + timeOf(s.timestamp) + '</td></tr>')
+  ), "No ready signals this session.");
+
+  const posRows = [];
+  (d.positions || []).forEach(snap => (snap.positions || []).forEach(pos => {
+    const qty = +(pos.quantity != null ? pos.quantity : pos.qty != null ? pos.qty : 0);
+    posRows.push('<tr><td class="sym">' + esc(pos.symbol) + '</td>' +
+      '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(pos.symbol) + '" data-entry="' + (pos.avg_entry_price != null ? pos.avg_entry_price : pos.average_price != null ? pos.average_price : "") + '" data-stop=""></canvas></td>' +
+      '<td><span class="pill ' + (qty < 0 ? "short" : "long") + '">' + (qty < 0 ? "short" : "long") + '</span></td>' +
+      '<td class="num">' + esc(Math.abs(qty)) + '</td>' +
+      '<td class="num">' + fmt(pos.avg_entry_price != null ? pos.avg_entry_price : pos.average_price) + '</td>' +
+      '<td class="num">' + fmt(pos.current_price != null ? pos.current_price : pos.market_price) + '</td>' +
+      '<td class="num ' + (+(pos.unrealized_pl || 0) >= 0 ? "pos" : "neg") + '">' + money(pos.unrealized_pl) + '</td>' +
+      '<td><button class="btn-exit" onclick="exitPos(\'' + esc(pos.symbol) + '\')">Exit</button></td></tr>');
+  }));
+  $("pos-count").textContent = posRows.length;
+  fill("positions", table(["Symbol", "Chart", "Side", "Qty", "Avg", "Last", "P/L", ""], posRows), "No open positions.");
+
+  renderWatch(d.watch_states || []);
+
+  const fills = d.fills || [];
+  $("feed-count").textContent = fills.length;
+  fill("feed", fills.length ? fills.map(f => {
+    const color = f.kind === "order_filled" ? "var(--green)" : "var(--accent)";
+    const verb = f.kind === "order_filled" ? "FILL" : "SENT";
+    return '<div class="feed-row"><span class="feed-dot" style="background:' + color + '"></span>' +
+      '<span class="feed-time">' + timeOf(f.timestamp) + '</span>' +
+      '<span style="color:' + color + ';font-weight:600">' + verb + '</span>' +
+      '<span class="sym">' + esc(f.symbol || "") + '</span>' +
+      '<span class="pill ' + (f.side === "sell" ? "short" : "long") + '">' + esc(f.side || "") + '</span>' +
+      '<span>' + esc(f.quantity != null ? f.quantity : "") + ' @ ' + fmt(f.price) + '</span></div>';
+  }).join("") : null, "No fills yet this session.");
+
+  const ol = d.order_lifecycle || [];
+  $("ol-count").textContent = ol.length;
+  fill("order-lifecycle", table(
+    ["Order", "Symbol", "Side", "Qty", "Price", "Status", "Updated"],
+    ol.slice(0, 30).map(o => '<tr><td class="num" style="color:var(--muted)">' + esc(String(o.order_id || "").slice(0, 8)) + '</td>' +
+      '<td class="sym">' + esc(o.symbol) + '</td>' +
+      '<td><span class="pill ' + (o.side === "sell" ? "short" : "long") + '">' + esc(o.side || "—") + '</span></td>' +
+      '<td class="num">' + esc(o.quantity != null ? o.quantity : "—") + '</td>' +
+      '<td class="num">' + fmt(o.price) + '</td>' +
+      '<td class="num">' + esc(o.status || "—") + '</td>' +
+      '<td class="num">' + timeOf(o.updated_at) + '</td></tr>')
+  ), "No orders yet.");
+
+  document.querySelectorAll("canvas[data-spark]").forEach(canvas => {
+    const sym = canvas.getAttribute("data-spark");
+    const entry = parseFloat(canvas.getAttribute("data-entry"));
+    const stop = parseFloat(canvas.getAttribute("data-stop"));
+    loadBars(sym, isNaN(entry) ? null : entry, isNaN(stop) ? null : stop, canvas);
+  });
+
+  const key = rs.length ? rs[0].symbol + "|" + rs[0].timestamp : "";
+  if (key && key !== lastSignalKey && lastSignalKey !== "") {
+    beep();
+    toast("New ready signal: " + rs[0].symbol + " (" + (rs[0].signal_type || "setup") + ")", "ok");
+  }
+  lastSignalKey = key;
+}
+
+let es = null, pollTimer = null;
+function setConn(ok, msg) {
+  $("conn-dot").className = "dot " + (ok ? "live" : "err");
+  $("stamp").textContent = msg;
+}
+function startStream() {
+  try {
+    es = new EventSource("/api/stream");
+    es.addEventListener("snapshot", (ev) => {
+      try { render(JSON.parse(ev.data)); setConn(true, "live · " + new Date().toLocaleTimeString()); }
+      catch (e) {}
+    });
+    es.onerror = () => { setConn(false, "stream lost — polling"); es.close(); es = null; startPolling(); };
+  } catch (e) { startPolling(); }
+}
+async function pollOnce() {
+  try {
+    const r = await fetch("/api/snapshots");
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    setConn(true, "polling · " + new Date().toLocaleTimeString());
+  } catch (e) { setConn(false, "disconnected — " + e.message); }
+}
+function startPolling() {
+  if (pollTimer) return;
+  pollOnce();
+  pollTimer = setInterval(pollOnce, 4000);
+}
+
+$("sound-toggle").onclick = () => {
+  soundOn = !soundOn;
+  $("sound-toggle").textContent = soundOn ? "SOUND ON" : "SOUND OFF";
+  $("sound-toggle").className = "hdr-btn" + (soundOn ? " on" : "");
+  if (soundOn) beep();
+};
+$("kbd-toggle").onclick = () => $("kbd-help").classList.toggle("show");
+$("kbd-help").onclick = (e) => { if (e.target.id === "kbd-help") $("kbd-help").classList.remove("show"); };
+
+function doInject() {
+  const v = $("inject-input").value.trim().toUpperCase();
+  if (v) { post("/api/watch/add", {symbol: v}); $("inject-input").value = ""; }
+}
+$("inject-btn").onclick = doInject;
+$("inject-input").addEventListener("keydown", (e) => { if (e.key === "Enter") doInject(); e.stopPropagation(); });
+
+document.addEventListener("keydown", (e) => {
+  if (e.target.tagName === "INPUT") return;
+  const aq = latest && latest.approval_queue || [];
+  if (e.key === "a" || e.key === "A") { if (aq[0]) approve(aq[0].order_id); }
+  else if (e.key === "r" || e.key === "R") { if (aq[0]) reject(aq[0].order_id); }
+  else if (e.key === "s" || e.key === "S") { $("sound-toggle").click(); }
+  else if (e.key === "/") { e.preventDefault(); $("inject-input").focus(); }
+  else if (e.key === "?") { $("kbd-help").classList.toggle("show"); }
+  else if (e.key === "Escape") { $("kbd-help").classList.remove("show"); }
+});
+
+startStream();
+setTimeout(() => { if (!latest) startPolling(); }, 3000);
+</script>
+</body>
+</html>

@@ -1,0 +1,405 @@
+================================================================================
+  MOMENTUM TRADING SYSTEM - COMPLETE LOGICAL FLOW
+================================================================================
+
+ENTRY POINT: python run_live_paper.py [--once] [--symbols AAPL,SNDL] [--auto-approve]
+
+================================================================================
+STARTUP PHASE
+================================================================================
+
+1. INITIALIZE CONFIGURATION
+   ├─ Load .env (ALPACA_API_KEY, ALPACA_SECRET_KEY, etc.)
+   ├─ Parse CLI args
+   └─ Create settings objects: AlpacaPaperSettings, ExecutionSettings, TradingModeSettings
+
+2. INITIALIZE STORAGE & DATABASES
+   ├─ EventStore("data/momentum_events.duckdb")
+   │  └─ Append-only log of all events (canonical source of truth)
+   ├─ ResearchConnection("data/research/market.duckdb")
+   │  └─ Minute bars + daily bars for all symbols
+   └─ AlpacaPaperClient (if API keys present)
+      └─ Connection to Alpaca paper trading account
+
+3. INITIALIZE RUNTIME COMPONENTS
+   ├─ Watcher (state machine for symbol discovery/evaluation)
+   │  └─ Provider: ResearchWatchlistProvider (pulls symbols from research DB)
+   ├─ TradingExecutionService (signal → approval → order pipeline)
+   ├─ AlpacaPaperSync (poll Alpaca account/positions/orders)
+   └─ DashboardAPI (optional HTTP server on port 8010)
+      └─ Serves JSON API + static UI + SSE event stream
+
+================================================================================
+MAIN LOOP (runs every tick, or once with --once)
+================================================================================
+
+TICK = 1 iteration (typically 60 seconds)
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 1: INGEST LATEST MARKET DATA                                     │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ingest_live_minute_bars()
+  ├─ Call Alpaca REST API: get latest 1-minute bars
+  ├─ Insert into research/market.duckdb (bars table)
+  └─ Return: list of symbols with new data
+
+  ingest_daily_history()
+  ├─ On startup or when needed:
+  │  ├─ Alpaca REST API: get daily bars (past 30 days)
+  │  ├─ Insert into research/market.duckdb (daily_bars table)
+  │  └─ Used by: gap%, RVOL calculations
+  └─ Return: daily bar snapshots
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 2: DISCOVER & UPDATE WATCHLIST                                   │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  ResearchWatchlistProvider.get_candidates(session_date)
+  ├─ Check what symbols are in the watchlist for today
+  │  ├─ Manual symbols (from --symbols or WATCHER_SYMBOLS env)
+  │  ├─ Screener results (most-actives from Alpaca if --discover)
+  │  └─ RSS feed candidates (if configured)
+  ├─ Return list of WatchCandidate objects (symbol, last_price, avg_volume)
+  └─ Watcher._states updated with new symbols
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 3: EVALUATE SYMBOLS (CORE STRATEGY LOGIC)                        │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  Watcher.tick(bar_data, candidates)
+  │
+  └─ For each symbol in candidates:
+     │
+     ├─ 1. FETCH BARS
+     │  └─ ResearchWatchlistProvider.get_bars(symbol, session_date)
+     │     └─ Query research DB for all minute bars from 9:30 AM to now
+     │
+     ├─ 2. EMIT SYMBOL DISCOVERED (if new)
+     │  └─ EventStore.emit(SymbolDiscoveredEvent(symbol, source, ...))
+     │     └─ Event recorded with timestamp, session_id, payload
+     │
+     ├─ 3. EVALUATE SETUP (if ≥10 bars available)
+     │  │
+     │  └─ evaluate_setup(bars, symbol)  ← PURE STRATEGY ENGINE
+     │     │
+     │     ├─ Gap Check
+     │     │  └─ (today_open - prev_close) / prev_close ≥ 2% ?
+     │     │
+     │     ├─ Relative Volume (RVOL)
+     │     │  └─ (current 5-min avg vol / 20-day avg) ≥ 1.5 ?
+     │     │
+     │     ├─ Bull Flag Structure
+     │     │  └─ Pullback from high + ascending support pattern?
+     │     │
+     │     ├─ Price Action Quality
+     │     │  └─ Higher highs + higher lows? Clean bars?
+     │     │
+     │     ├─ 5 Other Criteria (tunable)
+     │     │  └─ Momentum, volatility, trend confirmation, etc.
+     │     │
+     │     ├─ Calculate SCORE
+     │     │  └─ (criteria_passed / total_criteria) * 100 = X%
+     │     │
+     │     └─ Return: {score, details, setup_data}
+     │
+     ├─ 4. EMIT CRITERIA EVALUATED
+     │  └─ EventStore.emit(CriteriaEvaluatedEvent(symbol, criteria=[...], score))
+     │     └─ Each criterion: {name, passed, reason}
+     │
+     ├─ 5. CHECK SIGNAL READY THRESHOLD
+     │  └─ IF score ≥ ready_score_pct (default 60%) AND NOT already_ready_this_session:
+     │     │
+     │     ├─ Emit SIGNAL READY
+     │     │  └─ EventStore.emit(SignalReadyEvent(symbol, entry, stop, target, ...))
+     │     │
+     │     ├─ Update symbol state: watching → ready
+     │     │  └─ EventStore.emit(SymbolStateChangedEvent(symbol, "watching" → "ready"))
+     │     │
+     │     └─ Mark symbol as already signaled (no duplicate signals this session)
+     │
+     ├─ 6. CHECK SIGNAL BLOCKED
+     │  └─ ELSE IF score < ready_score_pct OR quality < min_quality:
+     │     │
+     │     ├─ Emit SIGNAL BLOCKED
+     │     │  └─ EventStore.emit(SignalBlockedEvent(symbol, reason, ...))
+     │     │
+     │     ├─ Update symbol state: watching → blocked
+     │     │  └─ EventStore.emit(SymbolStateChangedEvent(symbol, "watching" → "blocked"))
+     │     │
+     │     └─ RESET: allow signal_ready again if it recovers above threshold
+     │
+     └─ END for each symbol
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 4: EXECUTION PIPELINE (signal_ready → approval → order)           │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  TradingExecutionService.tick()
+  │
+  └─ Query event store for new signal_ready events (not yet processed)
+     │
+     └─ For each signal_ready:
+        │
+        ├─ 1. CHECK RISK RULES
+        │  │
+        │  ├─ How many positions are open?
+        │  │  └─ IF open_positions ≥ max_concurrent_positions (e.g., 3):
+        │  │     └─ RiskRuleTriggeredEvent("max concurrent positions")
+        │  │        └─ SKIP this signal
+        │  │
+        │  ├─ Check daily loss circuit breaker
+        │  │  └─ IF realized_pnl_today ≤ -max_daily_loss_pct * account_equity:
+        │  │     └─ RiskRuleTriggeredEvent("daily loss exceeded")
+        │  │        └─ SKIP this signal (halt trading for the day)
+        │  │
+        │  └─ Max orders per tick
+        │     └─ Only submit max_orders_per_tick (e.g., 1) per tick to avoid order queue floods
+        │
+        ├─ 2. CALCULATE POSITION SIZE
+        │  │
+        │  └─ calculate_position_size(entry, stop, account_equity, risk_per_trade_pct)
+        │     │
+        │     ├─ Risk per trade = account_equity * risk_per_trade_pct (e.g., 1%)
+        │     ├─ Risk per share = entry - stop
+        │     ├─ Shares = risk_per_trade / risk_per_share
+        │     └─ Return: {shares, entry, stop, target}
+        │
+        ├─ 3. EMIT ORDER APPROVAL REQUESTED
+        │  └─ EventStore.emit(OrderApprovalRequestedEvent(
+        │       symbol, entry, stop, target, shares, risk_dollar, notional, ...
+        │     ))
+        │
+        ├─ 4. AUTO-APPROVE OR QUEUE FOR MANUAL APPROVAL
+        │  │
+        │  ├─ IF --auto-approve or TRADING_AUTO_APPROVE=1:
+        │  │  │
+        │  │  ├─ Emit OrderApprovedEvent immediately
+        │  │  │  └─ EventStore.emit(OrderApprovedEvent(order_id, ...))
+        │  │  │
+        │  │  └─ Jump to Phase 5 (SUBMIT ORDER)
+        │  │
+        │  └─ ELSE (manual approval):
+        │     │
+        │     └─ Add to approval_queue in dashboard
+        │        └─ User sees: symbol, entry, stop, target, risk, share count, sparkline chart
+        │        └─ User clicks Approve or Reject
+        │        └─ Dashboard emits OrderApprovedEvent or OrderRejectedEvent
+        │
+        ├─ 5. ON APPROVAL (if approved)
+        │  │
+        │  └─ TradingExecutionService detects OrderApprovedEvent
+        │     │
+        │     ├─ Create ExecutionRequest
+        │     │  └─ {symbol, entry, stop, target, shares, order_type: "limit"/"market", ...}
+        │     │
+        │     └─ Call AlpacaPaperExecutor.submit(request)
+        │        │
+        │        └─ AlpacaPaperExecutor.submit() [PHASE 5]
+        │
+        └─ END for each signal_ready
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 5: BROKER ORDER SUBMISSION                                        │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  AlpacaPaperExecutor.submit(execution_request)
+  │
+  ├─ Create bracket order:
+  │  │
+  │  ├─ ENTRY ORDER
+  │  │  └─ Type: limit @ entry_price (restful, will fill on touch, can be cancelled)
+  │  │     OR market (fills immediately at market)
+  │  │
+  │  ├─ PROFIT TARGET
+  │  │  └─ Type: limit @ target_price
+  │  │     (target = entry + (entry - stop) * reward_multiple)
+  │  │
+  │  └─ STOP LOSS
+  │     └─ Type: stop @ stop_price (becomes market order when stop is hit)
+  │
+  ├─ Submit to Alpaca REST API
+  │  └─ Returns: Alpaca order_id
+  │
+  ├─ Emit OrderSubmittedEvent
+  │  └─ EventStore.emit(OrderSubmittedEvent(symbol, order_id, entry, stop, target, ...))
+  │
+  ├─ Track armed entry in TradingExecutionService._armed dict
+  │  └─ _armed[order_id] = {symbol, entry_price, broker_order_id, armed_at, checks}
+  │
+  └─ Monitor for:
+     │
+     ├─ Entry Fill
+     │  └─ If entry fills → position open → wait for target or stop
+     │
+     ├─ Entry Timeout (if not filled after entry_timeout_bars minutes)
+     │  └─ Call Alpaca to cancel unfilled entry order
+     │
+     ├─ Price Break Invalidation
+     │  └─ If current price < (entry - entry_invalidate_pct * entry):
+     │     └─ Cancel entry order (price broke back below entry)
+     │
+     └─ Full Fill (target or stop hit)
+        └─ Position closes → emit OrderFilledEvent
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 6: ACCOUNT & POSITION SYNC                                        │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  AlpacaPaperSync.sync_account()
+  │
+  ├─ 1. GET ACCOUNT SUMMARY
+  │  └─ Alpaca REST: /account
+  │     └─ Returns: {equity, buying_power, multiplier, long_market_value, ...}
+  │
+  ├─ 2. EMIT ACCOUNT SUMMARY UPDATED
+  │  └─ EventStore.emit(AccountSummaryUpdatedEvent(account_data))
+  │
+  ├─ 3. GET OPEN POSITIONS
+  │  └─ Alpaca REST: /positions
+  │     └─ Returns: [{symbol, qty, avg_fill_price, current_price, unrealized_pl, ...}]
+  │
+  ├─ 4. EMIT ACCOUNT POSITIONS UPDATED
+  │  └─ EventStore.emit(AccountPositionsUpdatedEvent(positions))
+  │
+  ├─ 5. GET PENDING ORDERS
+  │  └─ Alpaca REST: /orders?status=open
+  │     └─ Returns: [{id, symbol, qty, type, status, filled_qty, ...}]
+  │
+  ├─ 6. EMIT ACCOUNT ORDERS UPDATED
+  │  └─ EventStore.emit(AccountOrdersUpdatedEvent(orders))
+  │
+  └─ 7. CALCULATE SESSION P&L
+     └─ Query event store for all fills this session
+        ├─ For each closed trade:
+        │  └─ realized_pnl = (exit_price - entry_price) * qty
+        ├─ Aggregate:
+        │  └─ total_realized_pnl, total_unrealized_pnl, win_rate, avg_r, trade_count
+        └─ Used by dashboard P&L strip
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 7: DASHBOARD UPDATES (READ-ONLY PROJECTIONS)                      │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  DashboardAPI (runs in background thread)
+  │
+  ├─ SSE Stream Handler (/api/events)
+  │  └─ Pushes new events to all connected clients in real-time
+  │     └─ Falls back to polling if connection drops
+  │
+  ├─ JSON Endpoints:
+  │  │
+  │  ├─ GET /api/approval-queue
+  │  │  └─ query_approval_queue(event_store)
+  │  │     └─ Returns: [{symbol, entry, stop, target, shares, risk_pct, notional, ...}]
+  │  │
+  │  ├─ GET /api/positions
+  │  │  └─ query_account_positions_snapshot(event_store)
+  │  │     └─ Returns: [{symbol, qty, entry, current, unrealized_pl, ...}]
+  │  │
+  │  ├─ GET /api/pnl
+  │  │  └─ query_pnl_snapshot(event_store)
+  │  │     └─ Returns: {realized, unrealized, total, win_rate, avg_r, open_count, closed_count}
+  │  │
+  │  ├─ GET /api/activity-feed
+  │  │  └─ query_activity_feed(event_store, limit=100)
+  │  │     └─ Returns: [{timestamp, event_type, message, symbol, ...}]
+  │  │
+  │  ├─ GET /api/symbol/:symbol/bars
+  │  │  └─ query_minute_bars(research_db, symbol, session_date)
+  │  │     └─ Returns: [{timestamp, open, high, low, close, volume}]
+  │  │        (for sparkline chart rendering)
+  │  │
+  │  └─ POST /api/approval/:order_id/approve|reject
+  │     └─ Emits OrderApprovedEvent or OrderRejectedEvent
+  │
+  └─ UI Features:
+     ├─ P&L Strip (realized, unrealized, total, win rate, R multiple, counts)
+     ├─ Approval Queue (cards with entry/stop/target preview, Approve/Reject buttons)
+     ├─ Open Positions (list with live sparkline charts, P&L per position)
+     ├─ Activity Feed (chronological log of all events)
+     ├─ Symbol Details (expand to see 9 criteria: pass/fail/not-evaluated)
+     └─ Keyboard Shortcuts: A=Approve, R=Reject, S=Sound Toggle, /=Add Symbol, ?=Help
+
+  ┌─────────────────────────────────────────────────────────────────────────┐
+  │ PHASE 8: CLEANUP & REPEAT                                               │
+  └─────────────────────────────────────────────────────────────────────────┘
+
+  After all phases complete:
+  ├─ Log tick summary (discovered, ready, blocked, evaluated, errors)
+  ├─ IF --once: exit
+  └─ ELSE: sleep(60 seconds) and go back to PHASE 1
+
+================================================================================
+KEY CONCEPTS & INVARIANTS
+================================================================================
+
+EVENT SOURCING
+  • All state changes are recorded as immutable events in the append-only event store
+  • The current state is reconstructed by replaying events (projections)
+  • Every read operation queries the event store; no other state is authoritative
+  • Correlation ID = session_id (all events from one trading session have the same correlation_id)
+
+SIGNAL DEBOUNCING
+  • Once a symbol emits signal_ready, it cannot emit another signal_ready until:
+    → It falls back to signal_blocked (criteria fail), which resets the debounce
+  • Prevents duplicate signals from the same symbol in one session
+
+STATE MACHINE (Watcher)
+  • discovered → watching → { ready | blocked } (can toggle between ready ↔ blocked)
+  • States are per-session; new session = fresh symbol states
+
+BRACKET ORDER
+  • Entry (limit) + Profit Target (limit) + Stop Loss (stop) submitted as a single order
+  • If entry fills:
+    → Two child orders activate (target and stop)
+    → First one to fill = exit (other cancels automatically)
+  • If entry never fills:
+    → Entry can timeout (entry_timeout_bars) or be cancelled on price break
+
+RISK CONTROLS
+  • Max concurrent positions: once N positions open, no more entry orders until one closes
+  • Daily loss circuit breaker: once losses hit threshold, halt trading for the session
+  • Entry timeout: if entry rests >N minutes, cancel to avoid stale orders
+  • Price break invalidation: if price falls back >X% below entry, cancel entry (setup failed)
+
+APPROVAL WORKFLOW
+  • Manual: user clicks Approve in dashboard → OrderApprovedEvent
+  • Auto: --auto-approve flag or TRADING_AUTO_APPROVE=1 env var → immediate approval
+  • Rejection: user clicks Reject or risk rule triggers → OrderRejectedEvent (queued signal removed)
+
+================================================================================
+TROUBLESHOOTING BY PHASE
+================================================================================
+
+Phase 1 (Ingest):
+  • No new bars? Check if Alpaca API keys are valid. Run --once in dry mode.
+  • Bars not in research DB? Check data/research/market.duckdb exists and is writable.
+
+Phase 2 (Discover):
+  • No symbols in watchlist? Check --symbols / WATCHER_SYMBOLS env / most-actives screener.
+
+Phase 3 (Evaluate):
+  • Symbols stuck in "watching"? Criteria too strict. Lower ready_score_pct or min_quality.
+  • Signals appear then disappear? They're being blocked. Check criteria_evaluated events.
+  • Check event store: SELECT * FROM events WHERE event_type = 'criteria_evaluated'
+
+Phase 4 (Execution):
+  • Signal ready but no approval request? Risk rule triggered. Check RiskRuleTriggeredEvent.
+  • Approval request visible but user forgets to click? Use --auto-approve for testing.
+
+Phase 5 (Broker):
+  • Order submitted but no fill? Entry price may be stale. Use market orders (entry_order_type).
+  • Entry stuck for >N minutes? Timeout will cancel it. Check entry_timeout_bars setting.
+
+Phase 6 (Sync):
+  • Account sync fails? Alpaca API likely down. Dry mode still works.
+  • Positions don't match Alpaca? Event store is source of truth. Refresh browser.
+
+Phase 7 (Dashboard):
+  • Dashboard not updating? Check browser console for errors. Try hard-refresh (Ctrl+Shift+R).
+  • SSE stream failing? Falls back to polling (/api/approval-queue, etc.). Check /api/events.
+
+================================================================================
+END
+================================================================================

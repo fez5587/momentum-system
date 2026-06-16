@@ -1,0 +1,37 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "momentum"
+version = "0.4.0"
+description = "Small-cap momentum research & paper-trading system"
+requires-python = ">=3.11"
+dependencies = [
+    "duckdb>=1.0.0",
+    "pandas>=2.0.0",
+    "pydantic>=2.0.0",
+    "pydantic-settings>=2.0.0",
+    "pyyaml>=6.0",
+    "typer>=0.9.0",
+    "rich>=13.0.0",
+    "numpy>=1.24.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.uv]
+# This is a runnable app (flat layout: scripts at the repo root plus api/,
+# storage/, runtime/, ... packages), not a distributable library. Don't try to
+# build/install it as a wheel — just provision the dependencies. Code runs via
+# `uv run run_live_paper.py` from the repo root (pytest uses pythonpath="." ).
+package = false

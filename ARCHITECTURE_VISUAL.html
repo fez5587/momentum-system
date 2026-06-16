@@ -1,0 +1,664 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Momentum Trading System - Architecture Diagram</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background: linear-gradient(135deg, #1e1e2e 0%, #2d2d44 100%);
+            color: #e0e0e0;
+            padding: 40px 20px;
+            min-height: 100vh;
+        }
+
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
+
+        h1 {
+            text-align: center;
+            margin-bottom: 40px;
+            font-size: 2.5em;
+            background: linear-gradient(135deg, #00d4ff, #00ffaa);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .diagram {
+            background: #2d2d44;
+            border: 2px solid #00d4ff;
+            border-radius: 12px;
+            padding: 40px;
+            margin-bottom: 40px;
+            position: relative;
+            overflow-x: auto;
+        }
+
+        svg {
+            min-width: 100%;
+            height: auto;
+        }
+
+        .legend {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-top: 30px;
+            padding: 20px;
+            background: rgba(0, 212, 255, 0.1);
+            border-radius: 8px;
+        }
+
+        .legend-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .legend-box {
+            width: 30px;
+            height: 30px;
+            border-radius: 4px;
+            flex-shrink: 0;
+        }
+
+        .color-data { background: #ff6b6b; }
+        .color-process { background: #4ecdc4; }
+        .color-event { background: #ffd93d; }
+        .color-storage { background: #6c5ce7; }
+        .color-output { background: #00d4ff; }
+        .color-external { background: #95a5a6; }
+
+        .section {
+            margin-bottom: 40px;
+        }
+
+        .section-title {
+            font-size: 1.3em;
+            font-weight: 600;
+            color: #00ffaa;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #00ffaa;
+        }
+
+        .flow-box {
+            background: #3a3a52;
+            border: 1px solid #00d4ff;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 10px;
+            line-height: 1.6;
+        }
+
+        .step-number {
+            display: inline-block;
+            background: #00d4ff;
+            color: #1e1e2e;
+            width: 28px;
+            height: 28px;
+            border-radius: 50%;
+            text-align: center;
+            line-height: 28px;
+            font-weight: bold;
+            margin-right: 10px;
+        }
+
+        code {
+            background: #1e1e2e;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: "Monaco", "Menlo", monospace;
+            color: #00ffaa;
+        }
+
+        .arrow {
+            color: #00d4ff;
+            margin: 0 5px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 20px;
+            background: #3a3a52;
+            border-radius: 8px;
+            overflow: hidden;
+        }
+
+        th, td {
+            padding: 12px;
+            text-align: left;
+            border-bottom: 1px solid #505070;
+        }
+
+        th {
+            background: #505070;
+            color: #00ffaa;
+            font-weight: 600;
+        }
+
+        tr:hover {
+            background: rgba(0, 212, 255, 0.1);
+        }
+
+        .file-list {
+            background: #3a3a52;
+            border-radius: 8px;
+            padding: 15px;
+            margin-top: 10px;
+        }
+
+        .file-list li {
+            margin-left: 20px;
+            margin-bottom: 5px;
+            list-style: disc;
+        }
+
+        .file-list code {
+            background: #1e1e2e;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        @media (max-width: 768px) {
+            h1 {
+                font-size: 1.8em;
+            }
+
+            .diagram {
+                padding: 20px;
+            }
+
+            .legend {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>⚡ Momentum Trading System Architecture</h1>
+
+        <div class="diagram">
+            <svg viewBox="0 0 1200 800" xmlns="http://www.w3.org/2000/svg">
+                <!-- Define styles -->
+                <defs>
+                    <style>
+                        .node-label { font-size: 14px; font-weight: bold; fill: white; }
+                        .arrow { stroke: #00d4ff; stroke-width: 2; fill: none; marker-end: url(#arrowhead); }
+                        .arrow-event { stroke: #ffd93d; stroke-width: 2; fill: none; marker-end: url(#arrowhead-yellow); }
+                        .arrow-data { stroke: #ff6b6b; stroke-width: 2; fill: none; marker-end: url(#arrowhead-red); }
+                    </style>
+                    <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                        <polygon points="0 0, 10 3, 0 6" fill="#00d4ff" />
+                    </marker>
+                    <marker id="arrowhead-yellow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                        <polygon points="0 0, 10 3, 0 6" fill="#ffd93d" />
+                    </marker>
+                    <marker id="arrowhead-red" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                        <polygon points="0 0, 10 3, 0 6" fill="#ff6b6b" />
+                    </marker>
+                </defs>
+
+                <!-- DATA SOURCES -->
+                <rect x="50" y="20" width="140" height="60" fill="#ff6b6b" rx="5"/>
+                <text x="120" y="55" class="node-label" text-anchor="middle">Alpaca IEX Bars</text>
+
+                <!-- INGESTION LAYER -->
+                <rect x="280" y="20" width="160" height="60" fill="#4ecdc4" rx="5"/>
+                <text x="360" y="55" class="node-label" text-anchor="middle">Ingestion Module</text>
+
+                <!-- RESEARCH DB -->
+                <rect x="530" y="20" width="140" height="60" fill="#6c5ce7" rx="5"/>
+                <text x="600" y="50" class="node-label" text-anchor="middle">Research DB</text>
+                <text x="600" y="70" style="font-size: 12px; fill: #ccc; text-anchor: middle;">(market_data)</text>
+
+                <!-- EVENT STORE (CENTER) -->
+                <rect x="480" y="180" width="240" height="80" fill="#6c5ce7" rx="5" stroke="#ffd93d" stroke-width="3"/>
+                <text x="600" y="210" class="node-label" text-anchor="middle">EVENT STORE</text>
+                <text x="600" y="230" style="font-size: 12px; fill: #ccc; text-anchor: middle;">(momentum_events.duckdb)</text>
+                <text x="600" y="250" style="font-size: 11px; fill: #ffd93d; text-anchor: middle;">append-only canonical events</text>
+
+                <!-- WATCHER -->
+                <rect x="50" y="180" width="140" height="80" fill="#4ecdc4" rx="5"/>
+                <text x="120" y="210" class="node-label" text-anchor="middle">Watcher</text>
+                <text x="120" y="235" style="font-size: 12px; fill: white; text-anchor: middle;">symbol evaluation</text>
+                <text x="120" y="255" style="font-size: 12px; fill: white; text-anchor: middle;">state machine</text>
+
+                <!-- EXECUTION -->
+                <rect x="50" y="340" width="140" height="80" fill="#4ecdc4" rx="5"/>
+                <text x="120" y="370" class="node-label" text-anchor: "middle">Execution Service</text>
+                <text x="120" y="395" style="font-size: 12px; fill: white; text-anchor: middle;">sizing + approval</text>
+                <text x="120" y="415" style="font-size: 12px; fill: white; text-anchor: middle;">order submission</text>
+
+                <!-- ALPACA PAPER SYNC -->
+                <rect x="880" y="180" width="140" height="80" fill="#4ecdc4" rx="5"/>
+                <text x="950" y="210" class="node-label" text-anchor="middle">Alpaca Sync</text>
+                <text x="950" y="235" style="font-size: 12px; fill: white; text-anchor: middle;">positions, orders,</text>
+                <text x="950" y="255" style="font-size: 12px; fill: white; text-anchor: middle;">account state</text>
+
+                <!-- ALPACA PAPER BROKER -->
+                <rect x="880" y="340" width="140" height="80" fill="#95a5a6" rx="5"/>
+                <text x="950" y="370" class="node-label" text-anchor="middle">Alpaca Paper</text>
+                <text x="950" y="395" style="font-size: 12px; fill: white; text-anchor: middle;">order submission</text>
+                <text x="950" y="415" style="font-size: 12px; fill: white; text-anchor: middle;">& fills</text>
+
+                <!-- DASHBOARD -->
+                <rect x="800" y="500" width="220" height="80" fill="#00d4ff" rx="5"/>
+                <text x="910" y="530" class="node-label" text-anchor="middle" fill="#1e1e2e">Dashboard API & UI</text>
+                <text x="910" y="555" style="font-size: 12px; fill: #1e1e2e; text-anchor: middle;">http://127.0.0.1:8010</text>
+                <text x="910" y="575" style="font-size: 12px; fill: #1e1e2e; text-anchor: middle;">projections + SSE streaming</text>
+
+                <!-- WATCHLIST PROVIDER -->
+                <rect x="280" y="500" width="160" height="60" fill="#ff6b6b" rx="5"/>
+                <text x="360" y="535" class="node-label" text-anchor="middle">Watchlist</text>
+
+                <!-- ARROWS -->
+                <!-- Alpaca → Ingestion -->
+                <path d="M 190 50 L 280 50" class="arrow-data"/>
+
+                <!-- Ingestion → Research DB -->
+                <path d="M 440 50 L 530 50" class="arrow-data"/>
+
+                <!-- Research DB → Watcher -->
+                <path d="M 530 80 L 300 220" class="arrow-data"/>
+
+                <!-- Watcher → Event Store -->
+                <path d="M 190 220 L 480 220" class="arrow-event"/>
+
+                <!-- Event Store → Alpaca Sync (feedback) -->
+                <path d="M 720 220 L 880 220" class="arrow-event"/>
+
+                <!-- Alpaca Sync → Alpaca Paper Broker -->
+                <path d="M 950 260 L 950 340" class="arrow"/>
+
+                <!-- Alpaca Paper Broker → Alpaca Sync (fills feedback) -->
+                <path d="M 920 340 L 920 260" class="arrow-data" stroke-dasharray="5,5"/>
+
+                <!-- Watcher also submits execution requests → Execution Service -->
+                <path d="M 120 260 L 120 340" class="arrow-event"/>
+
+                <!-- Execution → Alpaca Paper Broker -->
+                <path d="M 190 380 L 880 380" class="arrow"/>
+
+                <!-- Event Store → Dashboard -->
+                <path d="M 600 260 L 910 500" class="arrow-event"/>
+
+                <!-- Watchlist → Watcher -->
+                <path d="M 360 500 L 200 260" class="arrow-data" stroke-dasharray="5,5"/>
+            </svg>
+        </div>
+
+        <div class="legend">
+            <div class="legend-item">
+                <div class="legend-box color-data"></div>
+                <span><strong>Data Flow:</strong> Market data, bars, watchlist</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box color-process"></div>
+                <span><strong>Process:</strong> Computation & evaluation</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box color-event"></div>
+                <span><strong>Events:</strong> Canonical state changes</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box color-storage"></div>
+                <span><strong>Storage:</strong> Persistent data</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box color-output"></div>
+                <span><strong>Output:</strong> User-facing interface</span>
+            </div>
+            <div class="legend-item">
+                <div class="legend-box color-external"></div>
+                <span><strong>External:</strong> Broker APIs</span>
+            </div>
+        </div>
+
+        <!-- DETAILED FLOW SECTION -->
+        <div class="section">
+            <div class="section-title">📊 Complete Processing Flow (Every Tick)</div>
+
+            <div class="flow-box">
+                <span class="step-number">1</span>
+                <strong>INGEST</strong> <span class="arrow">→</span>
+                <code>ingest_live_minute_bars()</code> +
+                <code>ingest_daily_history()</code>
+                <br/><small>Latest 1-minute bars from Alpaca IEX into research/market.duckdb + daily backfill for gap% and RVOL calculations</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">2</span>
+                <strong>DISCOVER</strong> <span class="arrow">→</span>
+                <code>ResearchWatchlistProvider.get_candidates()</code>
+                <br/><small>Pull symbols from watchlist (manual, screener, or most-actives from Alpaca)</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">3</span>
+                <strong>WATCH</strong> <span class="arrow">→</span>
+                <code>Watcher.tick()</code>
+                <br/><small>For each symbol: fetch bars from research DB, evaluate 9 setup criteria, emit symbol_discovered / state_changed events</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">4</span>
+                <strong>EVALUATE</strong> <span class="arrow">→</span>
+                <code>evaluate_setup()</code>
+                <br/><small>Pure strategy logic: gap%, RVOL, bull-flag structure, price action quality. Emit criteria_evaluated events.</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">5</span>
+                <strong>SIGNAL</strong> <span class="arrow">→</span>
+                <code>Watcher</code> emits <code>signal_ready</code>
+                <br/><small>Symbol passes ≥60% of criteria (tunable). Debounced (once per session unless it falls back to blocked).</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">6</span>
+                <strong>EXECUTE</strong> <span class="arrow">→</span>
+                <code>TradingExecutionService.tick()</code>
+                <br/><small>On signal_ready: position sizing → risk checks (max concurrent, daily loss circuit breaker) → order_approval_requested event</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">7</span>
+                <strong>APPROVE</strong> <span class="arrow">→</span>
+                <code>Dashboard</code> or <code>--auto-approve</code>
+                <br/><small>Manual: click Approve in dashboard. Auto: env flag TRADING_AUTO_APPROVE=1. Emit order_approved event.</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">8</span>
+                <strong>SUBMIT</strong> <span class="arrow">→</span>
+                <code>AlpacaPaperExecutor.submit()</code>
+                <br/><small>Bracket order: entry (limit or market), profit target (entry + reward_multiple × risk), stop loss. Emit order_submitted event.</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">9</span>
+                <strong>SYNC</strong> <span class="arrow">→</span>
+                <code>AlpacaPaperSync.sync_account()</code>
+                <br/><small>Poll Alpaca: account balance, open positions, pending orders. Emit account_summary_updated, account_positions_updated, account_orders_updated events.</small>
+            </div>
+
+            <div class="flow-box">
+                <span class="step-number">10</span>
+                <strong>PROJECT</strong> <span class="arrow">→</span>
+                <code>Dashboard (SSE stream)</code>
+                <br/><small>Read-only projections over event store: P&L, open positions, approval queue, activity feed, sparkline charts. Fall back to polling if SSE drops.</small>
+            </div>
+        </div>
+
+        <!-- KEY MODULES -->
+        <div class="section">
+            <div class="section-title">🔧 Key Modules & Responsibilities</div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Module</th>
+                        <th>Responsibility</th>
+                        <th>Key Files</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><strong>research/ingestion</strong></td>
+                        <td>Ingest market data (bars, daily history), discover candidates, classify market sessions</td>
+                        <td>market_data.py, watcher_task.py, scheduler.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>research/</strong></td>
+                        <td>Query and project research databases (minute/daily bars, gappers, RSS news)</td>
+                        <td>query.py, schema.py, multi_schema.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>runtime/watcher</strong></td>
+                        <td>Symbol state machine: discovered → watching → ready | blocked. Emit all watcher events.</td>
+                        <td>watcher.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>strategy/evaluation</strong></td>
+                        <td>Pure setup evaluation: 9 criteria (gap%, RVOL, bull-flag, structure, quality, etc.)</td>
+                        <td>setup_evaluator.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>strategy/risk</strong></td>
+                        <td>Position sizing, risk per trade, reward multiple, daily loss circuit breaker</td>
+                        <td>position_sizing.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>strategy/backtest</strong></td>
+                        <td>Intraday backtest engine: replay bars, simulate entry/exit, calculate P&L</td>
+                        <td>engine.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>storage/event_store</strong></td>
+                        <td>Append-only event log (canonical source of truth). Correlate by session_id.</td>
+                        <td>event_store.py, event_schema.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>storage/projections</strong></td>
+                        <td>Query event store for current state: approval queue, open positions, P&L, etc.</td>
+                        <td>projections.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>alpaca_paper/</strong></td>
+                        <td>Alpaca paper broker integration: order submission, position sync, account state</td>
+                        <td>client.py, execution.py, sync.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>schwab/</strong></td>
+                        <td>Schwab live integration (OAuth, market data, positions, orders, health)</td>
+                        <td>oauth.py, market_data.py, positions.py, health.py</td>
+                    </tr>
+                    <tr>
+                        <td><strong>api/</strong></td>
+                        <td>Dashboard JSON API + SSE streaming. Read-only projections served as REST + events.</td>
+                        <td>main.py, static/</td>
+                    </tr>
+                    <tr>
+                        <td><strong>trading_execution.py</strong></td>
+                        <td>Signal → sizing → approval → order pipeline. Manages armed entries & timeouts.</td>
+                        <td>trading_execution.py</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- EVENT FLOW -->
+        <div class="section">
+            <div class="section-title">📨 Key Event Types (Event-Sourced)</div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Event</th>
+                        <th>Emitted By</th>
+                        <th>Purpose</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td><code>symbol_discovered</code></td>
+                        <td>Watcher</td>
+                        <td>New symbol added to watchlist</td>
+                    </tr>
+                    <tr>
+                        <td><code>symbol_state_changed</code></td>
+                        <td>Watcher</td>
+                        <td>Symbol transitions: discovered → watching → ready | blocked</td>
+                    </tr>
+                    <tr>
+                        <td><code>criteria_evaluated</code></td>
+                        <td>Watcher (via evaluate_setup)</td>
+                        <td>9 setup criteria evaluated for symbol (pass/fail/not-evaluated)</td>
+                    </tr>
+                    <tr>
+                        <td><code>signal_ready</code></td>
+                        <td>Watcher</td>
+                        <td>Symbol ready: ≥60% criteria passed. Debounced once per session.</td>
+                    </tr>
+                    <tr>
+                        <td><code>signal_blocked</code></td>
+                        <td>Watcher</td>
+                        <td>Symbol failed criteria check. Resets debounce.</td>
+                    </tr>
+                    <tr>
+                        <td><code>order_approval_requested</code></td>
+                        <td>TradingExecutionService</td>
+                        <td>Ready signal → sizing + risk checks passed. Awaiting approval or auto-submit.</td>
+                    </tr>
+                    <tr>
+                        <td><code>order_approved</code></td>
+                        <td>Dashboard (manual) or TradingExecutionService (auto)</td>
+                        <td>Approval given. Next: submit to broker.</td>
+                    </tr>
+                    <tr>
+                        <td><code>order_rejected</code></td>
+                        <td>Dashboard (manual) or TradingExecutionService (risk rule)</td>
+                        <td>Approval denied or risk rule triggered. Signal dequeued.</td>
+                    </tr>
+                    <tr>
+                        <td><code>order_submitted</code></td>
+                        <td>AlpacaPaperExecutor</td>
+                        <td>Bracket order sent to Alpaca (entry + target + stop).</td>
+                    </tr>
+                    <tr>
+                        <td><code>account_positions_updated</code></td>
+                        <td>AlpacaPaperSync</td>
+                        <td>Open positions snapshot from Alpaca. Includes entry, qty, P&L.</td>
+                    </tr>
+                    <tr>
+                        <td><code>account_orders_updated</code></td>
+                        <td>AlpacaPaperSync</td>
+                        <td>Pending orders snapshot from Alpaca. Tracks fills, cancellations, expirations.</td>
+                    </tr>
+                    <tr>
+                        <td><code>account_summary_updated</code></td>
+                        <td>AlpacaPaperSync</td>
+                        <td>Account balance, buying power, margin, NAV, realized P&L.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- ENTRY POINT -->
+        <div class="section">
+            <div class="section-title">🚀 Main Entry Point: run_live_paper.py</div>
+
+            <div class="flow-box">
+                <strong>Overall orchestrator that ties everything together:</strong>
+                <ol style="margin-left: 20px; margin-top: 10px;">
+                    <li>Parse CLI args (--once, --symbols, --auto-approve, --no-dashboard)</li>
+                    <li>Load .env and configure Alpaca client + settings</li>
+                    <li>Initialize EventStore (momentum_events.duckdb)</li>
+                    <li>Open ResearchConnection (market_data.duckdb) + ResearchWatchlistProvider</li>
+                    <li>Create Watcher + TradingExecutionService + AlpacaPaperSync + AlpacaPaperExecutor</li>
+                    <li>Optional: start DashboardAPI server (SSE + JSON endpoints) in background thread</li>
+                    <li>Main loop (or single pass with --once):
+                        <ul style="margin-top: 5px;">
+                            <li>Ingest latest minute bars + daily history</li>
+                            <li>Watcher.tick() → symbol evaluation + state changes + signal emissions</li>
+                            <li>TradingExecutionService.tick() → approval requests + submissions</li>
+                            <li>AlpacaPaperSync.sync_account() → positions + orders + account state</li>
+                            <li>Sleep (configurable interval, e.g., 60 seconds)</li>
+                        </ul>
+                    </li>
+                </ol>
+            </div>
+        </div>
+
+        <!-- TYPICAL ISSUE DEBUGGING CHECKLIST -->
+        <div class="section">
+            <div class="section-title">🔍 Debugging: Where to Look When Something Breaks</div>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Symptom</th>
+                        <th>Likely Cause</th>
+                        <th>Check</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <tr>
+                        <td>No symbols appearing in Watcher</td>
+                        <td>Watchlist provider not returning candidates</td>
+                        <td>ResearchWatchlistProvider.get_candidates() → is research DB populated? Check data/research/market.duckdb</td>
+                    </tr>
+                    <tr>
+                        <td>Symbols discovered but never go ready</td>
+                        <td>Criteria evaluation failing or threshold too high</td>
+                        <td>Watcher → criteria_evaluated events. Check setup_evaluator.py scores. Lower ready_score_pct or min_quality config.</td>
+                    </tr>
+                    <tr>
+                        <td>Signal ready but no approval request</td>
+                        <td>TradingExecutionService.tick() not running or risk rule triggered</td>
+                        <td>Check trading_execution.py: max_concurrent_positions, max_daily_loss_pct. Emit risk_rule_triggered? Check event store.</td>
+                    </tr>
+                    <tr>
+                        <td>Approval request but order never submitted</td>
+                        <td>Dashboard approval not clicked OR auto-approve not set</td>
+                        <td>Dashboard approval queue visible? Or set TRADING_AUTO_APPROVE=1 in .env</td>
+                    </tr>
+                    <tr>
+                        <td>Order submitted but no fills from Alpaca</td>
+                        <td>API keys missing or Alpaca API down</td>
+                        <td>Check ALPACA_API_KEY / ALPACA_SECRET_KEY in .env. Run --once to test without loop.</td>
+                    </tr>
+                    <tr>
+                        <td>Dashboard not updating (SSE fails)</td>
+                        <td>Network drop or event stream blocked</td>
+                        <td>Dashboard falls back to polling. Check http://127.0.0.1:8010/api/events (should return JSON). Check browser console.</td>
+                    </tr>
+                    <tr>
+                        <td>Backtests showing different P&L than live</td>
+                        <td>Bar data mismatch or backtest engine using different fills</td>
+                        <td>Backtest engine simulates limit fills at exact prices. Live uses actual Alpaca fills. Compare bars in research DB vs Alpaca API.</td>
+                    </tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- DATA STORAGE LOCATIONS -->
+        <div class="section">
+            <div class="section-title">💾 Data Storage Locations</div>
+
+            <div class="flow-box">
+                <strong>Event Store (Canonical Source of Truth)</strong><br/>
+                <code>data/momentum_events.duckdb</code> — append-only events, indexed by timestamp + session_id
+            </div>
+
+            <div class="flow-box">
+                <strong>Research Database (Market Data)</strong><br/>
+                <code>data/research/market.duckdb</code> — minute bars + daily bars ingested from Alpaca
+            </div>
+
+            <div class="flow-box">
+                <strong>Schwab Integration</strong><br/>
+                <code>data/schwab_tokens.json</code> — OAuth tokens (git-ignored, 0600 perms)
+            </div>
+
+            <div class="flow-box">
+                <strong>Configuration</strong><br/>
+                <code>.env</code> — API keys, trading settings (git-ignored)
+            </div>
+        </div>
+    </div>
+</body>
+</html>
