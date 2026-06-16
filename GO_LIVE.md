@@ -58,8 +58,9 @@ TRADING_MAX_CONCURRENT_POSITIONS=3
 - **Manual approval instead of auto:** `TRADING_AUTO_APPROVE=0`, drop
   `--no-dashboard`, approve each signal at `http://127.0.0.1:8765`.
 - **Observe only (no orders):** `TRADING_EXECUTION_ENABLED=0`.
-- The breaker halts **new** entries at -3%; it does **not** auto-flatten open
-  positions — exit those from the dashboard.
+- The breaker at -3% halts **new** entries **and flattens the book** — cancels
+  unfilled entries + market-closes open positions. Set
+  `TRADING_FLATTEN_ON_BREACH=0` for halt-only (leave positions open).
 
 ## 5. Tuning (env vars)
 | var | default | meaning |
@@ -84,7 +85,6 @@ PY
 ## Known limitations (honest)
 - `quality_score` is a constant 1.0, `float_rotation` is 0.0, `spread_pct` is
   null — these fields are not real metrics yet.
-- The circuit breaker halts new entries but does not auto-flatten open positions.
 - News-catalyst discovery (RSS) exists but isn't wired into the watchlist.
 - Free Alpaca **IEX** data is thinner than SIP, especially premarket — some
   sub-$20 names show few/no bars until volume builds.

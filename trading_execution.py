@@ -55,6 +55,8 @@ class ExecutionSettings:
     risk_per_trade_pct: float = 0.01
     default_equity: float = 100_000.0
     max_daily_loss_pct: float = 0.03
+    # on a daily-loss breach, also flatten open positions + cancel unfilled entries
+    flatten_on_breach: bool = True
     # --- entry mechanism (Ross-Cameron-style; all tunable) -----------------
     # reward target as a multiple of risk (entry + reward_multiple * (entry-stop))
     reward_multiple: float = 2.0
@@ -93,6 +95,7 @@ class ExecutionSettings:
             risk_per_trade_pct=float(values.get("TRADING_RISK_PER_TRADE_PCT", "0.01")),
             default_equity=float(values.get("TRADING_DEFAULT_EQUITY", "100000")),
             max_daily_loss_pct=float(values.get("TRADING_MAX_DAILY_LOSS_PCT", "0.03")),
+            flatten_on_breach=flag("TRADING_FLATTEN_ON_BREACH", "1"),
             reward_multiple=float(values.get("TRADING_REWARD_MULTIPLE", "2.0")),
             entry_order_type=order_type,
             entry_timeout_bars=int(values.get("TRADING_ENTRY_TIMEOUT_BARS", "2")),
@@ -162,6 +165,38 @@ class TradingExecutionService:
             if p.get("symbol")
         }
 
+    def _flatten_all(self, reason: str) -> dict:
+        """Cancel unfilled entries and market-close every open position.
+
+        Used when the daily-loss circuit breaker trips: stop the bleeding by
+        cancelling resting entries and flattening the book. Best-effort — errors
+        are collected, not raised, so one bad symbol can't block the rest.
+        ``close_position`` also cancels the position's resting bracket legs.
+        """
+        result: dict = {"cancelled_entries": 0, "closed_positions": [], "errors": []}
+        # 1) cancel unfilled (armed) entries we are tracking
+        for order_id in list(self._armed):
+            armed = self._armed.pop(order_id)
+            symbol = armed.get("symbol", "")
+            try:
+                self.executor.cancel_entry(
+                    order_id, armed.get("broker_order_id"), symbol, reason
+                )
+                result["cancelled_entries"] += 1
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"cancel {symbol}: {exc}")
+            self._requested_symbols.discard(symbol)
+        # 2) market-close open positions
+        client = getattr(self.executor, "client", None)
+        for symbol in sorted(self._held_symbols()):
+            try:
+                if client is not None and hasattr(client, "close_position"):
+                    client.close_position(symbol)
+                result["closed_positions"].append(symbol)
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"close {symbol}: {exc}")
+        return result
+
     def _daily_loss_breach(self) -> bool:
         """True once the day's loss hits the circuit-breaker threshold.
 
@@ -189,6 +224,19 @@ class TradingExecutionService:
         pnl_pct = (equity - baseline) / baseline
         if pnl_pct <= -max_loss:
             self._halted = True
+            flat = (
+                self._flatten_all("daily_loss_circuit_breaker")
+                if self.settings.flatten_on_breach
+                else {"closed_positions": [], "cancelled_entries": 0}
+            )
+            extra = ""
+            if self.settings.flatten_on_breach:
+                n_closed = len(flat["closed_positions"])
+                n_cancel = flat["cancelled_entries"]
+                extra = (
+                    f" — flattened {n_closed} position(s), "
+                    f"cancelled {n_cancel} unfilled entr{'y' if n_cancel == 1 else 'ies'}"
+                )
             self.store.emit(
                 RiskRuleTriggeredEvent(
                     timestamp=datetime.now(),
@@ -196,7 +244,7 @@ class TradingExecutionService:
                     correlation_id=self.session_id,
                     message=(
                         f"Daily-loss circuit breaker tripped: {pnl_pct:+.2%} "
-                        f"(limit -{max_loss:.0%}) — halting new entries"
+                        f"(limit -{max_loss:.0%}) — halting new entries{extra}"
                     ),
                     rule_type="daily_loss",
                     rule_value=max_loss,
@@ -204,8 +252,11 @@ class TradingExecutionService:
                         "equity": equity,
                         "baseline_equity": baseline,
                         "pnl_pct": round(pnl_pct, 4),
+                        "flatten": flat,
                     },
-                    action_taken="halted_new_entries",
+                    action_taken="halted_and_flattened"
+                    if self.settings.flatten_on_breach
+                    else "halted_new_entries",
                 )
             )
         return self._halted
