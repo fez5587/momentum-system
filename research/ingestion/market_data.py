@@ -84,12 +84,22 @@ def upsert_minute_bars(
         return 0
     con.executemany(
         """
-        INSERT OR REPLACE INTO minute_bars (
+        INSERT INTO minute_bars (
             symbol, timestamp, session_date,
             is_premarket, is_regular_hours, is_afterhours,
             open, high, low, close, volume, vwap,
             spread_pct, halt_status, source_provider, quality_score
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (symbol, timestamp) DO UPDATE SET
+            session_date = EXCLUDED.session_date,
+            is_premarket = EXCLUDED.is_premarket,
+            is_regular_hours = EXCLUDED.is_regular_hours,
+            is_afterhours = EXCLUDED.is_afterhours,
+            open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+            close = EXCLUDED.close, volume = EXCLUDED.volume, vwap = EXCLUDED.vwap,
+            spread_pct = EXCLUDED.spread_pct, halt_status = EXCLUDED.halt_status,
+            source_provider = EXCLUDED.source_provider,
+            quality_score = EXCLUDED.quality_score
         """,
         rows,
     )
@@ -122,10 +132,14 @@ def upsert_daily_bars(con, symbol: str, bars: list[dict]) -> int:
         return 0
     con.executemany(
         """
-        INSERT OR REPLACE INTO daily_bars (
+        INSERT INTO daily_bars (
             symbol, trade_date, open, high, low, close, volume, vwap,
             previous_close
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (symbol, trade_date) DO UPDATE SET
+            open = EXCLUDED.open, high = EXCLUDED.high, low = EXCLUDED.low,
+            close = EXCLUDED.close, volume = EXCLUDED.volume, vwap = EXCLUDED.vwap,
+            previous_close = EXCLUDED.previous_close
         """,
         rows,
     )

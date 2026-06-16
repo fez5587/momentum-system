@@ -1,34 +1,13 @@
-"""DuckDB connection management."""
+"""Database connection management.
 
-import importlib
-from pathlib import Path
-from typing import Any
+The momentum datastore is a single PostgreSQL database. This module preserves
+the historical ``get_connection`` / ``get_memory_connection`` entry points but
+delegates to :mod:`storage.db_pg`. The ``db_path`` argument is accepted for
+call-site compatibility and ignored, except that ":memory:" yields an isolated
+throwaway schema (the DuckDB ':memory:' equivalent) so each test gets a fresh
+database.
+"""
 
-from .schema import create_schema
+from .db_pg import get_connection, get_memory_connection
 
-
-def get_connection(
-    db_path: str | Path = "./data/momentum.duckdb",
-) -> Any:
-    """Get a DuckDB connection, creating schema if needed."""
-    duckdb = importlib.import_module("duckdb")
-
-    if str(db_path) == ":memory:":
-        con = duckdb.connect(":memory:")
-        create_schema(con)
-        return con
-
-    db_path = Path(db_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-    con = duckdb.connect(str(db_path))
-    create_schema(con)
-    return con
-
-
-def get_memory_connection() -> Any:
-    """Get an in-memory DuckDB connection for testing."""
-    duckdb = importlib.import_module("duckdb")
-
-    con = duckdb.connect(":memory:")
-    create_schema(con)
-    return con
+__all__ = ["get_connection", "get_memory_connection"]

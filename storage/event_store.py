@@ -47,10 +47,9 @@ class EventStore:
             CREATE INDEX IF NOT EXISTS idx_events_session_id
             ON events(correlation_id);
         """)
-        cursor.execute("""
-            CREATE INDEX IF NOT EXISTS idx_events_symbol
-            ON events(payload_json);
-        """)
+        # No index on payload_json: a btree over full JSON text is invalid for
+        # large payloads in Postgres and useless for the LIKE-based symbol
+        # filter (query_events scans with payload_json LIKE instead).
         self.con.commit()
 
     def emit(self, event: BaseEvent) -> str:
