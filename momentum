@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# momentum — run the inspection/monitoring CLI with the project's venv.
+# Usage: ./momentum watch | doctor | inspect signals | inspect criteria SYM | ...
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_PY="/home/philip/.venvs/momentum/bin/python"
+if [ ! -x "$VENV_PY" ]; then
+  echo "venv python not found at $VENV_PY" >&2
+  echo "create it:" >&2
+  echo "  uv venv \"\$HOME/.venvs/momentum\" --python 3.13" >&2
+  echo "  uv pip install --python \"\$HOME/.venvs/momentum\" psycopg2-binary pandas pydantic pydantic-settings pyyaml typer rich numpy python-dotenv" >&2
+  exit 1
+fi
+cd "$ROOT"
+exec "$VENV_PY" momentum_cli.py "$@"

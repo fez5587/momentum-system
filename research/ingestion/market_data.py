@@ -234,7 +234,8 @@ def discover_active_symbols(
     static symbol list.
     """
     try:
-        actives = client.get_most_actives(top=top * 3, by="volume")
+        # Alpaca caps the most-actives `top` at 100; never request more.
+        actives = client.get_most_actives(top=min(top * 3, 100), by="volume")
         symbols = [a["symbol"] for a in actives if a.get("symbol")]
         if not symbols:
             return []
