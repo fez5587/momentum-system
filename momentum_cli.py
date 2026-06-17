@@ -631,6 +631,42 @@ def _render_board(con):
 
 
 @app.command()
+def journal():
+    """Print the day's trade journal (today's trades + day P&L) — for the close
+    capture and the nightly record."""
+    from datetime import datetime
+    try:
+        from zoneinfo import ZoneInfo
+        today = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:  # noqa: BLE001
+        today = datetime.now().date().isoformat()
+    con = _con()
+    trades, realized = _todays_trades(con)
+    day_pnl = _day_pnl(con)
+    console.print(f"[bold]=== trade journal {today} ===[/bold]")
+    if day_pnl is not None:
+        console.print(f"day P&L: [{'green' if day_pnl >= 0 else 'red'}]{day_pnl:+,.0f}[/]"
+                      f"  ([dim]matched {realized:+,.0f}[/])")
+    if not trades:
+        console.print("no trades today.")
+        return
+    t = Table(box=box.SIMPLE)
+    for c in ("time", "symbol", "qty", "entry", "exit", "P&L", "status"):
+        t.add_column(c, justify="left" if c in ("symbol", "status") else "right")
+    for tr in sorted(trades, key=lambda x: x["time"]):
+        pnl = tr["pnl"]
+        t.add_row(tr["time"], str(tr["symbol"]), f"{tr['qty']:.0f}", f"{tr['entry']:.2f}",
+                  f"{tr['exit']:.2f}" if tr["exit"] else "—",
+                  f"{pnl:+.0f}" if pnl is not None else "—", tr["status"])
+    console.print(t)
+    closed = [tr for tr in trades if tr["status"] == "closed"]
+    if closed:
+        wins = sum(1 for tr in closed if (tr["pnl"] or 0) > 0)
+        console.print(f"[dim]{len(closed)} closed · {wins} win ({wins / len(closed) * 100:.0f}%) · "
+                      f"{len(trades) - len(closed)} still open[/dim]")
+
+
+@app.command()
 def watch(interval: float = 3.0, once: bool = typer.Option(False, help="render one frame and exit")):
     """LIVE board: the symbols being evaluated + their determinations, refreshing."""
     import time as _t
