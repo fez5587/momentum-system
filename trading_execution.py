@@ -68,9 +68,12 @@ class ExecutionSettings:
     # based, so the invalidation guard can run far more often than this.
     entry_timeout_bars: int = 2
     # cancel an unfilled entry if price trades back below the entry trigger by
-    # this fraction (e.g. 0.0 = any break below entry; 0.005 = 0.5% below).
-    # Set to a negative number to disable price-break invalidation.
-    entry_invalidate_pct: float = 0.0
+    # this fraction. NOT 0.0: at zero tolerance any sub-cent wobble below the
+    # trigger cancels the entry one tick after it fires, so a breakout that
+    # oscillates around the level churns and never holds (observed live). Give
+    # it room — the bracket STOP (opening-range low) is the real protection and
+    # risk is capped at 1%/trade by sizing. Negative disables price-break cancel.
+    entry_invalidate_pct: float = 0.015
     # live-trigger fast path (submit_breakout_now): how far above the trigger to
     # cap the marketable limit so a breakout FILLS on a runner instead of
     # resting forever at the trigger, while still bounding slippage.
@@ -104,7 +107,7 @@ class ExecutionSettings:
             entry_order_type=order_type,
             entry_timeout_bars=int(values.get("TRADING_ENTRY_TIMEOUT_BARS", "2")),
             entry_invalidate_pct=float(
-                values.get("TRADING_ENTRY_INVALIDATE_PCT", "0.0")
+                values.get("TRADING_ENTRY_INVALIDATE_PCT", "0.015")
             ),
             trigger_slippage_pct=float(
                 values.get("TRADING_TRIGGER_SLIP_PCT", "0.004")
