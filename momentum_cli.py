@@ -500,18 +500,32 @@ def _render_board(con):
     pos_ev = con.execute("SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
                          "ORDER BY timestamp DESC LIMIT 1").fetchall()
     pt = Table(title="open positions", box=box.SIMPLE)
-    pt.add_column("symbol"); pt.add_column("qty", justify="right"); pt.add_column("uPnL", justify="right")
+    for c in ("symbol", "qty", "entry", "last", "uPnL $", "uPnL %"):
+        pt.add_column(c, justify="left" if c == "symbol" else "right")
     if pos_ev:
         for p in (json.loads(pos_ev[0][0]).get("positions") or []):
             # the sync stores it as 'unrealized_pnl'; fall back to 'unrealized_pl'
             upl = p.get("unrealized_pnl")
             if upl is None:
                 upl = p.get("unrealized_pl")
+            entry = p.get("avg_entry_price")
+            last = p.get("current_price")
+            pct = p.get("unrealized_pnl_pct")
             try:
                 upl_str = f"[{'green' if float(upl) >= 0 else 'red'}]{float(upl):+.0f}[/]"
             except (TypeError, ValueError):
                 upl_str = "-"
-            pt.add_row(str(p.get("symbol")), str(p.get("quantity") or p.get("qty") or ""), upl_str)
+            try:
+                pct_str = f"[{'green' if float(pct) >= 0 else 'red'}]{float(pct) * 100:+.1f}%[/]"
+            except (TypeError, ValueError):
+                pct_str = "-"
+            pt.add_row(
+                str(p.get("symbol")),
+                str(p.get("quantity") or p.get("qty") or ""),
+                f"{float(entry):.2f}" if entry not in (None, "") else "-",
+                f"{float(last):.2f}" if last not in (None, "") else "-",
+                upl_str, pct_str,
+            )
 
     risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
                        "ORDER BY timestamp DESC LIMIT 4").fetchall()
