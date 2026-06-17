@@ -93,6 +93,7 @@ class ArmedTriggerBook:
 
     max_armed: int = 6
     gap_min: float = 3.0        # min overnight gap % to be eligible to fire
+    gap_max: float = 1e9        # max gap % — skip blow-off gappers (they fade)
     rvol_min: float = 2.0       # min relative volume to be eligible to fire
     min_range_pct: float = 0.004  # opening range must be at least this wide
     triggers: dict[str, ArmedTrigger] = field(default_factory=dict)
@@ -103,7 +104,7 @@ class ArmedTriggerBook:
             t.trigger is not None
             and t.stop is not None
             and t.stop < t.trigger
-            and t.gap_pct >= self.gap_min
+            and self.gap_min <= t.gap_pct <= self.gap_max
             and t.rvol >= self.rvol_min
             and t.range_pct >= self.min_range_pct
         )

@@ -263,6 +263,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
     book = ArmedTriggerBook(
         max_armed=int(os.environ.get("TRIGGER_MAX_ARMED", "6")),
         gap_min=float(os.environ.get("TRIGGER_GAP_MIN", "3.0")),
+        gap_max=float(os.environ.get("TRIGGER_GAP_MAX", "1e9")),
         rvol_min=float(os.environ.get("TRIGGER_RVOL_MIN", "2.0")),
         min_range_pct=float(os.environ.get("TRIGGER_MIN_RANGE_PCT", "0.004")),
     )
