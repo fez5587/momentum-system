@@ -73,6 +73,7 @@ class AlpacaPaperSync:
                 cash_balance=float(account.get("cash") or 0),
                 buying_power=float(account.get("buying_power") or 0),
                 net_liquidating_value=float(account.get("equity") or 0),
+                last_equity=float(account.get("last_equity") or 0),
             )
         )
         return account
@@ -110,7 +111,7 @@ class AlpacaPaperSync:
         )
         return positions
 
-    def sync_orders(self, status: str = "all", limit: int = 50) -> list[dict] | None:
+    def sync_orders(self, status: str = "all", limit: int = 500) -> list[dict] | None:
         try:
             raw = self.client.get_orders(status=status, limit=limit)
         except Exception as exc:

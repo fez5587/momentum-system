@@ -448,6 +448,82 @@ _STATE_STYLE = {
 }
 
 
+def _todays_trades(con):
+    """Reconstruct TODAY's round-trip trades (FIFO buy->sell per symbol) from the
+    latest broker orders snapshot, plus still-open lots. Resets each day (filters
+    to today's fills). Returns (trades, realized_pnl)."""
+    from collections import defaultdict, deque
+    from datetime import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        today = _dt.now(ZoneInfo("America/New_York")).date().isoformat()
+    except Exception:  # noqa: BLE001
+        today = _dt.now().date().isoformat()
+    rows = con.execute("SELECT payload_json FROM events WHERE event_type='account_orders_updated' "
+                       "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    if not rows:
+        return [], 0.0
+    orders = json.loads(rows[0][0]).get("orders") or []
+    fills = [o for o in orders
+             if float(o.get("filled_quantity") or 0) > 0
+             and str(o.get("submitted_at") or "")[:10] == today]
+    fills.sort(key=lambda o: o.get("submitted_at") or "")
+    lots: dict = defaultdict(deque)
+    trades = []
+    for o in fills:
+        sym, side = o.get("symbol"), o.get("side")
+        qty = float(o.get("filled_quantity") or 0)
+        px = float(o.get("filled_avg_price") or 0)
+        tm = str(o.get("submitted_at") or "")[11:19]
+        if side == "buy":
+            lots[sym].append([qty, px, tm])
+        elif side == "sell":
+            rem = qty
+            while rem > 1e-9 and lots[sym]:
+                lot = lots[sym][0]
+                m = min(rem, lot[0])
+                trades.append({"symbol": sym, "qty": m, "entry": lot[1], "exit": px,
+                               "pnl": (px - lot[1]) * m, "time": lot[2], "status": "closed"})
+                lot[0] -= m
+                rem -= m
+                if lot[0] <= 1e-9:
+                    lots[sym].popleft()
+    for sym, dq in lots.items():
+        for qty, px, tm in dq:
+            trades.append({"symbol": sym, "qty": qty, "entry": px, "exit": None,
+                           "pnl": None, "time": tm, "status": "open"})
+    realized = sum(t["pnl"] for t in trades if t["status"] == "closed")
+    return trades, realized
+
+
+def _day_pnl(con):
+    """Authoritative day P&L = latest equity - prior-session close (broker truth,
+    resets daily). Uses the broker's last_equity baseline; falls back to the
+    first equity recorded today for events emitted before that field existed."""
+    latest = con.execute("SELECT payload_json FROM events WHERE event_type='account_summary_updated' "
+                         "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    if not latest:
+        return None
+    p = json.loads(latest[0][0])
+    try:
+        e_now = float(p.get("total_equity") or 0)
+        last_eq = float(p.get("last_equity") or 0)
+        if e_now and last_eq:
+            return e_now - last_eq
+    except (TypeError, ValueError):
+        pass
+    first = con.execute("SELECT payload_json FROM events WHERE event_type='account_summary_updated' "
+                        "AND timestamp::date = CURRENT_DATE ORDER BY timestamp ASC LIMIT 1").fetchall()
+    if not first:
+        return None
+    try:
+        e_now = float(p.get("total_equity") or 0)
+        e_start = float(json.loads(first[0][0]).get("total_equity") or 0)
+        return (e_now - e_start) if (e_now and e_start) else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _render_board(con):
     """Build the live monitoring board renderable."""
     from rich.console import Group
@@ -503,33 +579,35 @@ def _render_board(con):
 
     pos_ev = con.execute("SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
                          "ORDER BY timestamp DESC LIMIT 1").fetchall()
-    pt = Table(title="open positions", box=box.SIMPLE)
-    for c in ("symbol", "qty", "entry", "last", "uPnL $", "uPnL %"):
-        pt.add_column(c, justify="left" if c == "symbol" else "right")
+    open_unreal = 0.0
     if pos_ev:
         for p in (json.loads(pos_ev[0][0]).get("positions") or []):
-            # the sync stores it as 'unrealized_pnl'; fall back to 'unrealized_pl'
-            upl = p.get("unrealized_pnl")
-            if upl is None:
-                upl = p.get("unrealized_pl")
-            entry = p.get("avg_entry_price")
-            last = p.get("current_price")
-            pct = p.get("unrealized_pnl_pct")
             try:
-                upl_str = f"[{'green' if float(upl) >= 0 else 'red'}]{float(upl):+.0f}[/]"
+                open_unreal += float(p.get("unrealized_pnl") if p.get("unrealized_pnl") is not None
+                                     else p.get("unrealized_pl") or 0)
             except (TypeError, ValueError):
-                upl_str = "-"
-            try:
-                pct_str = f"[{'green' if float(pct) >= 0 else 'red'}]{float(pct) * 100:+.1f}%[/]"
-            except (TypeError, ValueError):
-                pct_str = "-"
-            pt.add_row(
-                str(p.get("symbol")),
-                str(p.get("quantity") or p.get("qty") or ""),
-                f"{float(entry):.2f}" if entry not in (None, "") else "-",
-                f"{float(last):.2f}" if last not in (None, "") else "-",
-                upl_str, pct_str,
-            )
+                pass
+    trades, realized = _todays_trades(con)
+    day_pnl = _day_pnl(con)
+    if day_pnl is None:            # fallback if equity snapshots missing
+        day_pnl = realized + open_unreal
+    dcol = "green" if day_pnl >= 0 else "red"
+    pt = Table(title=f"today's trades — day P&L [{dcol}]{day_pnl:+,.0f}[/] "
+                     f"([dim]matched {realized:+,.0f} · open {open_unreal:+,.0f}[/])",
+               box=box.SIMPLE)
+    for c in ("time", "symbol", "qty", "entry", "exit", "P&L", ""):
+        pt.add_column(c, justify="left" if c in ("symbol", "") else "right")
+    for t in sorted(trades, key=lambda x: x["time"], reverse=True)[:14]:
+        pnl = t["pnl"]
+        if pnl is None:
+            pnl_str, tag = "[dim]—[/dim]", "[yellow]● open[/yellow]"
+        else:
+            pnl_str = f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.0f}[/]"
+            tag = "closed"
+        pt.add_row(t["time"], str(t["symbol"]), f"{t['qty']:.0f}", f"{t['entry']:.2f}",
+                   f"{t['exit']:.2f}" if t["exit"] else "—", pnl_str, tag)
+    if not trades:
+        pt.add_row("—", "[dim]no trades today yet[/dim]", "—", "—", "—", "—", "—")
 
     risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
                        "ORDER BY timestamp DESC LIMIT 4").fetchall()
@@ -543,6 +621,7 @@ def _render_board(con):
         f"[bold]momentum live[/bold]   "
         f"[{pcolor}]{phase}[/{pcolor}] [dim]{detail}[/dim]   "
         f"equity [green]{eq}[/green]   "
+        f"day P&L [bold {dcol}]{day_pnl:+,.0f}[/]   "
         f"[{hb_color}]♥ {hb_text}[/{hb_color}]   "
         f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scanning\n"
         f"[dim]hunting $1–20 gappers (≥ gap% on ≥ 2× volume); buy the break of the "

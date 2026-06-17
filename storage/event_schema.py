@@ -232,6 +232,9 @@ class AccountSummaryUpdatedEvent(BaseEvent):
     cash_balance: float = Field(description="Available cash balance")
     buying_power: float = Field(description="Buying power")
     net_liquidating_value: float = Field(description="Net liquidation value")
+    last_equity: float = Field(
+        default=0.0, description="Prior-session close equity (day P&L baseline)"
+    )
 
 
 class AccountPositionsUpdatedEvent(BaseEvent):

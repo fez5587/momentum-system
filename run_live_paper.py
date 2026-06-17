@@ -469,6 +469,17 @@ def main(argv: list[str] | None = None) -> int:
         news_map = recent_news_map(
             rt["research_con"], lookback_hours=int(os.environ.get("NEWS_LOOKBACK_HOURS", "8")))
         news_boost = float(os.environ.get("NEWS_RANK_BOOST", "2.0"))
+        # optional MANUAL per-symbol priority nudge (SYMBOL_WEIGHTS=ABCD:1.2,XYZ:1.1)
+        # — a small boost to names you want watched; keep modest so it doesn't
+        # override the gap/volume logic.
+        weights: dict[str, float] = {}
+        for part in os.environ.get("SYMBOL_WEIGHTS", "").split(","):
+            if ":" in part:
+                s, w = part.split(":", 1)
+                try:
+                    weights[s.strip().upper()] = float(w)
+                except ValueError:
+                    pass
         candidates: list[dict] = []
         # rank ALL session symbols by gap*rvol (thresholds applied later, per
         # trigger, so the board still shows the field pre-gap)
@@ -492,8 +503,11 @@ def main(argv: list[str] | None = None) -> int:
                 "range_pct": ((hi - lo) / hi) if (hi and lo and hi > 0) else 0.0,
                 "cum_volume": g.cumulative_volume,
                 "catalyst": catalyst,
-                # a fresh catalyst is WHY a small-cap runs — boost it up the rank
-                "_score": g.gap_pct * max(g.relative_volume, 0.1) * (news_boost if catalyst else 1.0),
+                # a fresh catalyst is WHY a small-cap runs — boost it up the rank;
+                # times an optional manual per-symbol weight (default 1.0)
+                "_score": (g.gap_pct * max(g.relative_volume, 0.1)
+                           * (news_boost if catalyst else 1.0)
+                           * weights.get(g.symbol, 1.0)),
                 "complete": complete,
             })
         # pre-open / before any gappers form: surface the queued watchlist so the
