@@ -68,6 +68,18 @@ def variants() -> dict[str, ExitConfig]:
     v["scale50_be1_trailLow"] = ExitConfig(
         target_r=10.0, breakeven_at_r=1.0, scale_out_r=1.0, scale_out_pct=0.5,
         trail_mode=TRAIL_PRIOR_LOW, trail_after_r=1.0)
+    # --- PROFIT-LOCK tiers on top of the verified prior-low trail (= the live
+    #     config). lock_off is the baseline to beat; the rest add %-gain floors. ---
+    _trail = dict(target_r=10.0, trail_mode=TRAIL_PRIOR_LOW, trail_after_r=1.0)
+    v["lock_off"] = ExitConfig(**_trail)  # == trailLow_a1, current live exit
+    v["lock_tight"] = ExitConfig(**_trail,
+        profit_lock_tiers=[(.05, .01), (.10, .05), (.20, .13), (.30, .22)])
+    v["lock_mid"] = ExitConfig(**_trail,
+        profit_lock_tiers=[(.08, .03), (.15, .09), (.25, .18), (.40, .30)])
+    v["lock_wide"] = ExitConfig(**_trail,
+        profit_lock_tiers=[(.12, .05), (.25, .16), (.40, .30)])
+    v["lock_only_mid"] = ExitConfig(target_r=10.0,
+        profit_lock_tiers=[(.08, .03), (.15, .09), (.25, .18), (.40, .30)])
     return v
 
 
