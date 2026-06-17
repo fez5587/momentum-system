@@ -25,9 +25,13 @@ class AlpacaApiError(RuntimeError):
 
 
 class AlpacaPaperClient:
-    def __init__(self, settings: AlpacaPaperSettings | None = None, timeout: int = 15):
+    def __init__(self, settings: AlpacaPaperSettings | None = None, timeout: int = 15,
+                 max_retries: int = 2):
         self.settings = settings or AlpacaPaperSettings.from_env()
         self.timeout = timeout
+        # retry transient network/DNS errors (not HTTP 4xx/5xx) a couple times;
+        # DNS failures fail fast, so this smooths brief blips without much latency
+        self.max_retries = max_retries
 
     # -- low level -------------------------------------------------------
 
@@ -50,12 +54,21 @@ class AlpacaPaperClient:
         req = urllib.request.Request(
             url, data=data, headers=self._headers(), method=method
         )
-        try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
-                raw = resp.read().decode()
-                return json.loads(raw) if raw else {}
-        except urllib.error.HTTPError as exc:
-            raise AlpacaApiError(exc.code, exc.read().decode(errors="replace")) from exc
+        import time as _time
+        for attempt in range(self.max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                    raw = resp.read().decode()
+                    return json.loads(raw) if raw else {}
+            except urllib.error.HTTPError as exc:
+                # a real API response (4xx/5xx) — do not retry, surface it
+                raise AlpacaApiError(exc.code, exc.read().decode(errors="replace")) from exc
+            except urllib.error.URLError:
+                # transient network/DNS (e.g. gaierror) — retry a couple times
+                if attempt >= self.max_retries:
+                    raise
+                _time.sleep(0.4 * (attempt + 1))
+        raise RuntimeError("request retries exhausted")  # unreachable
 
     def _trading(self, method: str, path: str, **kw):
         return self._request(

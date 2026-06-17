@@ -58,15 +58,23 @@ def test_partial_fill_is_recorded():
     assert len(store.query_events(event_type="order_filled", limit=None)) == 1
 
 
-def test_breaker_fails_closed_when_equity_unreadable():
+def test_breaker_pauses_then_recovers_when_equity_unreadable():
+    """Equity-read outage PAUSES new entries (recoverable), not a permanent halt:
+    a transient DNS/network blip must not end the trading day."""
     store = EventStore(":memory:")
+    client = _FakeClient(raise_account=True)
     svc = TradingExecutionService(
         store,
-        executor=AlpacaPaperExecutor(store, client=_FakeClient(raise_account=True)),
+        executor=AlpacaPaperExecutor(store, client=client),
         settings=ExecutionSettings(max_daily_loss_pct=0.03),
         session_id="cb",
     )
+    svc._equity_fail_limit = 3  # tighten for the test
     assert svc._daily_loss_breach() is False   # 1 failure
     assert svc._daily_loss_breach() is False   # 2 failures
-    assert svc._daily_loss_breach() is True    # 3 -> fail CLOSED
-    assert svc._halted is True
+    assert svc._daily_loss_breach() is True    # 3 -> PAUSE (recoverable)
+    assert svc._data_halt is True and svc._halted is False  # NOT a permanent halt
+    # equity readable again -> resume
+    client.raise_account = False
+    assert svc._daily_loss_breach() is False
+    assert svc._data_halt is False

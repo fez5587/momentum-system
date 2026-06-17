@@ -169,9 +169,17 @@ class TradingExecutionService:
         # order_id -> {symbol, entry_price, broker_order_id, armed_at, checks}
         self._armed: dict[str, dict] = {}
         # daily-loss circuit breaker: once tripped, no new entries this session
+        # (a REAL loss is permanent for the session — a bounce can't re-open it)
         self._halted = False
-        # consecutive equity-read failures; after a few we fail CLOSED (halt)
+        # transient data-halt: equity unreadable (network/DNS). Blocks new entries
+        # WHILE unreadable but RECOVERS on the next good read — a DNS blip must not
+        # end the trading day the way a real loss does.
+        self._data_halt = False
+        # consecutive equity-read failures; after the limit we pause (recoverable)
         self._equity_read_failures = 0
+        self._equity_fail_limit = int(
+            os.environ.get("TRADING_EQUITY_FAIL_LIMIT", "5")
+        )
         # serializes state mutations across the main loop and the trigger thread
         self._lock = threading.RLock()
 
@@ -254,12 +262,12 @@ class TradingExecutionService:
 
     @_locked
     def _daily_loss_breach(self) -> bool:
-        """True once the day's loss hits the circuit-breaker threshold.
+        """True while new entries should be blocked.
 
-        Compares broker account equity to the prior-session close
-        (account.last_equity). Once tripped, stays tripped for the session so a
-        bounce can't re-open the floodgates. If equity can't be read, does NOT
-        block (fail-open on a data hiccup, not on a real loss).
+        Two distinct halts: a REAL daily-loss breach (``_halted``) is permanent
+        for the session so a bounce can't re-open the floodgates; an equity-read
+        outage (``_data_halt``) blocks WHILE unreadable but recovers on the next
+        good read — a transient DNS/network blip must not end the trading day.
         """
         if self._halted:
             return True
@@ -276,17 +284,32 @@ class TradingExecutionService:
                 raise ValueError("account 'equity' field missing")
             equity = float(equity_raw)
             baseline = float(acct.get("last_equity") or equity)
-            self._equity_read_failures = 0
+            # good read -> clear the transient data-halt and resume
+            if self._data_halt or self._equity_read_failures:
+                if self._data_halt:
+                    self.store.emit(
+                        RiskRuleTriggeredEvent(
+                            timestamp=datetime.now(), mode=self.mode,
+                            correlation_id=self.session_id,
+                            message="Equity readable again — resuming new entries",
+                            rule_type="equity_recovered", rule_value=0.0,
+                            current_state={"equity": equity},
+                            action_taken="resumed_new_entries",
+                        )
+                    )
+                self._data_halt = False
+                self._equity_read_failures = 0
         except Exception as exc:  # noqa: BLE001
             self._equity_read_failures += 1
             logger.warning(
                 "equity read failed (%d consecutive): %s",
                 self._equity_read_failures, exc,
             )
-            # FAIL CLOSED: if equity is unreadable repeatedly, stop opening risk
-            # rather than silently disabling the most important safety control.
-            if self._equity_read_failures >= 3 and not self._halted:
-                self._halted = True
+            # PAUSE (recoverable): block new entries while equity is unreadable,
+            # rather than silently disabling the most important safety control —
+            # but DO NOT permanently halt the session for a transient outage.
+            if self._equity_read_failures >= self._equity_fail_limit and not self._data_halt:
+                self._data_halt = True
                 self.store.emit(
                     RiskRuleTriggeredEvent(
                         timestamp=datetime.now(),
@@ -294,15 +317,15 @@ class TradingExecutionService:
                         correlation_id=self.session_id,
                         message=(
                             f"Equity unreadable {self._equity_read_failures}x — "
-                            "failing CLOSED, halting new entries"
+                            "pausing new entries until it recovers"
                         ),
                         rule_type="equity_unreadable",
                         rule_value=float(self._equity_read_failures),
                         current_state={"failures": self._equity_read_failures},
-                        action_taken="halted_new_entries",
+                        action_taken="paused_new_entries",
                     )
                 )
-            return self._halted
+            return self._data_halt
         if baseline <= 0:
             return False
         pnl_pct = (equity - baseline) / baseline

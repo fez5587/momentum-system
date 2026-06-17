@@ -56,7 +56,7 @@ class AlpacaPaperSync:
         try:
             account = self.client.get_account()
         except Exception as exc:
-            logger.exception("alpaca account sync failed")
+            logger.warning("alpaca account sync failed: %s", exc)
             self._emit_health(f"account: {exc}")
             return None
         account_id = str(account.get("account_number") or account.get("id") or "paper")
@@ -81,7 +81,7 @@ class AlpacaPaperSync:
         try:
             raw = self.client.get_positions()
         except Exception as exc:
-            logger.exception("alpaca positions sync failed")
+            logger.warning("alpaca positions sync failed: %s", exc)
             self._emit_health(f"positions: {exc}")
             return None
         positions = [
@@ -114,7 +114,7 @@ class AlpacaPaperSync:
         try:
             raw = self.client.get_orders(status=status, limit=limit)
         except Exception as exc:
-            logger.exception("alpaca orders sync failed")
+            logger.warning("alpaca orders sync failed: %s", exc)
             self._emit_health(f"orders: {exc}")
             return None
         orders = [
