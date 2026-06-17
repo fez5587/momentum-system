@@ -71,6 +71,10 @@ class ExecutionSettings:
     # this fraction (e.g. 0.0 = any break below entry; 0.005 = 0.5% below).
     # Set to a negative number to disable price-break invalidation.
     entry_invalidate_pct: float = 0.0
+    # live-trigger fast path (submit_breakout_now): how far above the trigger to
+    # cap the marketable limit so a breakout FILLS on a runner instead of
+    # resting forever at the trigger, while still bounding slippage.
+    trigger_slippage_pct: float = 0.004
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -101,6 +105,9 @@ class ExecutionSettings:
             entry_timeout_bars=int(values.get("TRADING_ENTRY_TIMEOUT_BARS", "2")),
             entry_invalidate_pct=float(
                 values.get("TRADING_ENTRY_INVALIDATE_PCT", "0.0")
+            ),
+            trigger_slippage_pct=float(
+                values.get("TRADING_TRIGGER_SLIP_PCT", "0.004")
             ),
         )
 
@@ -430,6 +437,133 @@ class TradingExecutionService:
             "broker_order_id": result.broker_order_id,
             "status": result.status,
             "error": result.error,
+        }
+
+    def submit_breakout_now(
+        self,
+        symbol: str,
+        trigger: float,
+        stop: float,
+        last_price: float | None = None,
+        reason: str = "orb_live_break",
+    ) -> dict:
+        """Fire a breakout entry immediately on a LIVE price cross.
+
+        The disciplined-but-fast counterpart to the watcher->approval cadence:
+        used by the armed-trigger loop when price crosses a pre-computed
+        opening-range high. Runs the SAME risk gates as the slow path (daily-loss
+        breaker, max-concurrent, per-symbol dedup, 1%-risk sizing), but submits a
+        *marketable* limit (capped a hair above the trigger) so it fills on a
+        runner instead of resting at the level. Returns a result dict; ``skipped``
+        explains a no-op (the symbol can simply try again next tick).
+        """
+        if not self.settings.enabled:
+            return {"ok": False, "skipped": "disabled"}
+        if self._daily_loss_breach():
+            return {"ok": False, "skipped": "halted"}
+        if self._open_position_count() >= self.settings.max_concurrent_positions:
+            return {"ok": False, "skipped": "max_positions"}
+
+        # per-symbol dedup shared with the slow path: never double-enter a name
+        # that's already held, pending approval, or requested this session.
+        held = self._held_symbols()
+        pending = {row["symbol"] for row in query_approval_queue(self.store)}
+        if symbol in held or symbol in pending or symbol in self._requested_symbols:
+            return {"ok": False, "skipped": "already_active"}
+
+        entry_ref = float(last_price or trigger)
+        stop_f = float(stop)
+        trigger_f = float(trigger)
+        if stop_f >= entry_ref or trigger_f <= 0:
+            return {"ok": False, "skipped": "bad_geometry"}
+
+        sizing = calculate_position_size(
+            entry_ref,
+            stop_f,
+            equity=self.equity,
+            config=PositionSizingConfig(
+                risk_per_trade_pct=self.settings.risk_per_trade_pct,
+                default_equity=self.settings.default_equity,
+            ),
+        )
+        if sizing.position_size <= 0:
+            return {"ok": False, "skipped": "zero_size"}
+
+        # marketable limit: fill now (price is already at/above the trigger), but
+        # cap how far above we'll chase so a gap-through doesn't pay any price.
+        limit_price = round(
+            max(entry_ref, trigger_f) * (1.0 + self.settings.trigger_slippage_pct), 2
+        )
+        risk_per_share = entry_ref - stop_f
+        request = ExecutionRequest(
+            symbol=symbol,
+            side="buy",
+            quantity=sizing.position_size,
+            entry_price=limit_price,
+            stop_loss_price=stop_f,
+            take_profit_price=round(
+                entry_ref + self.settings.reward_multiple * risk_per_share, 2
+            ),
+            order_type="limit",
+        )
+        # audit trail mirrors the slow path: requested(auto) -> approved -> submit
+        self.store.emit(
+            OrderApprovalRequestedEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=(
+                    f"Live ORB break ({reason}): buy {request.quantity} {symbol} "
+                    f"@ ~{entry_ref:.2f} (trigger {trigger_f:.2f}, stop {stop_f:.2f})"
+                ),
+                order_id=request.order_id,
+                symbol=symbol,
+                requested_by="orb_trigger",
+                approval_mode="auto",
+                execution_mode=self.trading_mode.execution_mode,
+                execution_request=request.to_payload(),
+            )
+        )
+        self.store.emit(
+            OrderApprovedEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=f"Order {request.order_id} auto-approved (live ORB break)",
+                order_id=request.order_id,
+                symbol=symbol,
+                approved_by="orb_trigger",
+                approval_notes=reason,
+            )
+        )
+        self._requested_symbols.add(symbol)
+        result = self.executor.execute(request)
+        if (
+            result.ok
+            and result.status
+            in {"new", "accepted", "pending_new", "held", "accepted_for_bidding"}
+            and request.entry_price
+        ):
+            self._armed[request.order_id] = {
+                "symbol": symbol,
+                "entry_price": float(request.entry_price),
+                "broker_order_id": result.broker_order_id,
+                "armed_at": self._now(),
+                "checks": 0,
+            }
+        logger.info(
+            "live ORB break %s qty=%s -> ok=%s status=%s",
+            symbol, request.quantity, result.ok, result.status,
+        )
+        return {
+            "ok": result.ok,
+            "order_id": request.order_id,
+            "broker_order_id": result.broker_order_id,
+            "status": result.status,
+            "error": result.error,
+            "quantity": sizing.position_size,
+            "entry": limit_price,
+            "stop": stop_f,
         }
 
     def reject_order(

@@ -49,6 +49,7 @@ from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.multi_schema import open_research_db
+from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
 from storage.event_schema import EventMode, ModuleTickEvent
 from storage.event_store import EventStore
@@ -253,6 +254,16 @@ def build_runtime(args: argparse.Namespace) -> dict:
     )
     sync = AlpacaPaperSync(store, client=client, session_id=session_id) if client else None
 
+    # Fast armed-trigger book: keep the N most-promising gappers ready with a
+    # pre-computed opening-range trigger/stop so step_trigger can fire the
+    # instant live price crosses (instead of waiting for a bar close + cadence).
+    book = ArmedTriggerBook(
+        max_armed=int(os.environ.get("TRIGGER_MAX_ARMED", "6")),
+        gap_min=float(os.environ.get("TRIGGER_GAP_MIN", "3.0")),
+        rvol_min=float(os.environ.get("TRIGGER_RVOL_MIN", "2.0")),
+        min_range_pct=float(os.environ.get("TRIGGER_MIN_RANGE_PCT", "0.004")),
+    )
+
     return {
         "symbols": symbols,
         "symbols_source": symbols_source,
@@ -263,6 +274,8 @@ def build_runtime(args: argparse.Namespace) -> dict:
         "watcher": watcher,
         "execution": execution,
         "sync": sync,
+        "book": book,
+        "latest_price": latest_price,
         "session_id": session_id,
         "event_db": event_db,
     }
@@ -410,6 +423,93 @@ def main(argv: list[str] | None = None) -> int:
         return (f"universe={len(res.universe)} gappers={len(res.gappers)}"
                 + (f" +{len(added)} new" if added else ""))
 
+    # --- fast armed-trigger path -------------------------------------------
+    book = rt["book"]
+    latest_price = rt["latest_price"]
+    price_min_v = float(os.environ.get("WATCHER_PRICE_MIN", "1"))
+    price_max_v = float(os.environ.get("WATCHER_PRICE_MAX", "20"))
+    orb_bars_v = int(os.environ.get("ORB_BARS", "5"))
+    stop_cushion_v = float(os.environ.get("TRIGGER_STOP_CUSHION", "0.005"))
+
+    def step_arm():
+        """Rank the most-promising gappers and pre-compute each one's opening-
+        range breakout trigger/stop, so step_trigger can fire on a live cross."""
+        from research import query as rq
+        from research.ingestion.signals import scan_gappers
+        from strategy.evaluation.structure import opening_range
+
+        session_date = _now_session_date()
+        candidates: list[dict] = []
+        # rank ALL session symbols by gap*rvol (thresholds applied later, per
+        # trigger, so the board still shows the field pre-gap)
+        gappers = scan_gappers(
+            rt["research_con"], session_date,
+            min_gap_pct=0.0, min_relative_volume=0.0,
+            price_min=price_min_v, price_max=price_max_v, limit=12,
+        )
+        for g in gappers:
+            bars = rq.query_minute_bars(rt["research_con"], g.symbol, session_date)
+            hi, lo, complete = opening_range(bars, orb_bars=orb_bars_v)
+            stop = lo * (1.0 - stop_cushion_v) if lo else None
+            candidates.append({
+                "symbol": g.symbol,
+                "gap_pct": g.gap_pct,
+                "rvol": g.relative_volume,
+                "trigger": hi,
+                "stop": stop,
+                "range_pct": ((hi - lo) / hi) if (hi and lo and hi > 0) else 0.0,
+                "complete": complete,
+            })
+        # pre-open / before any gappers form: surface the queued watchlist so the
+        # board shows what we're about to watch instead of looking blank
+        if not candidates:
+            for s in symbols[: book.max_armed]:
+                candidates.append({"symbol": s, "gap_pct": 0.0, "rvol": 0.0,
+                                   "trigger": None, "stop": None,
+                                   "range_pct": 0.0, "complete": False})
+        book.arm(candidates)
+        armed = sum(1 for t in book.triggers.values() if t.state == "armed")
+        return f"tracking={len(book.triggers)} armed={armed}"
+
+    def step_trigger():
+        """Fast tick: refresh live prices for the armed names, fire any that have
+        crossed their trigger, and publish the snapshot the live board renders."""
+        if not book.triggers:
+            return None
+        for sym in list(book.triggers):
+            book.update_price(sym, latest_price(sym) if client else None)
+        if rt["execution"] is not None:
+            try:
+                book.mark_filled(rt["execution"]._held_symbols())
+            except Exception:  # noqa: BLE001
+                pass
+        fired: list[str] = []
+        if rt["execution"] is not None:
+            for t in book.fires():
+                res = rt["execution"].submit_breakout_now(
+                    t.symbol, t.trigger, t.stop, last_price=t.price
+                )
+                if res.get("ok"):
+                    book.mark_fired(t.symbol)
+                    fired.append(t.symbol)
+        armed_n = sum(1 for t in book.triggers.values() if t.state == "armed")
+        rt["store"].emit(
+            ModuleTickEvent(
+                timestamp=datetime.now(),
+                mode=EventMode.PAPER,
+                correlation_id=rt["session_id"],
+                message=f"triggers armed={armed_n} fired={len(fired)}",
+                module="triggers",
+                stage="snapshot",
+                duration_ms=0.0,
+                input_count=len(book.triggers),
+                output_count=len(fired),
+                metrics={"triggers": book.snapshot(), "armed": armed_n},
+                errors=[],
+            )
+        )
+        return ("FIRED " + ", ".join(fired)) if fired else None
+
     scheduler = Scheduler()
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
@@ -418,6 +518,10 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("LIVE_BARS_ENABLED", "1"))
     scheduler.add("watch", step_watch, float(os.environ.get("WATCHER_INTERVAL_SECONDS", "30")),
                   enabled=_flag("WATCHER_ENABLED", "1"))
+    scheduler.add("arm", step_arm, float(os.environ.get("TRIGGER_ARM_INTERVAL_SECONDS", "20")),
+                  enabled=_flag("TRIGGER_ENABLED", "1"))
+    scheduler.add("trigger", step_trigger, float(os.environ.get("TRIGGER_INTERVAL_SECONDS", "4")),
+                  enabled=_flag("TRIGGER_ENABLED", "1"))
     scheduler.add("sync", step_sync, float(os.environ.get("ALPACA_PAPER_SYNC_INTERVAL_SECONDS", "60")),
                   enabled=_flag("ALPACA_PAPER_SYNC_ENABLED", "1"))
     scheduler.add("execute", step_execute, float(os.environ.get("TRADING_EXECUTION_INTERVAL_SECONDS", "30")),
@@ -430,7 +534,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "sync", "execute"):
+        for name in ("discover", "ingest", "watch", "arm", "trigger", "sync", "execute"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

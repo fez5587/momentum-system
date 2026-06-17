@@ -531,6 +531,28 @@ def detect_continuation_fallback(
     )
 
 
+def opening_range(bars: pd.DataFrame, orb_bars: int = 5):
+    """High/low of the first ``orb_bars`` regular-hours bars.
+
+    Returns ``(high, low, complete)``. ``complete`` is False — and high/low are
+    None — until ``orb_bars`` regular-hours bars exist, so a caller can arm a
+    breakout trigger the moment the opening range finishes forming (≈09:35 ET)
+    without waiting for a later bar to actually break it. Shares one definition
+    of "the opening range" with ``detect_opening_range_breakout`` below.
+    """
+    if bars is None or len(bars) == 0:
+        return (None, None, False)
+    if "is_regular_hours" in bars.columns:
+        rth = bars[bars["is_regular_hours"] == True]  # noqa: E712
+        rth = rth.reset_index(drop=True)
+    else:
+        rth = bars.reset_index(drop=True)
+    if len(rth) < orb_bars:
+        return (None, None, False)
+    orb = rth.iloc[:orb_bars]
+    return (float(orb["high"].max()), float(orb["low"].min()), True)
+
+
 def detect_opening_range_breakout(
     bars: pd.DataFrame,
     orb_bars: int = 5,

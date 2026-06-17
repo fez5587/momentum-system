@@ -387,9 +387,69 @@ def _latest_eval_board(con) -> dict:
     return seen
 
 
+def _market_clock():
+    """(phase, detail, color) for the US equities regular session, in ET."""
+    from datetime import datetime as _dt
+    try:
+        from zoneinfo import ZoneInfo
+        now = _dt.now(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001
+        now = _dt.now()
+    open_t = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    close_t = now.replace(hour=16, minute=0, second=0, microsecond=0)
+    if now.weekday() >= 5:
+        return ("CLOSED", "weekend", "dim")
+    if now < open_t:
+        s = int((open_t - now).total_seconds())
+        return ("PRE-OPEN", f"opens in {s // 3600}h {s % 3600 // 60}m", "yellow")
+    if now > close_t:
+        return ("CLOSED", "after hours", "dim")
+    s = int((close_t - now).total_seconds())
+    return ("OPEN", f"{s // 3600}h {s % 3600 // 60}m to close", "green")
+
+
+def _triggers_snapshot(con):
+    """Latest armed-trigger snapshot emitted by the live loop's `trigger` step.
+
+    Returns (rows, snapshot_timestamp, armed_count). rows is the per-symbol
+    board data (state/price/gap/rvol/trigger/distance/stop).
+    """
+    rows = con.execute(
+        "SELECT timestamp, payload_json FROM events WHERE event_type='module_tick' "
+        "ORDER BY timestamp DESC LIMIT 120").fetchall()
+    for ts, pj in rows:
+        p = json.loads(pj)
+        if p.get("module") == "triggers":
+            metrics = p.get("metrics") or {}
+            return (metrics.get("triggers") or [], ts, metrics.get("armed", 0))
+    return ([], None, 0)
+
+
+def _heartbeat(ts) -> tuple[str, str]:
+    """(text, color) describing how long ago the loop last published."""
+    if ts is None:
+        return ("no loop signal yet", "red")
+    from datetime import datetime as _dt
+    try:
+        when = ts if isinstance(ts, _dt) else _dt.fromisoformat(str(ts))
+        secs = (_dt.now() - when.replace(tzinfo=None)).total_seconds()
+    except Exception:  # noqa: BLE001
+        return ("loop signal seen", "green")
+    color = "green" if secs < 15 else ("yellow" if secs < 45 else "red")
+    return (f"loop {int(secs)}s ago", color)
+
+
+_STATE_STYLE = {
+    "armed": ("bold cyan", "● ARMED"),
+    "fired": ("bold magenta", "▶ FIRED"),
+    "filled": ("bold green", "◆ LONG"),
+    "waiting": ("dim", "· waiting"),
+    "weak": ("dim yellow", "  weak"),
+}
+
+
 def _render_board(con):
     """Build the live monitoring board renderable."""
-    from datetime import datetime
     from rich.console import Group
     from rich.panel import Panel
 
@@ -400,22 +460,38 @@ def _render_board(con):
     if acct:
         eq = json.loads(acct[0][0]).get("total_equity", "—")
 
-    seen = _latest_eval_board(con)
-    ready = [s for s, v in seen.items() if v[1] == "ready"]
-    et = Table(box=box.SIMPLE_HEAVY, expand=True)
-    for c, j in (("symbol", "left"), ("status", "center"), ("score", "right"),
-                 ("gap", "right"), ("rvol", "right"), ("why", "left")):
-        et.add_column(c, justify=j, no_wrap=(c != "why"))
-    for sym, (score, status, gap, rvol, reason) in sorted(seen.items(), key=lambda x: -(x[1][0] or 0))[:28]:
-        color = {"ready": "bold green", "late": "yellow", "blocked": "red"}.get(status, "white")
-        et.add_row(
-            sym, f"[{color}]{(status or '?').upper()}[/{color}]", f"{score:.0f}%",
-            f"{gap:+.1%}" if isinstance(gap, (int, float)) else "-",
-            f"{rvol:.1f}x" if isinstance(rvol, (int, float)) else "-",
-            (reason or "")[:46])
+    phase, detail, pcolor = _market_clock()
+    trig_rows, snap_ts, armed_n = _triggers_snapshot(con)
+    hb_text, hb_color = _heartbeat(snap_ts)
+
+    # --- the 6 armed triggers: the focused, live watchlist ------------------
+    tt = Table(box=box.SIMPLE_HEAVY, expand=True,
+               title="armed triggers — the 6 most-promising gappers, ready to fire")
+    for c, j in (("symbol", "left"), ("state", "left"), ("price", "right"),
+                 ("gap", "right"), ("rvol", "right"), ("trigger", "right"),
+                 ("→trigger", "right"), ("stop", "right")):
+        tt.add_column(c, justify=j, no_wrap=True)
+    for r in trig_rows:
+        style, label = _STATE_STYLE.get(r.get("state"), ("white", r.get("state", "?")))
+        price = r.get("price"); trig = r.get("trigger"); dist = r.get("dist")
+        stop = r.get("stop"); gap = r.get("gap"); rvol = r.get("rvol")
+        tt.add_row(
+            f"[{style}]{r.get('symbol')}[/{style}]",
+            f"[{style}]{label}[/{style}]",
+            f"{price:.2f}" if isinstance(price, (int, float)) else "—",
+            f"{gap:+.1f}%" if isinstance(gap, (int, float)) else "—",
+            f"{rvol:.1f}x" if isinstance(rvol, (int, float)) else "—",
+            f"{trig:.2f}" if isinstance(trig, (int, float)) else "—",
+            (f"[green]▲{dist * 100:+.2f}%[/green]" if isinstance(dist, (int, float)) and dist >= 0
+             else (f"{dist * 100:+.2f}%" if isinstance(dist, (int, float)) else "—")),
+            f"{stop:.2f}" if isinstance(stop, (int, float)) else "—",
+        )
+    if not trig_rows:
+        tt.add_row("[dim]—[/dim]", "[dim]waiting for the open / first bars[/dim]",
+                   "—", "—", "—", "—", "—", "—")
 
     sig = con.execute("SELECT timestamp, message FROM events WHERE event_type='signal_ready' "
-                      "ORDER BY timestamp DESC LIMIT 6").fetchall()
+                      "ORDER BY timestamp DESC LIMIT 5").fetchall()
     st = Table(title="ready signals", box=box.SIMPLE)
     st.add_column("time", style="cyan"); st.add_column("signal", overflow="fold")
     for ts, m in sig:
@@ -433,18 +509,22 @@ def _render_board(con):
 
     risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
                        "ORDER BY timestamp DESC LIMIT 4").fetchall()
-    rt = Table(title="risk events", box=box.SIMPLE)
-    rt.add_column("time", style="cyan"); rt.add_column("rule", overflow="fold")
+    rk = Table(title="risk / circuit breaker", box=box.SIMPLE)
+    rk.add_column("time", style="cyan"); rk.add_column("rule", overflow="fold")
     for ts, m in risk:
-        rt.add_row(str(ts)[11:19], m or "")
+        rk.add_row(str(ts)[11:19], m or "")
 
+    n_eval = len(_latest_eval_board(con))
     header = Panel(
-        f"[bold]momentum live[/bold]   equity [green]{eq}[/green]   "
-        f"{datetime.now().strftime('%H:%M:%S')}   "
-        f"{len(seen)} evaluated · [bold green]{len(ready)} ready[/bold green]   "
-        f"[dim](window 9:30–10:35 ET · Ctrl-C to exit)[/dim]",
+        f"[bold]momentum live[/bold]   "
+        f"[{pcolor}]{phase}[/{pcolor}] [dim]{detail}[/dim]   "
+        f"equity [green]{eq}[/green]   "
+        f"[{hb_color}]♥ {hb_text}[/{hb_color}]   "
+        f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scanning\n"
+        f"[dim]hunting $1–20 gappers (≥ gap% on ≥ 2× volume); buy the break of the "
+        f"opening-range high, stop at its low · Ctrl-C to exit[/dim]",
         style="cyan")
-    return Group(header, et, st, pt, rt)
+    return Group(header, tt, st, pt, rk)
 
 
 @app.command()
