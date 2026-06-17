@@ -466,7 +466,7 @@ def _render_board(con):
 
     # --- the 6 armed triggers: the focused, live watchlist ------------------
     tt = Table(box=box.SIMPLE_HEAVY, expand=True,
-               title="armed triggers — the 6 most-promising gappers, ready to fire")
+               title="armed triggers — the most-promising gappers, ready to fire")
     for c, j in (("symbol", "left"), ("state", "left"), ("price", "right"),
                  ("gap", "right"), ("rvol", "right"), ("trigger", "right"),
                  ("→trigger", "right"), ("stop", "right")):

@@ -51,17 +51,28 @@ class LiveExitManager:
 
     # -- broker helpers ----------------------------------------------------
 
+    # a bracket stop leg sits in these states once the entry has filled; it is a
+    # child of the (now FILLED) entry, so a status="open" query misses it.
+    _ACTIVE = {"held", "new", "accepted", "pending_new",
+               "accepted_for_bidding", "partially_filled"}
+
     def _stop_leg(self, symbol: str):
-        """(order_id, stop_price) of the live sell-stop protecting symbol."""
+        """(order_id, stop_price) of the live sell-stop protecting symbol.
+
+        Queries status="all" because the protective leg is a 'held' child of the
+        filled entry order — status="open" wouldn't return the filled parent and
+        so wouldn't surface the leg.
+        """
         try:
-            orders = self.client.get_orders(status="open", limit=200, nested=True)
+            orders = self.client.get_orders(status="all", limit=100, nested=True)
         except Exception:  # noqa: BLE001
             return (None, None)
         for o in orders:
             for c in [o, *(o.get("legs") or [])]:
                 sym = c.get("symbol") or o.get("symbol")
                 if (sym == symbol and c.get("type") in ("stop", "stop_limit")
-                        and c.get("side") == "sell"):
+                        and c.get("side") == "sell"
+                        and c.get("status") in self._ACTIVE):
                     sp = c.get("stop_price")
                     return (c.get("id"), float(sp) if sp else None)
         return (None, None)
@@ -140,15 +151,29 @@ class LiveExitManager:
 
             # (3) ratchet the protective stop UP (breakeven / trail) via replace
             leg_id, cur_stop = self._stop_leg(sym)
-            if leg_id and cur_stop is not None and d.desired_stop > cur_stop + 0.01:
-                try:
-                    self.client.replace_order(leg_id, stop_price=round(d.desired_stop, 2))
-                    tr.last_stop = d.desired_stop
-                    self._emit(sym, f"stop {sym} {cur_stop:.2f} -> {d.desired_stop:.2f}",
-                               "stop_moved", {"from": cur_stop, "to": d.desired_stop})
-                    actions.append(f"{sym} stop->{d.desired_stop:.2f}")
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("stop move failed %s: %s", sym, exc)
+            if cur_stop is not None and d.desired_stop > cur_stop + 0.01:
+                last_px = float(p.get("current_price") or 0.0)
+                if last_px > 0 and d.desired_stop >= last_px:
+                    # the trail is already BREACHED (price fell back through the
+                    # prior swing low) — a sell-stop above market would be
+                    # rejected, so exit at market now (this is the trail firing).
+                    try:
+                        self.client.close_position(sym)
+                        self._emit(sym, f"trail breached, exit {sym} @~{last_px:.2f}",
+                                   "exit_trail", {"trail": d.desired_stop, "price": last_px})
+                        actions.append(f"{sym} trail-exit @{last_px:.2f}")
+                        self._tracked.pop(sym, None)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("trail exit failed %s: %s", sym, exc)
+                elif leg_id:
+                    try:
+                        self.client.replace_order(leg_id, stop_price=round(d.desired_stop, 2))
+                        tr.last_stop = d.desired_stop
+                        self._emit(sym, f"stop {sym} {cur_stop:.2f} -> {d.desired_stop:.2f}",
+                                   "stop_moved", {"from": cur_stop, "to": d.desired_stop})
+                        actions.append(f"{sym} stop->{d.desired_stop:.2f}")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("stop move failed %s: %s", sym, exc)
         return actions
 
 

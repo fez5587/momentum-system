@@ -44,7 +44,8 @@ def _bars(seq):
 def test_manager_ratchets_stop_up_and_never_cancels():
     store = EventStore(":memory:")
     pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "qty": "100"}]
-    leg = {"id": "stop1", "symbol": "AAA", "type": "stop", "side": "sell", "stop_price": "9.0"}
+    leg = {"id": "stop1", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "9.0", "status": "held"}
     broker = _FakeBroker(pos, leg)
     bars = _bars([(10.5, 9.8, 10.4), (11.5, 10.5, 11.4), (12.2, 11.5, 12.0)])
     mgr = LiveExitManager(
@@ -63,7 +64,7 @@ def test_manager_noop_for_static_bracket():
     # no active rules -> the broker OCO handles everything; manager does nothing
     broker = _FakeBroker([{"symbol": "AAA", "avg_entry_price": "10", "qty": "100"}],
                          {"id": "s", "symbol": "AAA", "type": "stop", "side": "sell",
-                          "stop_price": "9"})
+                          "stop_price": "9", "status": "held"})
     mgr = LiveExitManager(broker, EventStore(":memory:"), lambda s: _bars([(11, 10, 10.9)]),
                           cfg=ExitConfig(target_r=2.0), session_id="t")
     assert mgr.manage() == []
