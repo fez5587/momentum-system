@@ -56,16 +56,19 @@ class LiveExitManager:
     _ACTIVE = {"held", "new", "accepted", "pending_new",
                "accepted_for_bidding", "partially_filled"}
 
-    def _stop_leg(self, symbol: str):
+    def _all_orders(self):
+        try:
+            return self.client.get_orders(status="all", limit=100, nested=True)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _stop_leg(self, symbol: str, orders):
         """(order_id, stop_price) of the live sell-stop protecting symbol.
 
-        Queries status="all" because the protective leg is a 'held' child of the
-        filled entry order — status="open" wouldn't return the filled parent and
-        so wouldn't surface the leg.
+        Uses pre-fetched ``orders`` (status="all" — the protective leg is a
+        'held' child of the FILLED entry, which status="open" wouldn't surface).
         """
-        try:
-            orders = self.client.get_orders(status="all", limit=100, nested=True)
-        except Exception:  # noqa: BLE001
+        if orders is None:
             return (None, None)
         for o in orders:
             for c in [o, *(o.get("legs") or [])]:
@@ -77,11 +80,9 @@ class LiveExitManager:
                     return (c.get("id"), float(sp) if sp else None)
         return (None, None)
 
-    def _entry_time(self, symbol: str):
+    def _entry_time(self, symbol: str, orders):
         """UTC-naive fill time of the most recent FILLED buy entry for symbol."""
-        try:
-            orders = self.client.get_orders(status="all", limit=100, nested=True)
-        except Exception:  # noqa: BLE001
+        if orders is None:
             return None
         best = None
         for o in orders:
@@ -121,6 +122,11 @@ class LiveExitManager:
         for sym in list(self._tracked):  # stop tracking closed names
             if sym not in held:
                 self._tracked.pop(sym, None)
+        if not held:
+            return []
+        # fetch the orders snapshot ONCE per pass (status="all" is the heavy call;
+        # reuse it for every position's stop-leg + entry-time lookups)
+        orders = self._all_orders()
 
         actions: list[str] = []
         for sym, p in held.items():
@@ -134,12 +140,12 @@ class LiveExitManager:
             if entry <= 0:
                 continue
             if sym not in self._tracked:
-                _leg, cur_stop = self._stop_leg(sym)
+                _leg, cur_stop = self._stop_leg(sym, orders)
                 if cur_stop is None or cur_stop >= entry:
                     continue  # no usable protective stop yet (or above entry)
                 # trail from the ACTUAL entry fill time (so high-water/R reflect
                 # the move since entry, not since we first noticed the position)
-                entry_ts = self._entry_time(sym) or _last_ts(bars)
+                entry_ts = self._entry_time(sym, orders) or _last_ts(bars)
                 self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts, cur_stop)
             tr = self._tracked[sym]
 
@@ -175,7 +181,7 @@ class LiveExitManager:
                         logger.warning("scale-out failed %s: %s", sym, exc)
 
             # (3) ratchet the protective stop UP (breakeven / trail) via replace
-            leg_id, cur_stop = self._stop_leg(sym)
+            leg_id, cur_stop = self._stop_leg(sym, orders)
             if cur_stop is not None and d.desired_stop > cur_stop + 0.01:
                 last_px = float(p.get("current_price") or 0.0)
                 if last_px > 0 and d.desired_stop >= last_px:

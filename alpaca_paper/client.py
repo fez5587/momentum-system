@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -32,6 +34,29 @@ class AlpacaPaperClient:
         # retry transient network/DNS errors (not HTTP 4xx/5xx) a couple times;
         # DNS failures fail fast, so this smooths brief blips without much latency
         self.max_retries = max_retries
+        # tiny TTL cache for hot read-only endpoints (account/positions). The
+        # breaker, sync, guard and exit manager each read these every pass; on a
+        # flaky-DNS host every call risks a multi-second resolve, so collapsing
+        # the redundant reads within a pass is the difference between ~2s and
+        # ~60s loop passes. Short TTL keeps risk checks effectively current.
+        self._cache: dict = {}
+        self._cache_lock = threading.Lock()
+        self.cache_ttl = 2.5
+
+    def _cached(self, key: str, fn):
+        now = time.monotonic()
+        with self._cache_lock:
+            hit = self._cache.get(key)
+            if hit and (now - hit[1]) < self.cache_ttl:
+                return hit[0]
+        val = fn()  # network call OUTSIDE the lock
+        with self._cache_lock:
+            self._cache[key] = (val, time.monotonic())
+        return val
+
+    def _invalidate_cache(self):
+        with self._cache_lock:
+            self._cache.clear()
 
     # -- low level -------------------------------------------------------
 
@@ -87,10 +112,10 @@ class AlpacaPaperClient:
     # -- trading API -------------------------------------------------------
 
     def get_account(self) -> dict:
-        return self._trading("GET", "/account")
+        return self._cached("account", lambda: self._trading("GET", "/account"))
 
     def get_positions(self) -> list[dict]:
-        return self._trading("GET", "/positions")
+        return self._cached("positions", lambda: self._trading("GET", "/positions"))
 
     def get_orders(
         self, status: str = "all", limit: int = 100, nested: bool = True
@@ -114,6 +139,7 @@ class AlpacaPaperClient:
         take_profit_price: float | None = None,
         client_order_id: str | None = None,
     ) -> dict:
+        self._invalidate_cache()
         body: dict = {
             "symbol": symbol,
             "qty": str(qty),
@@ -136,6 +162,7 @@ class AlpacaPaperClient:
         return self._trading("POST", "/orders", body=body)
 
     def cancel_order(self, order_id: str) -> None:
+        self._invalidate_cache()
         self._trading("DELETE", f"/orders/{order_id}")
 
     def replace_order(
@@ -146,6 +173,7 @@ class AlpacaPaperClient:
         trail it — WITHOUT cancelling it. Cancelling a bracket leg tears down the
         OCO and leaves the position naked (the bug we already fixed once); a
         replace keeps the protection intact and just changes the price."""
+        self._invalidate_cache()
         body: dict = {}
         if stop_price is not None:
             body["stop_price"] = str(round(stop_price, 2))
@@ -159,6 +187,7 @@ class AlpacaPaperClient:
 
     def close_position(self, symbol: str, qty: int | None = None,
                        percentage: float | None = None) -> dict:
+        self._invalidate_cache()
         params = {}
         if qty is not None:
             params["qty"] = str(int(qty))
