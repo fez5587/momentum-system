@@ -11,8 +11,30 @@ from strategy.exits import (
     TRAIL_PCT,
     TRAIL_PRIOR_LOW,
     manage_live,
+    parse_profit_tiers,
     simulate_exit,
 )
+
+
+def test_parse_profit_tiers():
+    assert parse_profit_tiers("8:3,15:9") == [(0.08, 0.03), (0.15, 0.09)]
+    assert parse_profit_tiers("") == []
+
+
+def test_profit_lock_keeps_minimum_gain():
+    # entry 10, stop 9. price runs to +12% (11.2) then fades; +8%->lock+3% tier
+    # pins the stop to 10.30, so the fade exits in profit instead of at the stop.
+    bars = _bars([(10.5, 9.9, 10.4), (11.2, 10.6, 11.0), (10.4, 9.5, 9.6)])
+    cfg = ExitConfig(target_r=20.0, profit_lock_tiers=[(0.08, 0.03)])
+    r = simulate_exit(10.0, 9.0, bars, cfg)
+    assert r.fills[-1].price >= 10.30 - 1e-6   # sold at/above the +3% lock
+    assert r.r_multiple > 0                    # a locked-in WIN, not a loss
+
+
+def test_profit_lock_live_desired_stop():
+    bars = _bars([(11.2, 10.6, 11.0)])       # high-water +12%
+    d = manage_live(10.0, 9.0, bars, ExitConfig(profit_lock_tiers=[(0.08, 0.03), (0.15, 0.09)]))
+    assert round(d.desired_stop, 2) == 10.30  # +3% locked (only +8% tier reached)
 
 
 def _bars(seq):

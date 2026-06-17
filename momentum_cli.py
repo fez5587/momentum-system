@@ -503,9 +503,15 @@ def _render_board(con):
     pt.add_column("symbol"); pt.add_column("qty", justify="right"); pt.add_column("uPnL", justify="right")
     if pos_ev:
         for p in (json.loads(pos_ev[0][0]).get("positions") or []):
-            upl = p.get("unrealized_pl")
-            pt.add_row(str(p.get("symbol")), str(p.get("quantity") or p.get("qty") or ""),
-                       f"{float(upl):+.2f}" if upl not in (None, "") else "-")
+            # the sync stores it as 'unrealized_pnl'; fall back to 'unrealized_pl'
+            upl = p.get("unrealized_pnl")
+            if upl is None:
+                upl = p.get("unrealized_pl")
+            try:
+                upl_str = f"[{'green' if float(upl) >= 0 else 'red'}]{float(upl):+.0f}[/]"
+            except (TypeError, ValueError):
+                upl_str = "-"
+            pt.add_row(str(p.get("symbol")), str(p.get("quantity") or p.get("qty") or ""), upl_str)
 
     risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
                        "ORDER BY timestamp DESC LIMIT 4").fetchall()

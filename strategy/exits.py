@@ -32,6 +32,25 @@ TRAIL_PRIOR_LOW = "prior_low"
 TRAIL_PCT = "pct"
 
 
+def parse_profit_tiers(raw: str) -> list[tuple[float, float]]:
+    """Parse 'gain:lock' percentage pairs, e.g. '8:3,15:9' -> [(.08,.03),(.15,.09)].
+
+    Each pair means: once price has been up >= gain%, never let the trade close
+    for less than lock% of profit (the stop ratchets to entry*(1+lock%)).
+    """
+    tiers: list[tuple[float, float]] = []
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if ":" not in part:
+            continue
+        g, lock = part.split(":", 1)
+        try:
+            tiers.append((float(g) / 100.0, float(lock) / 100.0))
+        except ValueError:
+            continue
+    return sorted(tiers)  # ascending by gain trigger
+
+
 @dataclass
 class ExitConfig:
     target_r: float = 2.0          # final take-profit in R (0 = no fixed target)
@@ -42,6 +61,10 @@ class ExitConfig:
     scale_out_r: float = 0.0       # sell scale_out_pct at +this R (0 = off)
     scale_out_pct: float = 0.5     # fraction sold at scale_out_r
     first_red_exit: bool = False   # exit on first close below the prior bar's low
+    # percentage profit-lock checkpoints: [(gain_frac, lock_frac), ...]. Once the
+    # trade has been up gain%, the stop never sits below entry*(1+lock%) — so a
+    # winner can only give back down to a locked-in minimum gain.
+    profit_lock_tiers: list = field(default_factory=list)
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExitConfig":
@@ -67,6 +90,7 @@ class ExitConfig:
             scale_out_r=f("TRADING_EXIT_SCALE_OUT_R", "0.0"),
             scale_out_pct=f("TRADING_EXIT_SCALE_OUT_PCT", "0.5"),
             first_red_exit=b("TRADING_EXIT_FIRST_RED", "0"),
+            profit_lock_tiers=parse_profit_tiers(v.get("TRADING_EXIT_PROFIT_TIERS", "")),
         )
 
     def describe(self) -> str:
@@ -80,6 +104,9 @@ class ExitConfig:
             parts.append(f"scale {self.scale_out_pct:.0%}@{self.scale_out_r:g}R")
         if self.first_red_exit:
             parts.append("first-red")
+        if self.profit_lock_tiers:
+            parts.append("lock " + "/".join(
+                f"+{g * 100:g}%->{lk * 100:g}%" for g, lk in self.profit_lock_tiers))
         return ", ".join(parts)
 
 
@@ -109,6 +136,13 @@ def _trail_stop(stop: float, entry: float, high_water: float,
             new = max(new, bar_low)
         elif cfg.trail_mode == TRAIL_PCT and cfg.trail_pct > 0:
             new = max(new, high_water * (1.0 - cfg.trail_pct))
+    # percentage profit-lock checkpoints: once the trade has been up gain%, pin
+    # the stop to at least entry*(1+lock%) so a winner keeps a minimum gain.
+    if cfg.profit_lock_tiers and entry > 0:
+        gain = (high_water - entry) / entry
+        for gain_pct, lock_pct in cfg.profit_lock_tiers:
+            if gain >= gain_pct:
+                new = max(new, entry * (1.0 + lock_pct))
     return new
 
 
