@@ -471,12 +471,15 @@ def _render_board(con):
                  ("gap", "right"), ("rvol", "right"), ("trigger", "right"),
                  ("→trigger", "right"), ("stop", "right")):
         tt.add_column(c, justify=j, no_wrap=True)
+    tt.add_column("catalyst", justify="left", overflow="ellipsis", max_width=34)
     for r in trig_rows:
         style, label = _STATE_STYLE.get(r.get("state"), ("white", r.get("state", "?")))
         price = r.get("price"); trig = r.get("trigger"); dist = r.get("dist")
         stop = r.get("stop"); gap = r.get("gap"); rvol = r.get("rvol")
+        cat = r.get("catalyst") or ""
+        sym = r.get("symbol")
         tt.add_row(
-            f"[{style}]{r.get('symbol')}[/{style}]",
+            f"[{style}]{'📰' if cat else ''}{sym}[/{style}]",
             f"[{style}]{label}[/{style}]",
             f"{price:.2f}" if isinstance(price, (int, float)) else "—",
             f"{gap:+.1f}%" if isinstance(gap, (int, float)) else "—",
@@ -485,10 +488,11 @@ def _render_board(con):
             (f"[green]▲{dist * 100:+.2f}%[/green]" if isinstance(dist, (int, float)) and dist >= 0
              else (f"{dist * 100:+.2f}%" if isinstance(dist, (int, float)) else "—")),
             f"{stop:.2f}" if isinstance(stop, (int, float)) else "—",
+            f"[cyan]{cat}[/cyan]" if cat else "[dim]—[/dim]",
         )
     if not trig_rows:
         tt.add_row("[dim]—[/dim]", "[dim]waiting for the open / first bars[/dim]",
-                   "—", "—", "—", "—", "—", "—")
+                   "—", "—", "—", "—", "—", "—", "—")
 
     sig = con.execute("SELECT timestamp, message FROM events WHERE event_type='signal_ready' "
                       "ORDER BY timestamp DESC LIMIT 5").fetchall()

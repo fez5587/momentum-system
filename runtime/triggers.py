@@ -59,6 +59,7 @@ class ArmedTrigger:
     range_pct: float = 0.0        # (high-low)/high — how wide the opening range is
     price: float | None = None    # latest live trade price
     cum_volume: float = 0.0       # session cumulative volume (for liquidity sizing)
+    catalyst: str = ""            # fresh news headline (if any) — why it's hot
     state: str = WAITING
     rank: int = 0
 
@@ -85,6 +86,7 @@ class ArmedTrigger:
             "price": round(self.price, 4) if self.price else None,
             "dist": round(d, 5) if d is not None else None,
             "range_pct": round(self.range_pct, 4),
+            "catalyst": self.catalyst,
         }
 
 
@@ -139,6 +141,7 @@ class ArmedTriggerBook:
             t.stop = c.get("stop")
             t.range_pct = float(c.get("range_pct") or 0.0)
             t.cum_volume = float(c.get("cum_volume") or 0.0)
+            t.catalyst = c.get("catalyst") or ""
             t.rank = rank
             if not c.get("complete") or t.trigger is None:
                 t.state = WAITING

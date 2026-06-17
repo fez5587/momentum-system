@@ -145,6 +145,32 @@ def news_candidates(
     return out[:limit]
 
 
+def recent_news_map(con, lookback_hours: int = 8) -> dict[str, str]:
+    """{ticker: latest_headline} for tickers mentioned in news within the window.
+
+    Used to PRIORITISE armed candidates that have a fresh catalyst — the reason a
+    small-cap gaps and runs. Read-only (the discovery pass does the ingest);
+    no-op ({}) if no news feeds / no rows.
+    """
+    cutoff = datetime.utcnow() - timedelta(hours=lookback_hours)
+    try:
+        rows = con.execute(
+            "SELECT raw_tickers, raw_title FROM raw_news_items "
+            "WHERE raw_tickers <> '' AND fetched_at >= ? ORDER BY fetched_at DESC LIMIT 800",
+            [cutoff],
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("recent_news_map query failed: %s", exc)
+        return {}
+    out: dict[str, str] = {}
+    for raw_tickers, title in rows:
+        for ticker in (raw_tickers or "").split(","):
+            t = ticker.strip().upper()
+            if t and t not in out:  # rows are newest-first -> keep the latest headline
+                out[t] = (title or "").strip()[:90]
+    return out
+
+
 def run_discovery(
     store,
     research_con,

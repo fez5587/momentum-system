@@ -460,10 +460,15 @@ def main(argv: list[str] | None = None) -> int:
         """Rank the most-promising gappers and pre-compute each one's opening-
         range breakout trigger/stop, so step_trigger can fire on a live cross."""
         from research import query as rq
+        from research.ingestion.discovery import recent_news_map
         from research.ingestion.signals import scan_gappers
         from strategy.evaluation.structure import opening_range
 
         session_date = _now_session_date()
+        # fresh catalysts (the discover step ingests the feeds; we just read them)
+        news_map = recent_news_map(
+            rt["research_con"], lookback_hours=int(os.environ.get("NEWS_LOOKBACK_HOURS", "8")))
+        news_boost = float(os.environ.get("NEWS_RANK_BOOST", "2.0"))
         candidates: list[dict] = []
         # rank ALL session symbols by gap*rvol (thresholds applied later, per
         # trigger, so the board still shows the field pre-gap)
@@ -477,6 +482,7 @@ def main(argv: list[str] | None = None) -> int:
             bars = rq.query_minute_bars(rt["research_con"], g.symbol, session_date)
             hi, lo, complete = opening_range(bars, orb_bars=orb_bars_v)
             stop = lo * (1.0 - stop_cushion_v) if lo else None
+            catalyst = news_map.get(g.symbol, "")
             candidates.append({
                 "symbol": g.symbol,
                 "gap_pct": g.gap_pct,
@@ -485,6 +491,9 @@ def main(argv: list[str] | None = None) -> int:
                 "stop": stop,
                 "range_pct": ((hi - lo) / hi) if (hi and lo and hi > 0) else 0.0,
                 "cum_volume": g.cumulative_volume,
+                "catalyst": catalyst,
+                # a fresh catalyst is WHY a small-cap runs — boost it up the rank
+                "_score": g.gap_pct * max(g.relative_volume, 0.1) * (news_boost if catalyst else 1.0),
                 "complete": complete,
             })
         # pre-open / before any gappers form: surface the queued watchlist so the
@@ -494,9 +503,12 @@ def main(argv: list[str] | None = None) -> int:
                 candidates.append({"symbol": s, "gap_pct": 0.0, "rvol": 0.0,
                                    "trigger": None, "stop": None,
                                    "range_pct": 0.0, "complete": False})
+        # catalyst-backed gappers float to the top of the armed set
+        candidates.sort(key=lambda c: c.get("_score", 0.0), reverse=True)
         book.arm(candidates)
         armed = sum(1 for t in book.triggers.values() if t.state == "armed")
-        return f"tracking={len(book.triggers)} armed={armed}"
+        n_news = sum(1 for c in candidates if c.get("catalyst"))
+        return f"tracking={len(book.triggers)} armed={armed}" + (f" news={n_news}" if n_news else "")
 
     # The trigger runs on its OWN thread, not the scheduler, so a slow ingest
     # can never freeze breakout detection. It only touches the (thread-safe)
