@@ -19,6 +19,43 @@ from alpaca_paper.settings import AlpacaPaperSettings
 logger = logging.getLogger(__name__)
 
 
+def _install_dns_cache() -> None:
+    """Cache DNS resolution process-wide (the real fix for the flaky-DNS host).
+
+    The WSL host resolves the Alpaca hostnames slowly/intermittently (~5s on ~1
+    in 5 lookups). urllib opens a fresh connection — and re-resolves — on EVERY
+    request, so across ~20 calls/pass this stretched loop passes to 60-120s.
+    Caching successful lookups for a few minutes pays the slow resolve at most
+    once per host. Opt out with ALPACA_DNS_CACHE=0.
+    """
+    import os
+    import socket
+    import time as _t
+    if os.environ.get("ALPACA_DNS_CACHE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    if getattr(socket.getaddrinfo, "_is_cached", False):
+        return
+    orig = socket.getaddrinfo
+    ttl = float(os.environ.get("ALPACA_DNS_TTL", "300"))
+    cache: dict = {}
+
+    def cached_getaddrinfo(host, *args, **kwargs):
+        key = (host, args, tuple(sorted(kwargs.items())))
+        now = _t.monotonic()
+        hit = cache.get(key)
+        if hit and now - hit[1] < ttl:
+            return hit[0]
+        res = orig(host, *args, **kwargs)
+        cache[key] = (res, now)
+        return res
+
+    cached_getaddrinfo._is_cached = True  # type: ignore[attr-defined]
+    socket.getaddrinfo = cached_getaddrinfo
+
+
+_install_dns_cache()
+
+
 class AlpacaApiError(RuntimeError):
     def __init__(self, status: int, body: str):
         super().__init__(f"Alpaca API error {status}: {body[:300]}")
