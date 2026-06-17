@@ -175,6 +175,8 @@ class TradingExecutionService:
         # WHILE unreadable but RECOVERS on the next good read — a DNS blip must not
         # end the trading day the way a real loss does.
         self._data_halt = False
+        # session closed (end-of-day flatten): no new entries for the rest of the day
+        self._session_closed = False
         # consecutive equity-read failures; after the limit we pause (recoverable)
         self._equity_read_failures = 0
         self._equity_fail_limit = int(
@@ -269,7 +271,7 @@ class TradingExecutionService:
         outage (``_data_halt``) blocks WHILE unreadable but recovers on the next
         good read — a transient DNS/network blip must not end the trading day.
         """
-        if self._halted:
+        if self._halted or self._session_closed:
             return True
         max_loss = abs(float(self.settings.max_daily_loss_pct or 0.0))
         if max_loss <= 0:
@@ -712,6 +714,45 @@ class TradingExecutionService:
             "error": result.error,
             "reason": reason,
         }
+
+    @_locked
+    def close_session(self, reason: str = "eod_flatten") -> dict:
+        """End-of-day: block new entries and flatten the book.
+
+        A day-trading strategy shouldn't carry overnight gap risk, so at the
+        configured time the loop calls this to cancel resting entries, market-
+        close every open position (which also cancels its bracket legs), and
+        halt new entries for the rest of the session.
+        """
+        self._session_closed = True
+        result = self._flatten_all(reason)
+        # belt-and-suspenders: close any broker position the store snapshot missed
+        client = getattr(self.executor, "client", None)
+        if client is not None and hasattr(client, "get_positions"):
+            try:
+                for p in client.get_positions():
+                    sym = p.get("symbol")
+                    if sym and sym not in result["closed_positions"]:
+                        try:
+                            client.close_position(sym)
+                            result["closed_positions"].append(sym)
+                        except Exception as exc:  # noqa: BLE001
+                            result["errors"].append(f"close {sym}: {exc}")
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"positions: {exc}")
+        self.store.emit(
+            RiskRuleTriggeredEvent(
+                timestamp=datetime.now(), mode=self.mode, correlation_id=self.session_id,
+                message=(f"End-of-day flatten ({reason}): closed "
+                         f"{len(result['closed_positions'])} position(s), "
+                         f"cancelled {result['cancelled_entries']} entr"
+                         f"{'y' if result['cancelled_entries'] == 1 else 'ies'}"
+                         + (f"; ERRORS {result['errors']}" if result['errors'] else "")),
+                rule_type="eod_flatten", rule_value=0.0,
+                current_state=result, action_taken="closed_session",
+            )
+        )
+        return result
 
     def _filled_order_ids(self) -> set[str]:
         ids: set[str] = set()

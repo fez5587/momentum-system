@@ -585,6 +585,34 @@ def main(argv: list[str] | None = None) -> int:
         acts = exit_mgr.manage()
         return ", ".join(acts) if acts else None
 
+    # --- end-of-day auto-flatten (a day-trading book shouldn't gap overnight) --
+    eod_enabled = _flag("TRADING_EOD_FLATTEN_ENABLED", "1")
+    try:
+        eod_h, eod_m = (int(x) for x in
+                        os.environ.get("TRADING_EOD_FLATTEN_TIME", "15:55").split(":"))
+    except Exception:  # noqa: BLE001
+        eod_h, eod_m = 15, 55
+    _eod_done = {"v": False}
+
+    def step_eod_flatten():
+        if not eod_enabled or _eod_done["v"] or rt["execution"] is None:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:  # noqa: BLE001
+            return None
+        cur = (now_et.hour, now_et.minute)
+        # only inside [flatten_time, 16:00): after the close a market order just
+        # queues uselessly, so don't fire then (e.g. on a post-close restart)
+        if now_et.weekday() >= 5 or not ((eod_h, eod_m) <= cur < (16, 0)):
+            return None
+        res = rt["execution"].close_session("eod_flatten")
+        _eod_done["v"] = True
+        closed = ", ".join(res["closed_positions"]) or "none"
+        return (f"EOD FLATTEN closed [{closed}]"
+                + (f" errors={res['errors']}" if res["errors"] else ""))
+
     scheduler = Scheduler()
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
@@ -603,13 +631,15 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
     scheduler.add("exits", step_manage_exits, float(os.environ.get("TRADING_EXIT_MANAGE_INTERVAL_SECONDS", "12")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
+    scheduler.add("eod", step_eod_flatten, float(os.environ.get("TRADING_EOD_INTERVAL_SECONDS", "30")),
+                  enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
 
     def run_pass():
         # force every task due, in pipeline order
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits"):
+        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits", "eod"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

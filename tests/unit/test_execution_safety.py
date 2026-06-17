@@ -58,6 +58,28 @@ def test_partial_fill_is_recorded():
     assert len(store.query_events(event_type="order_filled", limit=None)) == 1
 
 
+def test_close_session_flattens_and_blocks_new_entries():
+    store = EventStore(":memory:")
+    closed = []
+
+    class _C(_FakeClient):
+        def get_positions(self):
+            return [{"symbol": "AAA", "qty": "100"}, {"symbol": "BBB", "qty": "50"}]
+
+        def close_position(self, symbol, qty=None, percentage=None):
+            closed.append(symbol)
+            return {"id": "c", "status": "accepted"}
+
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=_C()),
+        settings=ExecutionSettings(max_daily_loss_pct=0.03), session_id="eod",
+    )
+    res = svc.close_session("eod_flatten")
+    assert set(res["closed_positions"]) == {"AAA", "BBB"}  # flattened the book
+    assert svc._session_closed is True
+    assert svc._daily_loss_breach() is True                # no new entries after
+
+
 def test_breaker_pauses_then_recovers_when_equity_unreadable():
     """Equity-read outage PAUSES new entries (recoverable), not a permanent halt:
     a transient DNS/network blip must not end the trading day."""
