@@ -484,6 +484,7 @@ def main(argv: list[str] | None = None) -> int:
                 "trigger": hi,
                 "stop": stop,
                 "range_pct": ((hi - lo) / hi) if (hi and lo and hi > 0) else 0.0,
+                "cum_volume": g.cumulative_volume,
                 "complete": complete,
             })
         # pre-open / before any gappers form: surface the queued watchlist so the
@@ -536,7 +537,8 @@ def main(argv: list[str] | None = None) -> int:
                 pass
             for t in book.fires():
                 res = rt["execution"].submit_breakout_now(
-                    t.symbol, t.trigger, t.stop, last_price=t.price
+                    t.symbol, t.trigger, t.stop, last_price=t.price,
+                    cum_volume=t.cum_volume,
                 )
                 if res.get("ok"):
                     book.mark_fired(t.symbol)

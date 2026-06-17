@@ -27,25 +27,34 @@ def calculate_position_size(
     stop_loss_price: float,
     equity: float | None = None,
     config: PositionSizingConfig = PositionSizingConfig(),
+    max_position_value: float | None = None,
+    max_shares: int | None = None,
 ) -> PositionSizeResult:
-    """Calculate position size based on risk per trade."""
+    """Shares to risk ``risk_per_trade_pct`` of equity, capped by buying power
+    and liquidity.
+
+    - risk-based: shares = (equity * risk%) / (entry - stop)
+    - ``max_position_value``: cap the position's DOLLAR value (buying-power aware
+      — essential for a small account so one trade can't exceed available cash)
+    - ``max_shares``: cap shares for LIQUIDITY (e.g. a % of the symbol's recent
+      volume) so at size you don't move the market against yourself
+    """
     account_equity = equity or config.default_equity
     risk_amount = account_equity * config.risk_per_trade_pct
-
     risk_per_share = abs(entry_price - stop_loss_price)
 
-    if risk_per_share <= 0:
-        return PositionSizeResult(
-            position_size=0,
-            dollar_amount=0.0,
-            risk_amount=risk_amount,
-        )
+    if risk_per_share <= 0 or entry_price <= 0:
+        return PositionSizeResult(position_size=0, dollar_amount=0.0, risk_amount=risk_amount)
 
     position_size = int(risk_amount / risk_per_share)
-    dollar_amount = position_size * entry_price
+    if max_position_value is not None and max_position_value > 0:
+        position_size = min(position_size, int(max_position_value / entry_price))
+    if max_shares is not None and max_shares >= 0:
+        position_size = min(position_size, int(max_shares))
+    position_size = max(0, position_size)
 
     return PositionSizeResult(
         position_size=position_size,
-        dollar_amount=dollar_amount,
+        dollar_amount=position_size * entry_price,
         risk_amount=risk_amount,
     )

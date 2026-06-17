@@ -58,6 +58,7 @@ class ArmedTrigger:
     stop: float | None = None     # opening-range low, cushioned (protective stop)
     range_pct: float = 0.0        # (high-low)/high — how wide the opening range is
     price: float | None = None    # latest live trade price
+    cum_volume: float = 0.0       # session cumulative volume (for liquidity sizing)
     state: str = WAITING
     rank: int = 0
 
@@ -137,6 +138,7 @@ class ArmedTriggerBook:
             t.trigger = c.get("trigger")
             t.stop = c.get("stop")
             t.range_pct = float(c.get("range_pct") or 0.0)
+            t.cum_volume = float(c.get("cum_volume") or 0.0)
             t.rank = rank
             if not c.get("complete") or t.trigger is None:
                 t.state = WAITING

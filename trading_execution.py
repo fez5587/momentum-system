@@ -96,6 +96,13 @@ class ExecutionSettings:
     # cap the marketable limit so a breakout FILLS on a runner instead of
     # resting forever at the trigger, while still bounding slippage.
     trigger_slippage_pct: float = 0.004
+    # --- account-aware sizing (matters most on a small REAL account) -------
+    # one position's dollar value <= this fraction of equity, so a single trade
+    # can't exceed buying power (critical at $300: 3 positions must fit, so ~1/3).
+    max_position_pct: float = 0.33
+    # liquidity cap: shares <= this fraction of the symbol's day volume so at
+    # SIZE you don't move the market. 0 = off (irrelevant at small size).
+    liquidity_max_volume_pct: float = 0.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -129,6 +136,10 @@ class ExecutionSettings:
             ),
             trigger_slippage_pct=float(
                 values.get("TRADING_TRIGGER_SLIP_PCT", "0.004")
+            ),
+            max_position_pct=float(values.get("TRADING_MAX_POSITION_PCT", "0.33")),
+            liquidity_max_volume_pct=float(
+                values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
         )
 
@@ -206,6 +217,24 @@ class TradingExecutionService:
             for p in snapshots[-1].get("positions") or []
             if p.get("symbol")
         }
+
+    def _current_equity(self) -> float:
+        """Size off the REAL broker equity, not the $100k default.
+
+        On a $300 live account the default would size $1,000 positions and get
+        rejected; this reads actual equity (the get_account read is cached, so
+        it's cheap) and caches it on the service for fallback.
+        """
+        client = getattr(self.executor, "client", None)
+        if client is not None and hasattr(client, "get_account"):
+            try:
+                eq = float((client.get_account() or {}).get("equity") or 0.0)
+                if eq > 0:
+                    self.equity = eq
+                    return eq
+            except Exception:  # noqa: BLE001
+                pass
+        return self.equity
 
     def _broker_held_symbols(self) -> set[str] | None:
         """Symbols the broker reports as OPEN POSITIONS right now (truth).
@@ -413,14 +442,16 @@ class TradingExecutionService:
             if not entry or not stop or stop >= entry:
                 continue
 
+            eq = self._current_equity()
             sizing = calculate_position_size(
                 float(entry),
                 float(stop),
-                equity=self.equity,
+                equity=eq,
                 config=PositionSizingConfig(
                     risk_per_trade_pct=self.settings.risk_per_trade_pct,
                     default_equity=self.settings.default_equity,
                 ),
+                max_position_value=eq * self.settings.max_position_pct,
             )
             if sizing.position_size <= 0:
                 continue
@@ -519,6 +550,7 @@ class TradingExecutionService:
         stop: float,
         last_price: float | None = None,
         reason: str = "orb_live_break",
+        cum_volume: float = 0.0,
     ) -> dict:
         """Fire a breakout entry immediately on a LIVE price cross.
 
@@ -550,14 +582,19 @@ class TradingExecutionService:
         if stop_f >= entry_ref or trigger_f <= 0:
             return {"ok": False, "skipped": "bad_geometry"}
 
+        eq = self._current_equity()
+        liq = self.settings.liquidity_max_volume_pct
+        max_shares = int(liq * cum_volume) if (liq > 0 and cum_volume > 0) else None
         sizing = calculate_position_size(
             entry_ref,
             stop_f,
-            equity=self.equity,
+            equity=eq,
             config=PositionSizingConfig(
                 risk_per_trade_pct=self.settings.risk_per_trade_pct,
                 default_equity=self.settings.default_equity,
             ),
+            max_position_value=eq * self.settings.max_position_pct,
+            max_shares=max_shares,
         )
         if sizing.position_size <= 0:
             return {"ok": False, "skipped": "zero_size"}
