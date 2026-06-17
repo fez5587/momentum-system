@@ -125,8 +125,34 @@ class AlpacaPaperClient:
     def cancel_order(self, order_id: str) -> None:
         self._trading("DELETE", f"/orders/{order_id}")
 
-    def close_position(self, symbol: str) -> dict:
-        return self._trading("DELETE", f"/positions/{symbol}")
+    def replace_order(
+        self, order_id: str, stop_price: float | None = None,
+        limit_price: float | None = None, qty: int | None = None,
+    ) -> dict:
+        """PATCH an open order — e.g. move a bracket STOP leg up to breakeven or
+        trail it — WITHOUT cancelling it. Cancelling a bracket leg tears down the
+        OCO and leaves the position naked (the bug we already fixed once); a
+        replace keeps the protection intact and just changes the price."""
+        body: dict = {}
+        if stop_price is not None:
+            body["stop_price"] = str(round(stop_price, 2))
+        if limit_price is not None:
+            body["limit_price"] = str(round(limit_price, 2))
+        if qty is not None:
+            body["qty"] = str(int(qty))
+        if not body:
+            return {}
+        return self._trading("PATCH", f"/orders/{order_id}", body=body)
+
+    def close_position(self, symbol: str, qty: int | None = None,
+                       percentage: float | None = None) -> dict:
+        params = {}
+        if qty is not None:
+            params["qty"] = str(int(qty))
+        elif percentage is not None:
+            params["percentage"] = str(round(percentage, 4))
+        return self._trading("DELETE", f"/positions/{symbol}",
+                             params=params or None)
 
     # -- market data API ----------------------------------------------------
 

@@ -50,8 +50,10 @@ from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.multi_schema import open_research_db
+from runtime.exit_manager import LiveExitManager
 from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
+from strategy.exits import ExitConfig
 from storage.event_schema import EventMode, ModuleTickEvent
 from storage.event_store import EventStore
 from trading_execution import ExecutionSettings, TradingExecutionService
@@ -467,7 +469,8 @@ def main(argv: list[str] | None = None) -> int:
         gappers = scan_gappers(
             rt["research_con"], session_date,
             min_gap_pct=0.0, min_relative_volume=0.0,
-            price_min=price_min_v, price_max=price_max_v, limit=12,
+            price_min=price_min_v, price_max=price_max_v,
+            limit=max(12, book.max_armed + 6),
         )
         for g in gappers:
             bars = rq.query_minute_bars(rt["research_con"], g.symbol, session_date)
@@ -559,6 +562,29 @@ def main(argv: list[str] | None = None) -> int:
             except Exception as exc:  # noqa: BLE001
                 print(f"[trigger] error: {exc}", flush=True)
 
+    # --- live exit management (breakeven / trail / scale / first-red) -------
+    exit_cfg = ExitConfig.from_env()
+
+    def _rth_bars(sym):
+        from research import query as rq
+        b = rq.query_minute_bars(rt["research_con"], sym, _now_session_date())
+        if b is not None and len(b) and "is_regular_hours" in b.columns:
+            b = b[b["is_regular_hours"] == True].reset_index(drop=True)  # noqa: E712
+        return b
+
+    exit_mgr = (
+        LiveExitManager(client, rt["store"], _rth_bars, cfg=exit_cfg,
+                        session_id=rt["session_id"])
+        if client else None
+    )
+    print(f"[boot] exit management: {exit_cfg.describe()}")
+
+    def step_manage_exits():
+        if exit_mgr is None:
+            return None
+        acts = exit_mgr.manage()
+        return ", ".join(acts) if acts else None
+
     scheduler = Scheduler()
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
@@ -575,13 +601,15 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
     scheduler.add("guard", step_guard, float(os.environ.get("TRADING_ENTRY_GUARD_INTERVAL_SECONDS", "5")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
+    scheduler.add("exits", step_manage_exits, float(os.environ.get("TRADING_EXIT_MANAGE_INTERVAL_SECONDS", "12")),
+                  enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
 
     def run_pass():
         # force every task due, in pipeline order
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "arm", "sync", "execute"):
+        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

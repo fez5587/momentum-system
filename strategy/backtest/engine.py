@@ -13,6 +13,7 @@ import pandas as pd
 
 from config import BacktestConfig, Config
 from strategy.evaluation.setup_evaluator import evaluate_setup
+from strategy.exits import ExitConfig, simulate_exit
 from strategy.risk.position_sizing import PositionSizingConfig, calculate_position_size
 
 
@@ -31,6 +32,7 @@ class Trade:
     realized_pnl: float | None = None
     r_multiple: float | None = None
     setup_type: str | None = None
+    entry_index: int | None = None   # bar position of the entry-fill bar
 
 
 @dataclass
@@ -68,6 +70,7 @@ class BacktestEngine:
         ready_score_pct: float = 60.0,
         criteria=None,
         min_bars: int = 10,
+        exit_config: ExitConfig | None = None,
     ):
         self.config = config or Config()
         self.bt: BacktestConfig = self.config.backtest
@@ -78,6 +81,8 @@ class BacktestEngine:
         self.ready_score_pct = ready_score_pct
         self.criteria = criteria
         self.min_bars = min_bars
+        # default reproduces the original static bracket (stop / +target_r / EOD)
+        self.exit_config = exit_config or ExitConfig(target_r=target_r)
 
     def _entry_costs(self, price: float, quantity: int) -> tuple[float, float]:
         slip = price * self.bt.slippage.base_spread_pct
@@ -95,114 +100,111 @@ class BacktestEngine:
     ) -> BacktestResult:
         result = BacktestResult(symbol=symbol)
         bars = bars.reset_index(drop=True)
-        open_trade: Trade | None = None
+        cfg = self.exit_config
+        n = len(bars)
 
         i = self.warmup_bars
-        while i < len(bars) - 1:
-            bar = bars.iloc[i]
-
-            if open_trade is not None:
-                low, high = float(bar["low"]), float(bar["high"])
-                exit_price = None
-                reason = None
-                if low <= open_trade.stop_price:
-                    exit_price, reason = open_trade.stop_price, "stop_loss"
-                elif high >= open_trade.target_price:
-                    exit_price, reason = open_trade.target_price, "target"
-                elif i == len(bars) - 2:
-                    exit_price, reason = float(bar["close"]), "session_end"
-                if exit_price is not None:
-                    self._close(open_trade, bar, exit_price, reason, result)
-                    open_trade = None
+        while i < n - 1:
+            if i % self.eval_every != 0:
                 i += 1
                 continue
 
-            if i % self.eval_every == 0:
-                window = bars.iloc[: i + 1]
-                # Evaluate as of the current bar's timestamp, not wall-clock
-                # now() — otherwise every setup is judged against the real
-                # clock and marked "late" past the entry cutoff (so a Sunday
-                # backtest would show zero trades). Bars are stored UTC-naive;
-                # the cutoff reasons in US/Eastern, so convert.
-                eval_time = None
-                try:
-                    from datetime import timezone as _tz
-                    from zoneinfo import ZoneInfo as _ZI
+            window = bars.iloc[: i + 1]
+            # Evaluate as of the current bar's timestamp, not wall-clock now() —
+            # otherwise every setup is judged against the real clock and marked
+            # "late" past the entry cutoff (so a Sunday backtest would show zero
+            # trades). Bars are stored UTC-naive; the cutoff reasons in
+            # US/Eastern, so convert.
+            eval_time = None
+            try:
+                from datetime import timezone as _tz
+                from zoneinfo import ZoneInfo as _ZI
 
-                    last_ts = pd.Timestamp(window["timestamp"].iloc[-1]).to_pydatetime()
-                    if last_ts.tzinfo is None:
-                        last_ts = last_ts.replace(tzinfo=_tz.utc)
-                    eval_time = last_ts.astimezone(_ZI("America/New_York")).replace(
-                        tzinfo=None
-                    )
-                except Exception:  # noqa: BLE001 - fall back to now()
-                    eval_time = None
-
-                evaluation = evaluate_setup(
-                    window,
-                    previous_close=previous_close,
-                    avg_daily_volume=avg_daily_volume,
-                    evaluation_time=eval_time,
-                    ready_score_pct=self.ready_score_pct,
-                    criteria=self.criteria,
-                    min_bars=self.min_bars,
+                last_ts = pd.Timestamp(window["timestamp"].iloc[-1]).to_pydatetime()
+                if last_ts.tzinfo is None:
+                    last_ts = last_ts.replace(tzinfo=_tz.utc)
+                eval_time = last_ts.astimezone(_ZI("America/New_York")).replace(
+                    tzinfo=None
                 )
-                result.evaluations += 1
-                if evaluation.status == "ready" and evaluation.setups:
-                    result.signals += 1
-                    setup = evaluation.setups[0]
-                    next_bar = bars.iloc[i + 1]
-                    raw_entry = (
-                        float(next_bar["open"])
-                        if self.bt.entry_mode == "next_bar"
-                        else float(bar["close"])
-                    )
-                    stop = float(setup["stop_loss_price"])
-                    sizing = calculate_position_size(
-                        raw_entry, stop, equity=self.equity,
-                        config=PositionSizingConfig(),
-                    )
-                    if sizing.position_size > 0:
-                        slip, commission = self._entry_costs(
-                            raw_entry, sizing.position_size
-                        )
-                        entry = raw_entry + slip
-                        risk = entry - stop
-                        open_trade = Trade(
-                            trade_id=str(uuid.uuid4()),
-                            symbol=symbol,
-                            entry_time=str(next_bar.get("timestamp", i + 1)),
-                            entry_price=round(entry, 4),
-                            stop_price=round(stop, 4),
-                            target_price=round(entry + self.target_r * risk, 4),
-                            quantity=sizing.position_size,
-                            setup_type=setup.get("setup_type"),
-                        )
-                        open_trade.realized_pnl = -commission
-                        i += 1  # consumed next bar for entry
-            i += 1
+            except Exception:  # noqa: BLE001 - fall back to now()
+                eval_time = None
 
-        if open_trade is not None:
-            last = bars.iloc[-1]
-            self._close(open_trade, last, float(last["close"]), "session_end", result)
+            evaluation = evaluate_setup(
+                window,
+                previous_close=previous_close,
+                avg_daily_volume=avg_daily_volume,
+                evaluation_time=eval_time,
+                ready_score_pct=self.ready_score_pct,
+                criteria=self.criteria,
+                min_bars=self.min_bars,
+            )
+            result.evaluations += 1
+            if not (evaluation.status == "ready" and evaluation.setups):
+                i += 1
+                continue
+
+            result.signals += 1
+            setup = evaluation.setups[0]
+            entry_idx = i + 1
+            next_bar = bars.iloc[entry_idx]
+            raw_entry = (
+                float(next_bar["open"])
+                if self.bt.entry_mode == "next_bar"
+                else float(bars.iloc[i]["close"])
+            )
+            stop = float(setup["stop_loss_price"])
+            sizing = calculate_position_size(
+                raw_entry, stop, equity=self.equity, config=PositionSizingConfig(),
+            )
+            if sizing.position_size <= 0:
+                i += 1
+                continue
+            slip, entry_commission = self._entry_costs(raw_entry, sizing.position_size)
+            entry = raw_entry + slip
+            risk = entry - stop
+            if risk <= 0:
+                i += 1
+                continue
+
+            # Simulate the FULL managed exit forward with the shared rules (the
+            # same logic the live exit manager applies), then resume scanning
+            # after the exit bar so trades never overlap.
+            bars_after = bars.iloc[entry_idx + 1:]
+            res = simulate_exit(entry, stop, bars_after, cfg)
+            qty = sizing.position_size
+            gross = res.r_multiple * risk * qty
+            total_commission = entry_commission
+            exit_slip = 0.0
+            for fll in res.fills:
+                fqty = max(1, int(round(fll.frac * qty)))
+                total_commission += max(
+                    self.bt.commission.minimum, fqty * self.bt.commission.per_share
+                )
+                exit_slip += fll.price * self.bt.slippage.base_spread_pct * fqty
+            realized = gross - total_commission - exit_slip
+
+            exit_pos = min(entry_idx + 1 + res.exit_index, n - 1) if len(bars_after) else entry_idx
+            trade = Trade(
+                trade_id=str(uuid.uuid4()),
+                symbol=symbol,
+                entry_time=str(next_bar.get("timestamp", entry_idx)),
+                entry_price=round(entry, 4),
+                stop_price=round(stop, 4),
+                target_price=round(entry + cfg.target_r * risk, 4) if cfg.target_r else round(entry, 4),
+                quantity=qty,
+                exit_time=str(bars.iloc[exit_pos].get("timestamp", exit_pos)),
+                exit_price=round(res.fills[-1].price, 4) if res.fills else None,
+                exit_reason=res.reason,
+                realized_pnl=round(realized, 2),
+                r_multiple=round(res.r_multiple, 3),
+                setup_type=setup.get("setup_type"),
+                entry_index=entry_idx,
+            )
+            result.trades.append(trade)
+            result.total_pnl += trade.realized_pnl
+            i = exit_pos + 1  # resume after the exit
 
         if result.trades:
             wins = sum(1 for t in result.trades if (t.realized_pnl or 0) > 0)
             result.win_rate = wins / len(result.trades)
         return result
-
-    def _close(
-        self, trade: Trade, bar, exit_price: float, reason: str | None,
-        result: BacktestResult,
-    ) -> None:
-        slip, commission = self._entry_costs(exit_price, trade.quantity)
-        fill = exit_price - slip
-        gross = (fill - trade.entry_price) * trade.quantity
-        trade.exit_time = str(bar.get("timestamp", "end"))
-        trade.exit_price = round(fill, 4)
-        trade.exit_reason = reason
-        trade.realized_pnl = round((trade.realized_pnl or 0.0) + gross - commission, 2)
-        risk = trade.entry_price - trade.stop_price
-        trade.r_multiple = round((fill - trade.entry_price) / risk, 3) if risk > 0 else 0.0
-        result.trades.append(trade)
-        result.total_pnl += trade.realized_pnl
