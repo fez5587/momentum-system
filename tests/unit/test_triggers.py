@@ -108,21 +108,26 @@ def test_mark_filled_promotes_held():
 # -- live fire (submit_breakout_now) --------------------------------------
 
 class _FakeClient:
-    def __init__(self, resp=None, account=None):
+    def __init__(self, resp=None, account=None, positions=None):
         self.resp = resp or {"id": "o1", "status": "new", "filled_qty": "0"}
         self.account = account or {"equity": "100000", "last_equity": "100000"}
+        self._positions = positions or []
         self.last = None
         self.closed = []
+        self.canceled = []
 
     def submit_order(self, **kw):
         self.last = kw
         return self.resp
 
     def cancel_order(self, order_id):
-        pass
+        self.canceled.append(order_id)
 
     def get_account(self):
         return self.account
+
+    def get_positions(self):
+        return self._positions
 
     def close_position(self, symbol):
         self.closed.append(symbol)
@@ -170,3 +175,24 @@ def test_breakout_now_rejects_bad_geometry():
     store, svc = _svc(_FakeClient())
     res = svc.submit_breakout_now("AAA", 10.0, 10.5, last_price=10.0)  # stop > entry
     assert res["ok"] is False and res["skipped"] == "bad_geometry"
+
+
+def test_guard_never_cancels_a_filled_position():
+    """The naked-stop fix: a stale-looking armed entry whose position is actually
+    OPEN at the broker must NOT be cancelled (that would strip its stop/TP)."""
+    from datetime import datetime, timedelta
+    store = EventStore(":memory:")
+    client = _FakeClient(positions=[{"symbol": "AAA", "qty": "100"}])  # AAA filled
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=client),
+        settings=ExecutionSettings(entry_timeout_bars=1, entry_invalidate_pct=0.0,
+                                   max_daily_loss_pct=0.5),
+        session_id="t", price_provider=lambda s: 0.5,  # below trigger -> would invalidate
+    )
+    # an entry that LOOKS stale (armed 5 min ago, price below trigger)
+    svc._armed["o1"] = {"symbol": "AAA", "entry_price": 1.0, "broker_order_id": "b1",
+                        "armed_at": datetime.now() - timedelta(minutes=5), "checks": 0}
+    backed = svc.expire_stale_entries()
+    assert backed == []              # not backed out
+    assert client.canceled == []     # stop/TP legs NOT stripped
+    assert "o1" not in svc._armed    # but we stop tracking the filled entry

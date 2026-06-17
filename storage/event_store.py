@@ -12,6 +12,7 @@ from .db import get_connection
 from uuid import uuid4
 import json
 import logging
+import threading
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,9 @@ class EventStore:
     def __init__(self, db_path: str = "./data/momentum_events.duckdb"):
         """Initialize event store with DuckDB connection."""
         self.con = get_connection(db_path)
+        # serialize DB access: the fast trigger thread and the main loop share
+        # this one psycopg2 connection, which is not safe for concurrent use.
+        self._lock = threading.RLock()
         self._ensure_schema()
 
     def _ensure_schema(self):
@@ -64,26 +68,27 @@ class EventStore:
         event_id = str(uuid4())
         payload_json = json.dumps(event.model_dump(mode="json", exclude_unset=True))
 
-        cursor = self.con.cursor()
-        cursor.execute(
-            """
-            INSERT INTO events
-                (id, timestamp, mode, event_type, correlation_id, message, payload_json, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)
-            """,
-            [
-                event_id,
-                event.timestamp,
-                event.mode.value,
-                event.event_type.value
-                if isinstance(event.event_type, EventType)
-                else str(event.event_type),
-                event.correlation_id,
-                event.message,
-                payload_json,
-            ],
-        )
-        self.con.commit()
+        with self._lock:
+            cursor = self.con.cursor()
+            cursor.execute(
+                """
+                INSERT INTO events
+                    (id, timestamp, mode, event_type, correlation_id, message, payload_json, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, current_timestamp)
+                """,
+                [
+                    event_id,
+                    event.timestamp,
+                    event.mode.value,
+                    event.event_type.value
+                    if isinstance(event.event_type, EventType)
+                    else str(event.event_type),
+                    event.correlation_id,
+                    event.message,
+                    payload_json,
+                ],
+            )
+            self.con.commit()
 
         logger.debug(
             f"Emitted event {event_id}: {event.event_type.value} - {event.message}"
@@ -152,9 +157,10 @@ class EventStore:
             {limit_clause}
         """
 
-        cursor = self.con.cursor()
-        cursor.execute(query, params)
-        rows = cursor.fetchall()
+        with self._lock:
+            cursor = self.con.cursor()
+            cursor.execute(query, params)
+            rows = cursor.fetchall()
 
         results = []
         for row in rows:
@@ -175,9 +181,10 @@ class EventStore:
 
     def count_events(self) -> int:
         """Total number of events. Cheap change-detection signal for SSE."""
-        cursor = self.con.cursor()
-        cursor.execute("SELECT COUNT(*) FROM events")
-        row = cursor.fetchone()
+        with self._lock:
+            cursor = self.con.cursor()
+            cursor.execute("SELECT COUNT(*) FROM events")
+            row = cursor.fetchone()
         return int(row[0]) if row else 0
 
     def get_symbol_timeline(self, symbol: str) -> list[dict]:

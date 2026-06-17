@@ -28,6 +28,7 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -340,11 +341,33 @@ def main(argv: list[str] | None = None) -> int:
               + (f" (errors: {daily.errors})" if daily.errors else ""))
 
     lookback = int(os.environ.get("LIVE_BARS_LOOKBACK_MINUTES", "240"))
+    refresh_lb = int(os.environ.get("LIVE_BARS_REFRESH_MINUTES", "20"))
+    _ingest_first = {"v": True}
+
+    def _first_pass_lookback() -> int:
+        # The first ingest must cover the whole session-so-far so the
+        # opening-range bars land in the DB (even on a mid-session restart);
+        # after that we only pull the last few minutes — closed bars never
+        # change, and re-fetching a 4-hour window for 80 symbols every minute
+        # was the ~46s step that froze the loop.
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+            open_et = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            since_open = max(0.0, (now_et - open_et).total_seconds() / 60.0)
+        except Exception:  # noqa: BLE001
+            since_open = 0.0
+        return int(max(lookback, since_open + 15))
 
     def step_ingest():
         if not client:
             return "skipped (no keys)"
-        res = ingest_live_minute_bars(rt["research_con"], client, symbols, lookback_minutes=lookback)
+        if _ingest_first["v"]:
+            lb = _first_pass_lookback()
+            _ingest_first["v"] = False
+        else:
+            lb = refresh_lb
+        res = ingest_live_minute_bars(rt["research_con"], client, symbols, lookback_minutes=lb)
         rt["store"].emit(
             ModuleTickEvent(
                 timestamp=datetime.now(),
@@ -360,7 +383,7 @@ def main(argv: list[str] | None = None) -> int:
                 errors=[{"error": e} for e in res.errors],
             )
         )
-        return f"{res.minute_rows} minute rows" + (f", errors={res.errors}" if res.errors else "")
+        return f"{res.minute_rows} rows (lookback {lb}m)" + (f", errors={res.errors}" if res.errors else "")
 
     def step_watch():
         res = rt["watcher"].tick(_now_session_date())
@@ -425,7 +448,6 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- fast armed-trigger path -------------------------------------------
     book = rt["book"]
-    latest_price = rt["latest_price"]
     price_min_v = float(os.environ.get("WATCHER_PRICE_MIN", "1"))
     price_max_v = float(os.environ.get("WATCHER_PRICE_MAX", "20"))
     orb_bars_v = int(os.environ.get("ORB_BARS", "5"))
@@ -471,20 +493,43 @@ def main(argv: list[str] | None = None) -> int:
         armed = sum(1 for t in book.triggers.values() if t.state == "armed")
         return f"tracking={len(book.triggers)} armed={armed}"
 
-    def step_trigger():
-        """Fast tick: refresh live prices for the armed names, fire any that have
-        crossed their trigger, and publish the snapshot the live board renders."""
-        if not book.triggers:
-            return None
-        for sym in list(book.triggers):
-            book.update_price(sym, latest_price(sym) if client else None)
+    # The trigger runs on its OWN thread, not the scheduler, so a slow ingest
+    # can never freeze breakout detection. It only touches the (thread-safe)
+    # book, execution service, and event store — never research_con.
+    trigger_interval = float(os.environ.get("TRIGGER_INTERVAL_SECONDS", "4"))
+    stop_event = threading.Event()
+
+    def _batch_prices(syms):
+        """One batched last-trade call for all armed names (8 syms ≈ 1 sym cost)."""
+        if client is None or not syms:
+            return {}
+        try:
+            trades = client.get_latest_trades(list(syms))
+        except Exception:  # noqa: BLE001
+            return {}
+        out = {}
+        for s in syms:
+            tr = trades.get(s) or trades.get(s.upper())
+            if tr and tr.get("p") is not None:
+                try:
+                    out[s] = float(tr["p"])
+                except (TypeError, ValueError):
+                    pass
+        return out
+
+    def _trigger_pass():
+        snap = book.snapshot()
+        syms = [r["symbol"] for r in snap]
+        if not syms:
+            return
+        for s, px in _batch_prices(syms).items():
+            book.update_price(s, px)
+        fired: list[str] = []
         if rt["execution"] is not None:
             try:
                 book.mark_filled(rt["execution"]._held_symbols())
             except Exception:  # noqa: BLE001
                 pass
-        fired: list[str] = []
-        if rt["execution"] is not None:
             for t in book.fires():
                 res = rt["execution"].submit_breakout_now(
                     t.symbol, t.trigger, t.stop, last_price=t.price
@@ -492,23 +537,27 @@ def main(argv: list[str] | None = None) -> int:
                 if res.get("ok"):
                     book.mark_fired(t.symbol)
                     fired.append(t.symbol)
-        armed_n = sum(1 for t in book.triggers.values() if t.state == "armed")
+        snap = book.snapshot()
+        armed_n = sum(1 for r in snap if r["state"] == "armed")
         rt["store"].emit(
             ModuleTickEvent(
-                timestamp=datetime.now(),
-                mode=EventMode.PAPER,
+                timestamp=datetime.now(), mode=EventMode.PAPER,
                 correlation_id=rt["session_id"],
                 message=f"triggers armed={armed_n} fired={len(fired)}",
-                module="triggers",
-                stage="snapshot",
-                duration_ms=0.0,
-                input_count=len(book.triggers),
-                output_count=len(fired),
-                metrics={"triggers": book.snapshot(), "armed": armed_n},
-                errors=[],
+                module="triggers", stage="snapshot", duration_ms=0.0,
+                input_count=len(syms), output_count=len(fired),
+                metrics={"triggers": snap, "armed": armed_n}, errors=[],
             )
         )
-        return ("FIRED " + ", ".join(fired)) if fired else None
+        if fired:
+            print(f"[{datetime.now():%H:%M:%S}] TRIGGER FIRED {', '.join(fired)}", flush=True)
+
+    def trigger_loop():
+        while not stop_event.wait(trigger_interval):
+            try:
+                _trigger_pass()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[trigger] error: {exc}", flush=True)
 
     scheduler = Scheduler()
     scheduler.add("discover", step_discover,
@@ -519,8 +568,6 @@ def main(argv: list[str] | None = None) -> int:
     scheduler.add("watch", step_watch, float(os.environ.get("WATCHER_INTERVAL_SECONDS", "30")),
                   enabled=_flag("WATCHER_ENABLED", "1"))
     scheduler.add("arm", step_arm, float(os.environ.get("TRIGGER_ARM_INTERVAL_SECONDS", "20")),
-                  enabled=_flag("TRIGGER_ENABLED", "1"))
-    scheduler.add("trigger", step_trigger, float(os.environ.get("TRIGGER_INTERVAL_SECONDS", "4")),
                   enabled=_flag("TRIGGER_ENABLED", "1"))
     scheduler.add("sync", step_sync, float(os.environ.get("ALPACA_PAPER_SYNC_INTERVAL_SECONDS", "60")),
                   enabled=_flag("ALPACA_PAPER_SYNC_ENABLED", "1"))
@@ -534,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "arm", "trigger", "sync", "execute"):
+        for name in ("discover", "ingest", "watch", "arm", "sync", "execute"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))
@@ -561,6 +608,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     print("[boot] entering live loop (Ctrl-C to stop)")
+    # start the fast trigger on its own thread so slow ingest can't freeze it
+    trigger_thread = None
+    if _flag("TRIGGER_ENABLED", "1") and client is not None:
+        trigger_thread = threading.Thread(target=trigger_loop, name="trigger", daemon=True)
+        trigger_thread.start()
+        print(f"[boot] fast trigger thread started (every {trigger_interval:.0f}s)")
     try:
         # one immediate full pass, then interval-driven
         run_pass()
@@ -577,6 +630,9 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("\n[stop] shutting down")
     finally:
+        stop_event.set()
+        if trigger_thread is not None:
+            trigger_thread.join(timeout=5)
         if server:
             server.shutdown()
         rt["store"].close()

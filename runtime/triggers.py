@@ -23,6 +23,8 @@ State machine per symbol:
 
 from __future__ import annotations
 
+import functools
+import threading
 from dataclasses import dataclass, field
 
 WAITING = "waiting"
@@ -34,6 +36,17 @@ FILLED = "filled"
 # states that represent a committed trade — pinned across re-ranking so a name
 # that fired doesn't get bumped off the board when the gapper ranking rotates
 _COMMITTED = (FIRED, FILLED)
+
+
+def _synced(method):
+    """Serialize a book method behind self._lock so the main loop's arm() and
+    the trigger thread's poll/fire never iterate ``triggers`` while it's being
+    rebuilt."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -83,6 +96,7 @@ class ArmedTriggerBook:
     rvol_min: float = 2.0       # min relative volume to be eligible to fire
     min_range_pct: float = 0.004  # opening range must be at least this wide
     triggers: dict[str, ArmedTrigger] = field(default_factory=dict)
+    _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
 
     def _eligible(self, t: ArmedTrigger) -> bool:
         return (
@@ -94,6 +108,7 @@ class ArmedTriggerBook:
             and t.range_pct >= self.min_range_pct
         )
 
+    @_synced
     def arm(self, candidates: list[dict]) -> None:
         """Refresh the book from a ranked candidate list.
 
@@ -131,11 +146,13 @@ class ArmedTriggerBook:
             new[sym] = t
         self.triggers = new
 
+    @_synced
     def update_price(self, symbol: str, price: float | None) -> None:
         t = self.triggers.get(symbol)
         if t is not None and price is not None:
             t.price = float(price)
 
+    @_synced
     def fires(self) -> list[ArmedTrigger]:
         """Armed triggers whose live price has reached or crossed the trigger."""
         return [
@@ -147,11 +164,13 @@ class ArmedTriggerBook:
             and t.price >= t.trigger
         ]
 
+    @_synced
     def mark_fired(self, symbol: str) -> None:
         t = self.triggers.get(symbol)
         if t is not None:
             t.state = FIRED
 
+    @_synced
     def mark_filled(self, held_symbols) -> None:
         """Promote tracked symbols that are now open broker positions to filled."""
         held = set(held_symbols or ())
@@ -159,6 +178,7 @@ class ArmedTriggerBook:
             if sym in held:
                 t.state = FILLED
 
+    @_synced
     def snapshot(self) -> list[dict]:
         """Board-ready rows, ordered armed -> fired -> filled -> waiting -> weak."""
         order = {ARMED: 0, FIRED: 1, FILLED: 2, WAITING: 3, WEAK: 4}

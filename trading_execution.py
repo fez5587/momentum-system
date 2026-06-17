@@ -14,9 +14,11 @@ Exit orders close existing broker positions on demand.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -44,6 +46,22 @@ from strategy.risk.position_sizing import (
 from trading_mode import TradingModeSettings
 
 logger = logging.getLogger(__name__)
+
+
+def _locked(method):
+    """Serialize a mutating service method behind self._lock (a re-entrant lock).
+
+    The fast trigger thread (submit_breakout_now) and the main loop (tick,
+    approvals) both mutate execution state (_armed, _requested_symbols) and emit
+    events; without this they would race on the shared psycopg2 connection and
+    the in-memory sets. RLock so a public method may call another (tick ->
+    expire_stale_entries) without deadlocking.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 @dataclass
@@ -154,6 +172,8 @@ class TradingExecutionService:
         self._halted = False
         # consecutive equity-read failures; after a few we fail CLOSED (halt)
         self._equity_read_failures = 0
+        # serializes state mutations across the main loop and the trigger thread
+        self._lock = threading.RLock()
 
     # -- pipeline -----------------------------------------------------------
 
@@ -176,6 +196,27 @@ class TradingExecutionService:
             for p in snapshots[-1].get("positions") or []
             if p.get("symbol")
         }
+
+    def _broker_held_symbols(self) -> set[str] | None:
+        """Symbols the broker reports as OPEN POSITIONS right now (truth).
+
+        Used to guard entry cancellation: our own order_filled events lag the
+        actual fill (they arrive via the 60s account sync), so the entry-timeout
+        guard once cancelled an entry it thought was unfilled AFTER it had really
+        filled — and cancelling a bracket parent cancels its stop/take-profit
+        legs, leaving the position NAKED. This queries the broker directly so a
+        filled name is never cancelled. None if positions can't be read (caller
+        then falls back to the synced snapshot and stays conservative).
+        """
+        client = getattr(self.executor, "client", None)
+        if client is None or not hasattr(client, "get_positions"):
+            return None
+        try:
+            positions = client.get_positions() or []
+            return {str(p.get("symbol")) for p in positions if p.get("symbol")}
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("broker positions unreadable in entry guard: %s", exc)
+            return None
 
     def _flatten_all(self, reason: str) -> dict:
         """Cancel unfilled entries and market-close every open position.
@@ -211,6 +252,7 @@ class TradingExecutionService:
                 result["errors"].append(f"close {symbol}: {exc}")
         return result
 
+    @_locked
     def _daily_loss_breach(self) -> bool:
         """True once the day's loss hits the circuit-breaker threshold.
 
@@ -306,6 +348,7 @@ class TradingExecutionService:
             )
         return self._halted
 
+    @_locked
     def request_approvals_for_ready_signals(self) -> list[str]:
         """Turn fresh ready signals into approval requests. Returns order ids."""
         if not self.settings.enabled:
@@ -395,6 +438,7 @@ class TradingExecutionService:
 
         return created
 
+    @_locked
     def approve_order(
         self, order_id: str, approved_by: str = "dashboard", notes: str | None = None
     ) -> dict:
@@ -442,6 +486,7 @@ class TradingExecutionService:
             "error": result.error,
         }
 
+    @_locked
     def submit_breakout_now(
         self,
         symbol: str,
@@ -569,6 +614,7 @@ class TradingExecutionService:
             "stop": stop_f,
         }
 
+    @_locked
     def reject_order(
         self, order_id: str, rejected_by: str = "dashboard", reason: str = "manual"
     ) -> dict:
@@ -591,6 +637,7 @@ class TradingExecutionService:
         self._requested_symbols.discard(entry.get("symbol") or "")
         return {"ok": True, "order_id": order_id}
 
+    @_locked
     def process_auto_approvals(self) -> list[dict]:
         """Auto-approve any pending requests marked approval_mode=auto."""
         results = []
@@ -601,6 +648,7 @@ class TradingExecutionService:
                 )
         return results
 
+    @_locked
     def submit_exit_order(self, symbol: str, reason: str = "manual_exit") -> dict:
         """Close an open broker position for symbol with a market sell."""
         held = self._held_symbols()
@@ -658,6 +706,7 @@ class TradingExecutionService:
                 ids.add(str(payload["order_id"]))
         return ids
 
+    @_locked
     def expire_stale_entries(self) -> list[dict]:
         """Back out of unfilled entries that timed out or broke their trigger.
 
@@ -677,6 +726,12 @@ class TradingExecutionService:
 
         filled = self._filled_order_ids()
         cancelled = self._cancelled_order_ids()
+        # broker truth: never cancel an entry whose position is actually open
+        # (cancelling its bracket parent would strip the protective stop/TP).
+        # Fall back to the synced snapshot if the broker can't be read.
+        broker_held = self._broker_held_symbols()
+        if broker_held is None:
+            broker_held = self._held_symbols()
         invalidate_pct = self.settings.entry_invalidate_pct
         timeout_bars = self.settings.entry_timeout_bars
         now = self._now()
@@ -693,6 +748,11 @@ class TradingExecutionService:
             if order_id in cancelled:
                 self._armed.pop(order_id, None)
                 self._requested_symbols.discard(symbol)
+                continue
+            # FILLED at the broker (position open) -> stop tracking, NEVER cancel
+            # (this is the naked-stop fix: cancelling here killed the stop leg).
+            if symbol in broker_held:
+                self._armed.pop(order_id, None)
                 continue
 
             armed["checks"] += 1
@@ -746,6 +806,7 @@ class TradingExecutionService:
 
         return actions
 
+    @_locked
     def tick(self) -> dict:
         """One execution pass: expire stale entries, request approvals, auto-execute."""
         backed_out = self.expire_stale_entries()
