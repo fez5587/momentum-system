@@ -77,6 +77,29 @@ class LiveExitManager:
                     return (c.get("id"), float(sp) if sp else None)
         return (None, None)
 
+    def _entry_time(self, symbol: str):
+        """UTC-naive fill time of the most recent FILLED buy entry for symbol."""
+        try:
+            orders = self.client.get_orders(status="all", limit=100, nested=True)
+        except Exception:  # noqa: BLE001
+            return None
+        best = None
+        for o in orders:
+            if (o.get("symbol") == symbol and o.get("side") == "buy"
+                    and float(o.get("filled_qty") or 0) > 0):
+                ft = o.get("filled_at") or o.get("submitted_at")
+                if not ft:
+                    continue
+                try:
+                    ts = pd.Timestamp(ft)
+                    if ts.tzinfo is not None:
+                        ts = ts.tz_convert("UTC").tz_localize(None)
+                except Exception:  # noqa: BLE001
+                    continue
+                if best is None or ts > best:
+                    best = ts
+        return best
+
     def _emit(self, symbol: str, message: str, rule: str, state: dict) -> None:
         from datetime import datetime
         self.store.emit(RiskRuleTriggeredEvent(
@@ -114,8 +137,10 @@ class LiveExitManager:
                 _leg, cur_stop = self._stop_leg(sym)
                 if cur_stop is None or cur_stop >= entry:
                     continue  # no usable protective stop yet (or above entry)
-                self._tracked[sym] = _Tracked(
-                    entry, cur_stop, _last_ts(bars), cur_stop)
+                # trail from the ACTUAL entry fill time (so high-water/R reflect
+                # the move since entry, not since we first noticed the position)
+                entry_ts = self._entry_time(sym) or _last_ts(bars)
+                self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts, cur_stop)
             tr = self._tracked[sym]
 
             since = _bars_since(bars, tr.entry_ts)
