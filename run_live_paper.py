@@ -25,6 +25,7 @@ still work against whatever data already exists.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -70,6 +71,16 @@ def _flag(name: str, default: str = "1") -> bool:
 def _now_session_date():
     session_date, _, _, _ = classify_session(datetime.now(timezone.utc))
     return session_date
+
+
+def _load_learned() -> dict:
+    """Nightly-tuned params from data/learned_params.json (empty if absent)."""
+    path = os.path.join(os.environ.get("DATA_DIR", "./data"), "learned_params.json")
+    try:
+        with open(path) as fh:
+            return json.load(fh)
+    except Exception:  # noqa: BLE001
+        return {}
 
 
 def _db_target_desc() -> str:
@@ -169,6 +180,13 @@ def build_runtime(args: argparse.Namespace) -> dict:
         )
     )
 
+    _learned = _load_learned()
+    if _learned:
+        print(f"[boot] learned params: ready_score={_learned.get('ready_score_pct')} "
+              f"min_bars={_learned.get('min_bars')} setups={_learned.get('setups')} "
+              f"(tuned {str(_learned.get('as_of', ''))[:10]} over {_learned.get('sessions')} "
+              f"sessions; backtest pnl {_learned.get('pnl')}, entry@{_learned.get('entry_min')}min)")
+
     watcher = Watcher(
         store,
         ResearchWatchlistProvider(
@@ -179,7 +197,11 @@ def build_runtime(args: argparse.Namespace) -> dict:
             session_id=session_id,
             mode=EventMode.PAPER,
             max_symbols=int(os.environ.get("WATCHER_MAX_SYMBOLS", "25")),
-            min_bars=int(os.environ.get("WATCHER_MIN_BARS", "10")),
+            # Defaults come from the nightly self-tuner (learned_params.json);
+            # an explicit env var still wins.
+            min_bars=int(os.environ.get("WATCHER_MIN_BARS", str(_learned.get("min_bars", 10)))),
+            ready_score_pct=float(os.environ.get(
+                "WATCHER_READY_SCORE", str(_learned.get("ready_score_pct", 60.0)))),
             min_quality=float(os.environ.get("WATCHER_MIN_QUALITY", "0.30")),
         ),
     )

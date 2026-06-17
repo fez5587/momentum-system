@@ -20,6 +20,8 @@ the live loop accumulate them) for a robust optimum.
 from __future__ import annotations
 
 import itertools
+import os
+from collections import defaultdict
 
 import pandas as pd
 from dotenv import load_dotenv
@@ -99,6 +101,43 @@ def run_combo(sessions, *, warmup, min_bars, eval_every, ready, gap_min, rvol_mi
     }
 
 
+def per_setup_report(sessions, *, warmup=6, eval_every=1, ready=65, min_bars=3,
+                     gap_min=0.05, rvol_min=2.0):
+    """Break trades down by setup type — shows which setups actually make money.
+
+    Always runs with ALL setups enabled (ignores STRATEGY_SETUPS) so the
+    comparison is visible even when the live config is restricted to ORB-only.
+    """
+    saved = os.environ.pop("STRATEGY_SETUPS", None)
+    try:
+        eng = BacktestEngine(
+            Config(), warmup_bars=warmup, eval_every=eval_every, ready_score_pct=ready,
+            min_bars=min_bars,
+            criteria=SetupCriteria(gap_pct_min=gap_min, relative_volume_min=rvol_min),
+        )
+        by = defaultdict(lambda: {"n": 0, "win": 0, "R": 0.0, "pnl": 0.0, "em": []})
+        for symbol, _sess, bars, pc, adv in sessions:
+            for t in eng.run(bars, symbol, previous_close=pc, avg_daily_volume=adv).trades:
+                b = by[t.setup_type or "?"]
+                b["n"] += 1
+                b["win"] += 1 if (t.realized_pnl or 0) > 0 else 0
+                b["R"] += t.r_multiple or 0.0
+                b["pnl"] += t.realized_pnl or 0.0
+                b["em"].append(_entry_min(bars, t.entry_time))
+    finally:
+        if saved is not None:
+            os.environ["STRATEGY_SETUPS"] = saved
+
+    print("\n=== per-setup breakdown (which setups actually make money) ===")
+    print(f"{'setup':24s} {'trades':>6} {'win%':>5} {'avgR':>6} {'pnl':>9} {'entry_min':>9}")
+    for st, b in sorted(by.items(), key=lambda x: x[1]["pnl"], reverse=True):
+        em = [e for e in b["em"] if e == e]
+        em_avg = (sum(em) / len(em)) if em else float("nan")
+        print(f"{st:24s} {b['n']:>6} {b['win']/max(1,b['n'])*100:>4.0f}% "
+              f"{b['R']/max(1,b['n']):>+6.2f} {b['pnl']:>9.0f} {em_avg:>9.1f}")
+    print("  -> keep only the profitable setups via STRATEGY_SETUPS in .env")
+
+
 def main():
     con = open_research_db("market")
     sessions = load_sessions(con)
@@ -144,6 +183,8 @@ def main():
     print("\n=== current default (warmup15 / min10 / evry5 / ready60) ===")
     print(f"  pnl {base['pnl']:.0f}, win {base['win']*100:.0f}%, R {base['avgR']:.2f}, "
           f"{base['trades']} trades, entry@{base['entry_min']:.1f}min")
+
+    per_setup_report(sessions)
 
 
 if __name__ == "__main__":
