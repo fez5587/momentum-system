@@ -20,7 +20,7 @@ import logging
 import os
 import threading
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from alpaca_paper.execution import (
     AlpacaPaperExecutor,
@@ -107,6 +107,15 @@ class ExecutionSettings:
     # liquidity cap: shares <= this fraction of the symbol's day volume so at
     # SIZE you don't move the market. 0 = off (irrelevant at small size).
     liquidity_max_volume_pct: float = 0.0
+    # --- backout cooldown (anti-thrash) ------------------------------------
+    # after an entry backs out (timeout / price-break) the symbol is benched for
+    # this many seconds before it can re-arm. Without it a breakout that won't
+    # fill on a marketable limit re-arms every pass and churns (observed live:
+    # NEOV armed+backed-out 68x in one session, bloating the order list). 0 = off.
+    backout_cooldown_seconds: float = 180.0
+    # after this many backouts in a session, bench the symbol for the rest of the
+    # day (a setup that has failed to fill repeatedly isn't going to start). 0 = no cap.
+    max_backouts_per_symbol: int = 3
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -146,6 +155,12 @@ class ExecutionSettings:
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
+            backout_cooldown_seconds=float(
+                values.get("TRADING_BACKOUT_COOLDOWN_SECONDS", "180")
+            ),
+            max_backouts_per_symbol=int(
+                values.get("TRADING_MAX_BACKOUTS_PER_SYMBOL", "3")
+            ),
         )
 
 
@@ -184,6 +199,12 @@ class TradingExecutionService:
         # armed (submitted, awaiting fill) entries we may need to cancel.
         # order_id -> {symbol, entry_price, broker_order_id, armed_at, checks}
         self._armed: dict[str, dict] = {}
+        # backout cooldown (anti-thrash): symbol -> wall-clock time it may re-arm,
+        # and how many times it has backed out this session. A symbol that won't
+        # fill is benched instead of re-arming every pass. datetime.max == benched
+        # for the rest of the session (hit max_backouts_per_symbol).
+        self._cooldown_until: dict[str, datetime] = {}
+        self._backout_counts: dict[str, int] = {}
         # daily-loss circuit breaker: once tripped, no new entries this session
         # (a REAL loss is permanent for the session — a bounce can't re-open it)
         self._halted = False
@@ -440,7 +461,9 @@ class TradingExecutionService:
             if len(created) >= self.settings.max_orders_per_tick:
                 break
             symbol = signal["symbol"]
-            if symbol in held or symbol in pending or symbol in self._requested_symbols:
+            if (symbol in held or symbol in pending
+                    or symbol in self._requested_symbols
+                    or self._in_cooldown(symbol)):  # benched after recent backouts
                 continue
             entry = signal.get("entry_price")
             stop = signal.get("stop_loss_price")
@@ -580,6 +603,8 @@ class TradingExecutionService:
         pending = {row["symbol"] for row in query_approval_queue(self.store)}
         if symbol in held or symbol in pending or symbol in self._requested_symbols:
             return {"ok": False, "skipped": "already_active"}
+        if self._in_cooldown(symbol):  # benched after recent backouts (anti-thrash)
+            return {"ok": False, "skipped": "cooldown"}
 
         entry_ref = float(last_price or trigger)
         stop_f = float(stop)
@@ -813,6 +838,30 @@ class TradingExecutionService:
         return ids
 
     @_locked
+    def _in_cooldown(self, symbol: str) -> bool:
+        """True if symbol is benched after recent backouts (anti-thrash)."""
+        until = self._cooldown_until.get(symbol)
+        if until is None:
+            return False
+        if self._now() >= until:
+            del self._cooldown_until[symbol]  # cooldown elapsed
+            return False
+        return True
+
+    def _register_backout(self, symbol: str) -> str:
+        """Record a backout and bench the symbol; returns a short reason suffix."""
+        n = self._backout_counts.get(symbol, 0) + 1
+        self._backout_counts[symbol] = n
+        cap = self.settings.max_backouts_per_symbol
+        if cap and n >= cap:
+            self._cooldown_until[symbol] = datetime.max  # benched for the session
+            return f"benched for session ({n} backouts)"
+        secs = self.settings.backout_cooldown_seconds
+        if secs > 0:
+            self._cooldown_until[symbol] = self._now() + timedelta(seconds=secs)
+            return f"cooldown {secs:.0f}s (backout {n})"
+        return f"backout {n}"
+
     def expire_stale_entries(self) -> list[dict]:
         """Back out of unfilled entries that timed out or broke their trigger.
 
@@ -895,25 +944,28 @@ class TradingExecutionService:
                 self.executor.cancel_entry(
                     order_id, armed.get("broker_order_id"), symbol, reason
                 )
+                bench = self._register_backout(symbol)  # anti-thrash: cool the name
                 self.store.emit(
                     RiskRuleTriggeredEvent(
                         timestamp=datetime.now(),
                         mode=self.mode,
                         correlation_id=self.session_id,
-                        message=f"Backed out of {symbol} entry — {reason}",
+                        message=f"Backed out of {symbol} entry — {reason} [{bench}]",
                         rule_type="entry_backout",
                         rule_value=float(timeout_bars),
                         current_state={
                             "symbol": symbol,
                             "order_id": order_id,
                             "checks": armed["checks"],
+                            "backouts": self._backout_counts.get(symbol, 0),
                         },
                         action_taken="cancelled_unfilled_entry",
                     )
                 )
                 self._armed.pop(order_id, None)
                 self._requested_symbols.discard(symbol)
-                actions.append({"order_id": order_id, "symbol": symbol, "reason": reason})
+                actions.append({"order_id": order_id, "symbol": symbol,
+                                "reason": reason, "cooldown": bench})
 
         return actions
 

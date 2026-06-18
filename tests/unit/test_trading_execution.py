@@ -343,3 +343,53 @@ def test_backout_frees_symbol_to_resignal(store):
     service.expire_stale_entries()
     # after backing out, the symbol is no longer marked as requested
     assert symbol not in service._requested_symbols
+
+
+# ---------------------------------------------------------------------------
+# Backout cooldown (anti-thrash): a name that won't fill is benched, not
+# re-armed every pass (NEOV armed+backed-out 68x in one live session).
+# ---------------------------------------------------------------------------
+
+def test_backout_benches_symbol_until_cooldown_elapses(store):
+    emit_signal(store)
+    executor = FakeExecutor(status="accepted")
+    clock = Clock()
+    service = make_service(
+        store, executor, auto_approve=True, now_fn=clock,
+        entry_timeout_bars=1, entry_invalidate_pct=-1.0,
+        backout_cooldown_seconds=120, max_backouts_per_symbol=3,
+    )
+    service.tick()
+    sym = service._armed[next(iter(service._armed))]["symbol"]
+    clock.advance(1)  # hit the timeout -> backs out
+    out = service.expire_stale_entries()
+    assert len(out) == 1 and "cooldown" in out[0]
+    # benched right after the backout; a fresh ready signal must NOT re-arm it
+    assert service._in_cooldown(sym)
+    emit_signal(store)
+    assert service.request_approvals_for_ready_signals() == []
+    # still benched just before the window closes...
+    clock.advance(1.9)  # 114s elapsed (< 120)
+    assert service._in_cooldown(sym)
+    # ...and eligible once the cooldown elapses
+    clock.advance(0.2)  # 126s elapsed (> 120)
+    assert not service._in_cooldown(sym)
+    assert len(service.request_approvals_for_ready_signals()) == 1
+
+
+def test_repeated_backouts_bench_symbol_for_session(store):
+    clock = Clock()
+    service = make_service(
+        store, now_fn=clock,
+        backout_cooldown_seconds=60, max_backouts_per_symbol=3,
+    )
+    # first two backouts only cool the name temporarily
+    for _ in range(2):
+        service._register_backout("THRASH")
+        assert service._in_cooldown("THRASH")
+        clock.advance(2)  # 120s > 60s -> cooldown elapses
+        assert not service._in_cooldown("THRASH")
+    # the third hits the cap -> benched for the rest of the session
+    service._register_backout("THRASH")
+    clock.advance(10_000)  # hours later, still benched
+    assert service._in_cooldown("THRASH")
