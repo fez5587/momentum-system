@@ -18,6 +18,7 @@ import functools
 import json
 import logging
 import os
+import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -295,14 +296,49 @@ class TradingExecutionService:
             logger.warning("broker positions unreadable in entry guard: %s", exc)
             return None
 
+    # order states that still reserve position quantity (held_for_orders)
+    _RESERVING = {"held", "new", "accepted", "pending_new",
+                  "accepted_for_bidding", "partially_filled"}
+
+    def _release_and_close(self, client, symbol: str) -> None:
+        """Market-close a position, cancelling its resting bracket legs FIRST.
+
+        A bracket stop/take-profit leg RESERVES the full quantity, so a bare
+        close_position is rejected 403 'insufficient qty available' — which is
+        exactly why the EOD flatten failed and left positions naked overnight.
+        Cancel the symbol's working orders to free the shares, then close (with
+        retry so a not-yet-settled cancel doesn't abort the flatten)."""
+        if hasattr(client, "get_orders"):
+            try:
+                for o in client.get_orders(status="open", nested=True, symbols=[symbol]):
+                    for x in [o, *(o.get("legs") or [])]:
+                        sym = x.get("symbol") or o.get("symbol")
+                        if (sym == symbol and x.get("status") in self._RESERVING
+                                and x.get("id")):
+                            try:
+                                client.cancel_order(x["id"])
+                            except Exception:  # noqa: BLE001
+                                pass
+            except Exception:  # noqa: BLE001
+                pass
+        last_exc = None
+        for attempt in range(4):
+            try:
+                client.close_position(symbol)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                time.sleep(0.3 * (attempt + 1))
+        raise last_exc if last_exc else RuntimeError("flatten failed")
+
     def _flatten_all(self, reason: str) -> dict:
         """Cancel unfilled entries and market-close every open position.
 
-        Used when the daily-loss circuit breaker trips: stop the bleeding by
-        cancelling resting entries and flattening the book. Best-effort — errors
-        are collected, not raised, so one bad symbol can't block the rest.
-        ``close_position`` also cancels the position's resting bracket legs.
-        """
+        Used at EOD and when the daily-loss circuit breaker trips: stop the
+        bleeding by cancelling resting entries and flattening the book.
+        Best-effort — errors are collected, not raised, so one bad symbol can't
+        block the rest. Resting bracket legs are cancelled before each close so
+        the held quantity is freed (else close_position 403s)."""
         result: dict = {"cancelled_entries": 0, "closed_positions": [], "errors": []}
         # 1) cancel unfilled (armed) entries we are tracking
         for order_id in list(self._armed):
@@ -323,7 +359,7 @@ class TradingExecutionService:
                 result["errors"].append(f"close {symbol}: no broker client to flatten")
                 continue
             try:
-                client.close_position(symbol)
+                self._release_and_close(client, symbol)
                 result["closed_positions"].append(symbol)  # only on a confirmed close
             except Exception as exc:  # noqa: BLE001
                 result["errors"].append(f"close {symbol}: {exc}")
@@ -816,7 +852,7 @@ class TradingExecutionService:
                     sym = p.get("symbol")
                     if sym and sym not in result["closed_positions"]:
                         try:
-                            client.close_position(sym)
+                            self._release_and_close(client, sym)
                             result["closed_positions"].append(sym)
                         except Exception as exc:  # noqa: BLE001
                             result["errors"].append(f"close {sym}: {exc}")

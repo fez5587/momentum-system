@@ -648,10 +648,13 @@ def main(argv: list[str] | None = None) -> int:
         if now_et.weekday() >= 5 or not ((eod_h, eod_m) <= cur < (16, 0)):
             return None
         res = rt["execution"].close_session("eod_flatten")
-        _eod_done["v"] = True
+        # only mark done if it actually succeeded — otherwise RETRY on the next
+        # pass within the window (a flatten that errored once left positions naked
+        # overnight). close_session re-blocks entries each call, so retrying is safe.
+        _eod_done["v"] = not res["errors"]
         closed = ", ".join(res["closed_positions"]) or "none"
         return (f"EOD FLATTEN closed [{closed}]"
-                + (f" errors={res['errors']}" if res["errors"] else ""))
+                + (f" errors={res['errors']} (will retry)" if res["errors"] else ""))
 
     scheduler = Scheduler()
     scheduler.add("discover", step_discover,

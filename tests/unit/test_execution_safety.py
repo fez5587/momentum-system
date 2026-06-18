@@ -80,6 +80,53 @@ def test_close_session_flattens_and_blocks_new_entries():
     assert svc._daily_loss_breach() is True                # no new entries after
 
 
+def test_eod_flatten_cancels_legs_before_close():
+    """EOD flatten must cancel resting bracket legs BEFORE close_position — else
+    held_for_orders 403s and the book is left naked overnight (the live bug)."""
+    store = EventStore(":memory:")
+
+    class _C:
+        def __init__(self):
+            self.reserved = True   # stop leg holds the qty until cancelled
+            self.closed = []
+            self.canceled = []
+
+        def get_account(self):
+            return {"equity": "100000", "last_equity": "100000"}
+
+        def get_positions(self, fresh=False):
+            return [] if self.closed else [{"symbol": "AAA", "qty": "100"}]
+
+        def get_orders(self, status="open", nested=True, symbols=None):
+            if self.reserved:
+                return [{"symbol": "AAA", "side": "sell", "type": "stop",
+                         "status": "held", "id": "st1"}]
+            return []
+
+        def cancel_order(self, order_id):
+            self.canceled.append(order_id)
+            self.reserved = False
+
+        def submit_order(self, **kw):
+            return {"id": "o", "status": "new", "filled_qty": "0"}
+
+        def close_position(self, symbol, qty=None, percentage=None):
+            if self.reserved:
+                raise RuntimeError("403 insufficient qty available for order")
+            self.closed.append(symbol)
+            return {"id": "c", "status": "accepted"}
+
+    cli = _C()
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=cli),
+        settings=ExecutionSettings(max_daily_loss_pct=0.5), session_id="eod",
+    )
+    res = svc.close_session("eod_flatten")
+    assert cli.canceled == ["st1"]              # cancelled the leg first
+    assert "AAA" in res["closed_positions"]      # then actually closed
+    assert res["errors"] == []                   # no 403
+
+
 def test_breaker_pauses_then_recovers_when_equity_unreadable():
     """Equity-read outage PAUSES new entries (recoverable), not a permanent halt:
     a transient DNS/network blip must not end the trading day."""
