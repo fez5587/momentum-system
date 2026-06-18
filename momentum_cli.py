@@ -448,17 +448,28 @@ _STATE_STYLE = {
 }
 
 
+def _to_et(iso: str):
+    """Parse an ISO-8601 (UTC) broker timestamp to America/New_York. The broker
+    reports UTC; a US-market journal must read in ET. None if unparseable."""
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo
+    try:
+        dt = _dt.fromisoformat((iso or "").replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+        return dt.astimezone(ZoneInfo("America/New_York"))
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _todays_trades(con):
     """Reconstruct TODAY's round-trip trades (FIFO buy->sell per symbol) from the
     latest broker orders snapshot, plus still-open lots. Resets each day (filters
-    to today's fills). Returns (trades, realized_pnl)."""
+    to today's fills, in ET). Returns (trades, realized_pnl). Times are ET."""
     from collections import defaultdict, deque
     from datetime import datetime as _dt
-    try:
-        from zoneinfo import ZoneInfo
-        today = _dt.now(ZoneInfo("America/New_York")).date().isoformat()
-    except Exception:  # noqa: BLE001
-        today = _dt.now().date().isoformat()
+    from zoneinfo import ZoneInfo
+    today = _dt.now(ZoneInfo("America/New_York")).date().isoformat()
     rows = con.execute("SELECT payload_json FROM events WHERE event_type='account_orders_updated' "
                        "ORDER BY timestamp DESC LIMIT 1").fetchall()
     if not rows:
@@ -466,7 +477,8 @@ def _todays_trades(con):
     orders = json.loads(rows[0][0]).get("orders") or []
     fills = [o for o in orders
              if float(o.get("filled_quantity") or 0) > 0
-             and str(o.get("submitted_at") or "")[:10] == today]
+             and (_to_et(o.get("submitted_at")) is not None)
+             and _to_et(o.get("submitted_at")).date().isoformat() == today]
     fills.sort(key=lambda o: o.get("submitted_at") or "")
     lots: dict = defaultdict(deque)
     trades = []
@@ -474,7 +486,8 @@ def _todays_trades(con):
         sym, side = o.get("symbol"), o.get("side")
         qty = float(o.get("filled_quantity") or 0)
         px = float(o.get("filled_avg_price") or 0)
-        tm = str(o.get("submitted_at") or "")[11:19]
+        _et = _to_et(o.get("submitted_at"))
+        tm = _et.strftime("%H:%M:%S") if _et else ""
         if side == "buy":
             lots[sym].append([qty, px, tm])
         elif side == "sell":
