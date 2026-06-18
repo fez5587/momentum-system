@@ -116,6 +116,11 @@ class ExecutionSettings:
     # after this many backouts in a session, bench the symbol for the rest of the
     # day (a setup that has failed to fill repeatedly isn't going to start). 0 = no cap.
     max_backouts_per_symbol: int = 3
+    # once a position in a symbol CLOSES (stop-out / trail / target), don't re-enter
+    # that name for the rest of the session. Stops the "throw good money after bad"
+    # re-entry into a name that already failed (observed live: APWC stopped out
+    # -904, was bought back, lost another -645). One round-trip per symbol per day.
+    reentry_block_after_exit: bool = True
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -161,6 +166,7 @@ class ExecutionSettings:
             max_backouts_per_symbol=int(
                 values.get("TRADING_MAX_BACKOUTS_PER_SYMBOL", "3")
             ),
+            reentry_block_after_exit=flag("TRADING_BLOCK_REENTRY_AFTER_EXIT", "1"),
         )
 
 
@@ -205,6 +211,12 @@ class TradingExecutionService:
         # for the rest of the session (hit max_backouts_per_symbol).
         self._cooldown_until: dict[str, datetime] = {}
         self._backout_counts: dict[str, int] = {}
+        # re-entry block: symbols whose position has CLOSED this session (detected
+        # by a name leaving the broker's held set) — benched from re-entry so we
+        # don't buy back a name that just stopped out. _prev_held is the last
+        # fresh broker snapshot used to spot departures.
+        self._exited_today: set[str] = set()
+        self._prev_held: set[str] = set()
         # daily-loss circuit breaker: once tripped, no new entries this session
         # (a REAL loss is permanent for the session — a bounce can't re-open it)
         self._halted = False
@@ -463,7 +475,8 @@ class TradingExecutionService:
             symbol = signal["symbol"]
             if (symbol in held or symbol in pending
                     or symbol in self._requested_symbols
-                    or self._in_cooldown(symbol)):  # benched after recent backouts
+                    or self._in_cooldown(symbol)        # benched after recent backouts
+                    or symbol in self._exited_today):   # already round-tripped today
                 continue
             entry = signal.get("entry_price")
             stop = signal.get("stop_loss_price")
@@ -605,6 +618,8 @@ class TradingExecutionService:
             return {"ok": False, "skipped": "already_active"}
         if self._in_cooldown(symbol):  # benched after recent backouts (anti-thrash)
             return {"ok": False, "skipped": "cooldown"}
+        if symbol in self._exited_today:  # already round-tripped today — no re-entry
+            return {"ok": False, "skipped": "reentry_blocked"}
 
         entry_ref = float(last_price or trigger)
         stop_f = float(stop)
@@ -862,6 +877,28 @@ class TradingExecutionService:
             return f"cooldown {secs:.0f}s (backout {n})"
         return f"backout {n}"
 
+    def _note_position_exits(self) -> None:
+        """Detect names whose position CLOSED since last pass and bench them from
+        re-entry this session. A symbol leaving the broker's held set means its
+        round-trip is done — re-buying it is throwing good money after bad."""
+        if not self.settings.reentry_block_after_exit:
+            return
+        held = self._broker_held_symbols()
+        if held is None:   # broker unreadable — don't trust a stale snapshot here
+            return
+        departed = self._prev_held - held
+        if departed:
+            self._exited_today |= departed
+            for sym in departed:
+                self.store.emit(RiskRuleTriggeredEvent(
+                    timestamp=datetime.now(), mode=self.mode,
+                    correlation_id=self.session_id,
+                    message=f"{sym} position closed — benched from re-entry today",
+                    rule_type="reentry_block", rule_value=0.0,
+                    current_state={"symbol": sym}, action_taken="reentry_blocked",
+                ))
+        self._prev_held = set(held)
+
     def expire_stale_entries(self) -> list[dict]:
         """Back out of unfilled entries that timed out or broke their trigger.
 
@@ -876,6 +913,10 @@ class TradingExecutionService:
         running this every few seconds reacts fast without shortening the
         timeout window.
         """
+        # track positions that have CLOSED since last pass (so a stopped-out name
+        # is benched from re-entry). Done BEFORE the early-return so it runs every
+        # pass, not only when there are armed entries to expire.
+        self._note_position_exits()
         if not self._armed:
             return []
 

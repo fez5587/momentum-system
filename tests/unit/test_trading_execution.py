@@ -377,6 +377,48 @@ def test_backout_benches_symbol_until_cooldown_elapses(store):
     assert len(service.request_approvals_for_ready_signals()) == 1
 
 
+def test_reentry_blocked_after_position_closes(store):
+    """Once a name's position closes (stop-out / trail), it must not be re-entered
+    this session — both the fast trigger and the slow approval path skip it."""
+    from alpaca_paper.execution import AlpacaPaperExecutor
+
+    class _Cli:
+        def __init__(self):
+            self.pos = []
+
+        def get_positions(self, fresh=False):
+            return list(self.pos)
+
+        def get_account(self):
+            return {"equity": "100000", "last_equity": "100000"}
+
+        def submit_order(self, **kw):
+            return {"id": "o", "status": "new", "filled_qty": "0"}
+
+        def cancel_order(self, order_id):
+            pass
+
+    cli = _Cli()
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=cli),
+        settings=ExecutionSettings(reentry_block_after_exit=True, auto_approve=True,
+                                   max_daily_loss_pct=0.5),
+        session_id="t",
+    )
+    cli.pos = [{"symbol": "AAA", "qty": "100"}]
+    svc.expire_stale_entries()                 # records AAA as held
+    assert "AAA" not in svc._exited_today
+    cli.pos = []                               # AAA's position closes
+    svc.expire_stale_entries()                 # detects the departure
+    assert "AAA" in svc._exited_today
+    # fast path blocked
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.0)
+    assert res["ok"] is False and res["skipped"] == "reentry_blocked"
+    # slow path blocked too
+    emit_signal(store, symbol="AAA", entry=10.0, stop=9.5)
+    assert svc.request_approvals_for_ready_signals() == []
+
+
 def test_repeated_backouts_bench_symbol_for_session(store):
     clock = Clock()
     service = make_service(
