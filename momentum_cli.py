@@ -524,6 +524,34 @@ def _day_pnl(con):
         return None
 
 
+def _open_unrealized(con):
+    """Sum of unrealized P&L across the latest open-positions snapshot (broker
+    average-cost basis). Pairs with _day_pnl so realized = day_pnl - open."""
+    pos_ev = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
+        "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    total = 0.0
+    if pos_ev:
+        for p in (json.loads(pos_ev[0][0]).get("positions") or []):
+            try:
+                total += float(p.get("unrealized_pnl") if p.get("unrealized_pnl") is not None
+                               else p.get("unrealized_pl") or 0)
+            except (TypeError, ValueError):
+                pass
+    return total
+
+
+def _matched_realized(day_pnl, open_unreal, fifo_realized):
+    """Broker-authoritative realized for the header: day P&L minus current open
+    unrealized, so the parenthetical reconciles exactly (matched + open == day
+    P&L). Falls back to the FIFO sum when the broker day P&L is unavailable.
+    (Per-trade rows stay FIFO-accurate; their sum can differ from this only by
+    the average-cost-vs-FIFO split on partially-closed names.)"""
+    if day_pnl is None:
+        return fifo_realized
+    return day_pnl - open_unreal
+
+
 def _render_board(con):
     """Build the live monitoring board renderable."""
     from rich.console import Group
@@ -577,23 +605,15 @@ def _render_board(con):
     for ts, m in sig:
         st.add_row(str(ts)[11:19], m or "")
 
-    pos_ev = con.execute("SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
-                         "ORDER BY timestamp DESC LIMIT 1").fetchall()
-    open_unreal = 0.0
-    if pos_ev:
-        for p in (json.loads(pos_ev[0][0]).get("positions") or []):
-            try:
-                open_unreal += float(p.get("unrealized_pnl") if p.get("unrealized_pnl") is not None
-                                     else p.get("unrealized_pl") or 0)
-            except (TypeError, ValueError):
-                pass
+    open_unreal = _open_unrealized(con)
     trades, realized = _todays_trades(con)
     day_pnl = _day_pnl(con)
     if day_pnl is None:            # fallback if equity snapshots missing
         day_pnl = realized + open_unreal
+    matched = _matched_realized(day_pnl, open_unreal, realized)
     dcol = "green" if day_pnl >= 0 else "red"
     pt = Table(title=f"today's trades — day P&L [{dcol}]{day_pnl:+,.0f}[/] "
-                     f"([dim]matched {realized:+,.0f} · open {open_unreal:+,.0f}[/])",
+                     f"([dim]matched {matched:+,.0f} · open {open_unreal:+,.0f}[/])",
                box=box.SIMPLE)
     for c in ("time", "symbol", "qty", "entry", "exit", "P&L", ""):
         pt.add_column(c, justify="left" if c in ("symbol", "") else "right")
@@ -643,10 +663,12 @@ def journal():
     con = _con()
     trades, realized = _todays_trades(con)
     day_pnl = _day_pnl(con)
+    open_unreal = _open_unrealized(con)
+    matched = _matched_realized(day_pnl, open_unreal, realized)
     console.print(f"[bold]=== trade journal {today} ===[/bold]")
     if day_pnl is not None:
         console.print(f"day P&L: [{'green' if day_pnl >= 0 else 'red'}]{day_pnl:+,.0f}[/]"
-                      f"  ([dim]matched {realized:+,.0f}[/])")
+                      f"  ([dim]matched {matched:+,.0f} · open {open_unreal:+,.0f}[/])")
     if not trades:
         console.print("no trades today.")
         return
