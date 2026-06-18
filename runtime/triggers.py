@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import functools
 import threading
+import time
 from dataclasses import dataclass, field
 
 WAITING = "waiting"
@@ -58,6 +59,7 @@ class ArmedTrigger:
     stop: float | None = None     # opening-range low, cushioned (protective stop)
     range_pct: float = 0.0        # (high-low)/high — how wide the opening range is
     price: float | None = None    # latest live trade price
+    price_ts: float = 0.0         # monotonic time of that price (staleness guard)
     cum_volume: float = 0.0       # session cumulative volume (for liquidity sizing)
     dollar_vol: float = 0.0       # recent $-volume (liquidity gate: skip thin spikes)
     catalyst: str = ""            # fresh news headline (if any) — why it's hot
@@ -104,6 +106,10 @@ class ArmedTriggerBook:
     # qualifies — thin names then fill at the top of a one-bar spike and reverse
     # (observed live: WKSP/LNKS/UWMC entered on 100-400 share bars). 0 = off.
     min_dollar_vol: float = 0.0
+    # max age (s) of the last price before a trigger may fire. A stalled feed
+    # would otherwise let a name fire on a frozen quote into a reverted market.
+    # 0 = off.
+    max_price_age_s: float = 0.0
     triggers: dict[str, ArmedTrigger] = field(default_factory=dict)
     _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -162,12 +168,20 @@ class ArmedTriggerBook:
     @_synced
     def update_price(self, symbol: str, price: float | None) -> None:
         t = self.triggers.get(symbol)
-        if t is not None and price is not None:
+        if t is None:
+            return
+        if price is None:
+            t.price = None       # failed fetch -> clear, so we can't fire on stale
+        else:
             t.price = float(price)
+            t.price_ts = time.monotonic()
 
     @_synced
     def fires(self) -> list[ArmedTrigger]:
-        """Armed triggers whose live price has reached or crossed the trigger."""
+        """Armed triggers whose live price has reached or crossed the trigger —
+        and whose price is fresh (a stalled feed must not fire on a frozen quote)."""
+        now = time.monotonic()
+        max_age = self.max_price_age_s
         return [
             t
             for t in self.triggers.values()
@@ -175,6 +189,7 @@ class ArmedTriggerBook:
             and t.price is not None
             and t.trigger is not None
             and t.price >= t.trigger
+            and (max_age <= 0 or (now - t.price_ts) <= max_age)
         ]
 
     @_synced

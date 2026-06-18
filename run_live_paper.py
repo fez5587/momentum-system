@@ -267,6 +267,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
         rvol_min=float(os.environ.get("TRIGGER_RVOL_MIN", "2.0")),
         min_range_pct=float(os.environ.get("TRIGGER_MIN_RANGE_PCT", "0.004")),
         min_dollar_vol=float(os.environ.get("TRIGGER_MIN_DOLLAR_VOL", "0")),
+        max_price_age_s=float(os.environ.get("TRIGGER_PRICE_MAX_AGE", "12")),
     )
 
     return {

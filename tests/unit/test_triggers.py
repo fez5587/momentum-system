@@ -102,6 +102,21 @@ def test_fires_only_when_price_crosses():
     assert [t.symbol for t in b.fires()] == ["AAA"]
 
 
+def test_fire_blocked_when_price_is_stale():
+    """A stalled feed must not fire on a frozen quote — fires() requires the
+    price to be fresher than max_price_age_s."""
+    b = ArmedTriggerBook(gap_min=3, rvol_min=2, max_price_age_s=5)
+    b.arm([_cand("AAA", trig=10.0)])
+    b.update_price("AAA", 10.5)                 # fresh cross -> fires
+    assert [t.symbol for t in b.fires()] == ["AAA"]
+    b.triggers["AAA"].price_ts -= 10            # age the price past the window
+    assert b.fires() == []                      # stale -> no fire
+    b.update_price("AAA", 10.5)                 # fresh again -> fires
+    assert [t.symbol for t in b.fires()] == ["AAA"]
+    b.update_price("AAA", None)                 # failed fetch clears the price
+    assert b.fires() == [] and b.triggers["AAA"].price is None
+
+
 def test_fired_state_pinned_across_rearm():
     b = ArmedTriggerBook(max_armed=2, gap_min=3, rvol_min=2)
     b.arm([_cand("AAA"), _cand("BBB")])
