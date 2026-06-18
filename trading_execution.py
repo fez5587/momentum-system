@@ -18,11 +18,11 @@ import functools
 import json
 import logging
 import os
-import time
 import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from runtime.flatten import cancel_protective_and_close
 from alpaca_paper.execution import (
     AlpacaPaperExecutor,
     ExecutionRequest,
@@ -307,40 +307,13 @@ class TradingExecutionService:
             logger.warning("broker positions unreadable in entry guard: %s", exc)
             return None
 
-    # order states that still reserve position quantity (held_for_orders)
-    _RESERVING = {"held", "new", "accepted", "pending_new",
-                  "accepted_for_bidding", "partially_filled"}
-
     def _release_and_close(self, client, symbol: str) -> None:
-        """Market-close a position, cancelling its resting bracket legs FIRST.
+        """Cancel a symbol's resting bracket legs, then market-close it.
 
-        A bracket stop/take-profit leg RESERVES the full quantity, so a bare
-        close_position is rejected 403 'insufficient qty available' — which is
-        exactly why the EOD flatten failed and left positions naked overnight.
-        Cancel the symbol's working orders to free the shares, then close (with
-        retry so a not-yet-settled cancel doesn't abort the flatten)."""
-        if hasattr(client, "get_orders"):
-            try:
-                for o in client.get_orders(status="open", nested=True, symbols=[symbol]):
-                    for x in [o, *(o.get("legs") or [])]:
-                        sym = x.get("symbol") or o.get("symbol")
-                        if (sym == symbol and x.get("status") in self._RESERVING
-                                and x.get("id")):
-                            try:
-                                client.cancel_order(x["id"])
-                            except Exception:  # noqa: BLE001
-                                pass
-            except Exception:  # noqa: BLE001
-                pass
-        last_exc = None
-        for attempt in range(4):
-            try:
-                client.close_position(symbol)
-                return
-            except Exception as exc:  # noqa: BLE001
-                last_exc = exc
-                time.sleep(0.3 * (attempt + 1))
-        raise last_exc if last_exc else RuntimeError("flatten failed")
+        Thin wrapper over the shared helper (runtime/flatten.py) — the held-qty
+        403 fix lives in one place, shared with the live exit manager. Fetches
+        the symbol's open orders itself (no pre-fetched snapshot at EOD)."""
+        cancel_protective_and_close(client, symbol)
 
     def _flatten_all(self, reason: str) -> dict:
         """Cancel unfilled entries and market-close every open position.
