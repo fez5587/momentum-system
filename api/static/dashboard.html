@@ -134,6 +134,18 @@
   /* risk preview chip */
   .risk { font: 500 11px var(--mono); color: var(--muted); }
   .risk b { color: var(--text); font-weight: 600; }
+  /* naked-position alarm banner + portfolio risk strip */
+  .naked-banner { display: none; background: #b00020; color: #fff;
+    font: 700 13px var(--mono); padding: 9px 14px; text-align: center; letter-spacing: .4px; }
+  .naked-banner.show { display: block; animation: nakedpulse 1.1s ease-in-out infinite; }
+  @keyframes nakedpulse { 50% { background: #d32f3f; } }
+  .risk-strip { display: flex; gap: 20px; padding: 7px 14px; align-items: center;
+    border-bottom: 1px solid var(--border); font: 500 11px var(--mono); }
+  .risk-strip .label { color: var(--muted); text-transform: uppercase; font-size: 10px;
+    letter-spacing: .6px; margin-right: 5px; }
+  .risk-strip b { color: var(--text); font-weight: 650; }
+  .rdot { font-weight: 700; }
+  .rdot.ok { color: #2ecc71; } .rdot.warn { color: #f1c40f; } .rdot.critical { color: #ff4d4f; }
 
   /* activity feed */
   .feed-row { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid #151a26; font: 500 12px var(--mono); }
@@ -174,6 +186,15 @@
   <button id="kbd-toggle" class="hdr-btn" title="Keyboard shortcuts (?)">KEYS</button>
   <div class="conn"><div id="conn-dot" class="dot"></div><span id="stamp" class="stamp">connecting...</span></div>
 </header>
+
+<div id="naked-banner" class="naked-banner"></div>
+<div class="risk-strip" id="risk-strip">
+  <div><span class="label">Risk</span><span id="risk-status" class="rdot">—</span></div>
+  <div><span class="label">Positions</span><b id="risk-pos">—</b></div>
+  <div><span class="label">Gross</span><b id="risk-gross">—</b></div>
+  <div><span class="label">Day vs limit</span><b id="risk-day">—</b></div>
+  <div><span class="label">Data</span><b id="risk-fresh">—</b></div>
+</div>
 
 <div class="pnl-strip" id="pnl-strip">
   <div class="pnl-cell"><div class="label">Total P&amp;L</div><div class="value num" id="pnl-total">—</div></div>
@@ -433,6 +454,24 @@ function render(d) {
   $("pnl-avgr").className = "value num " + (p.avg_r_multiple > 0 ? "pos" : p.avg_r_multiple < 0 ? "neg" : "");
   $("pnl-counts").textContent = (p.open_positions != null ? p.open_positions : 0) + " / " + (p.closed_trades != null ? p.closed_trades : 0);
   $("pnl-counts").className = "value num";
+
+  // portfolio risk strip + naked-position alarm — the conditions that silently
+  // cost money this session, now visible.
+  const rk = d.risk || {};
+  const nb = $("naked-banner");
+  if (rk.unprotected && rk.unprotected.length) {
+    nb.textContent = "⚠ UNPROTECTED: " + rk.unprotected.join(", ") + " — held long with no / short protective stop";
+    nb.classList.add("show");
+  } else { nb.classList.remove("show"); }
+  const rs = $("risk-status");
+  rs.textContent = (rk.status || "—").toUpperCase();
+  rs.className = "rdot " + (rk.status || "");
+  $("risk-pos").textContent = (rk.open_positions != null ? rk.open_positions : "—") + " / " + (rk.max_concurrent != null ? rk.max_concurrent : "—");
+  $("risk-gross").textContent = rk.gross_pct != null ? (rk.gross_pct * 100).toFixed(0) + "% / " + (rk.max_gross_pct * 100).toFixed(0) + "%" : "—";
+  $("risk-day").textContent = rk.day_pnl_pct != null ? (rk.day_pnl_pct * 100).toFixed(1) + "% / -" + (rk.daily_loss_limit_pct * 100).toFixed(0) + "%" : "—";
+  const fr = $("risk-fresh");
+  fr.textContent = rk.data_age_s != null ? rk.data_age_s.toFixed(0) + "s" : "—";
+  fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 90 ? "#ff4d4f" : rk.data_age_s > 30 ? "#f1c40f" : "");
 
   const accts = d.accounts || [];
   $("acct-count").textContent = accts.length;

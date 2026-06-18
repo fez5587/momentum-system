@@ -556,3 +556,104 @@ def query_session_pnl(store, session_id: str | None = None) -> dict:
         "expectancy_r": avg_r,
         "trades": list(reversed(trades))[:20],
     }
+
+
+_PROT_ACTIVE = {"held", "new", "accepted", "pending_new",
+                "accepted_for_bidding", "partially_filled"}
+
+
+def query_risk_state(store) -> dict:
+    """Portfolio risk/health for the dashboard gauge — the conditions that
+    silently cost money this session: concentration vs the caps, day P&L vs the
+    daily-loss limit, data freshness, and any UNPROTECTED (naked) long. Returns a
+    status (ok / warn / critical) plus the underlying numbers."""
+    import os
+    from datetime import datetime, timezone
+
+    equity = None
+    day_pnl = None
+    summ = store.query_events(event_type="account_summary_updated", limit=None)
+    ts_latest = None
+    if summ:
+        sp = json.loads(summ[-1].get("payload_json", "{}"))
+        ts_latest = summ[-1].get("timestamp")
+        try:
+            equity = float(sp.get("total_equity") or 0.0) or None
+            le = float(sp.get("last_equity") or 0.0)
+            if equity and le:
+                day_pnl = equity - le
+        except (TypeError, ValueError):
+            pass
+
+    psnap = query_account_positions_snapshot(store)
+    positions = (psnap[-1].get("positions") if psnap else []) or []
+    osnap = query_account_orders_snapshot(store)
+    orders = (osnap[-1].get("orders") if osnap else []) or []
+
+    sell_cover: dict = {}
+    for o in orders:
+        if (o.get("side") == "sell" and o.get("status") in _PROT_ACTIVE
+                and o.get("type") in ("stop", "stop_limit", "limit", "trailing_stop")):
+            q = float(o.get("quantity") or 0) - float(o.get("filled_quantity") or 0)
+            sell_cover[o.get("symbol")] = sell_cover.get(o.get("symbol"), 0.0) + max(q, 0.0)
+
+    open_count = 0
+    gross = 0.0
+    unprotected: list[str] = []
+    for p in positions:
+        try:
+            qty = float(p.get("quantity") if p.get("quantity") is not None
+                        else p.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty <= 0:
+            continue
+        open_count += 1
+        try:
+            gross += abs(float(p.get("market_value") or 0.0))
+        except (TypeError, ValueError):
+            pass
+        if sell_cover.get(p.get("symbol"), 0.0) < qty - 1e-6:
+            unprotected.append(p.get("symbol"))
+
+    gross_pct = (gross / equity) if equity else None
+    day_pnl_pct = (day_pnl / equity) if (equity and day_pnl is not None) else None
+
+    age = None  # data freshness from the latest broker-sync timestamp
+    if ts_latest:
+        try:
+            t = (datetime.fromisoformat(ts_latest.replace("Z", "+00:00"))
+                 if isinstance(ts_latest, str) else ts_latest)
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            age = (datetime.now(timezone.utc) - t).total_seconds()
+        except Exception:  # noqa: BLE001
+            pass
+
+    max_conc = int(os.environ.get("TRADING_MAX_CONCURRENT_POSITIONS", "6"))
+    max_gross = float(os.environ.get("TRADING_MAX_GROSS_NOTIONAL_PCT", "0.60"))
+    daily_loss = float(os.environ.get("TRADING_MAX_DAILY_LOSS_PCT", "0.03"))
+
+    status = "ok"
+    if unprotected:
+        status = "critical"
+    elif day_pnl_pct is not None and day_pnl_pct <= -daily_loss * 0.8:
+        status = "critical"
+    elif (open_count >= max_conc
+          or (gross_pct is not None and gross_pct >= max_gross * 0.9)
+          or (day_pnl_pct is not None and day_pnl_pct <= -daily_loss * 0.5)
+          or (age is not None and age > 90)):
+        status = "warn"
+
+    return {
+        "status": status,
+        "open_positions": open_count,
+        "max_concurrent": max_conc,
+        "gross_pct": round(gross_pct, 3) if gross_pct is not None else None,
+        "max_gross_pct": max_gross,
+        "day_pnl": round(day_pnl, 2) if day_pnl is not None else None,
+        "day_pnl_pct": round(day_pnl_pct, 4) if day_pnl_pct is not None else None,
+        "daily_loss_limit_pct": daily_loss,
+        "data_age_s": round(age, 1) if age is not None else None,
+        "unprotected": unprotected,
+    }
