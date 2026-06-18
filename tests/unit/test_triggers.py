@@ -75,6 +75,18 @@ def test_book_weak_below_thresholds():
     assert b.triggers["AAA"].state == WEAK
 
 
+def test_book_weak_below_min_dollar_vol():
+    """A thin name (low recent $-volume) is too illiquid to fire even if gap/rvol
+    qualify — it would fill at the top of a one-bar spike and reverse."""
+    b = ArmedTriggerBook(gap_min=3, rvol_min=2, min_dollar_vol=10_000)
+    thin = _cand("AAA"); thin["dollar_vol"] = 4_000
+    b.arm([thin])
+    assert b.triggers["AAA"].state == WEAK
+    liquid = _cand("BBB"); liquid["dollar_vol"] = 80_000
+    b.arm([liquid])
+    assert b.triggers["BBB"].state == ARMED
+
+
 def test_book_caps_at_max_armed():
     b = ArmedTriggerBook(max_armed=2)
     b.arm([_cand(f"S{i}") for i in range(5)])

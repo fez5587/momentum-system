@@ -266,6 +266,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
         gap_max=float(os.environ.get("TRIGGER_GAP_MAX", "1e9")),
         rvol_min=float(os.environ.get("TRIGGER_RVOL_MIN", "2.0")),
         min_range_pct=float(os.environ.get("TRIGGER_MIN_RANGE_PCT", "0.004")),
+        min_dollar_vol=float(os.environ.get("TRIGGER_MIN_DOLLAR_VOL", "0")),
     )
 
     return {
@@ -494,6 +495,15 @@ def main(argv: list[str] | None = None) -> int:
             hi, lo, complete = opening_range(bars, orb_bars=orb_bars_v)
             stop = lo * (1.0 - stop_cushion_v) if lo else None
             catalyst = news_map.get(g.symbol, "")
+            # recent $-volume (last 5 regular-hours bars) — the liquidity gate.
+            # rvol is relative; this is the absolute "can it absorb an order" check.
+            dollar_vol = 0.0
+            try:
+                rth = bars[bars["is_regular_hours"]] if "is_regular_hours" in bars else bars
+                tail = rth.tail(5)
+                dollar_vol = float((tail["close"] * tail["volume"]).sum())
+            except Exception:  # noqa: BLE001
+                dollar_vol = 0.0
             candidates.append({
                 "symbol": g.symbol,
                 "gap_pct": g.gap_pct,
@@ -502,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
                 "stop": stop,
                 "range_pct": ((hi - lo) / hi) if (hi and lo and hi > 0) else 0.0,
                 "cum_volume": g.cumulative_volume,
+                "dollar_vol": dollar_vol,
                 "catalyst": catalyst,
                 # a fresh catalyst is WHY a small-cap runs — boost it up the rank;
                 # times an optional manual per-symbol weight (default 1.0)

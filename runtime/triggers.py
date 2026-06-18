@@ -59,6 +59,7 @@ class ArmedTrigger:
     range_pct: float = 0.0        # (high-low)/high — how wide the opening range is
     price: float | None = None    # latest live trade price
     cum_volume: float = 0.0       # session cumulative volume (for liquidity sizing)
+    dollar_vol: float = 0.0       # recent $-volume (liquidity gate: skip thin spikes)
     catalyst: str = ""            # fresh news headline (if any) — why it's hot
     state: str = WAITING
     rank: int = 0
@@ -99,6 +100,10 @@ class ArmedTriggerBook:
     gap_max: float = 1e9        # max gap % — skip blow-off gappers (they fade)
     rvol_min: float = 2.0       # min relative volume to be eligible to fire
     min_range_pct: float = 0.004  # opening range must be at least this wide
+    # min recent $-volume to fire. rvol is RELATIVE, so 2x of near-nothing still
+    # qualifies — thin names then fill at the top of a one-bar spike and reverse
+    # (observed live: WKSP/LNKS/UWMC entered on 100-400 share bars). 0 = off.
+    min_dollar_vol: float = 0.0
     triggers: dict[str, ArmedTrigger] = field(default_factory=dict)
     _lock: object = field(default_factory=threading.RLock, repr=False, compare=False)
 
@@ -110,6 +115,7 @@ class ArmedTriggerBook:
             and self.gap_min <= t.gap_pct <= self.gap_max
             and t.rvol >= self.rvol_min
             and t.range_pct >= self.min_range_pct
+            and t.dollar_vol >= self.min_dollar_vol
         )
 
     @_synced
@@ -141,6 +147,7 @@ class ArmedTriggerBook:
             t.stop = c.get("stop")
             t.range_pct = float(c.get("range_pct") or 0.0)
             t.cum_volume = float(c.get("cum_volume") or 0.0)
+            t.dollar_vol = float(c.get("dollar_vol") or 0.0)
             t.catalyst = c.get("catalyst") or ""
             t.rank = rank
             if not c.get("complete") or t.trigger is None:
