@@ -675,11 +675,22 @@ def watch(interval: float = 3.0, once: bool = typer.Option(False, help="render o
     if once:
         console.print(_render_board(con))
         return
+    from rich.panel import Panel
     try:
         with Live(_render_board(con), console=console, screen=True, refresh_per_second=2) as live:
             while True:
                 _t.sleep(max(0.5, interval))
-                live.update(_render_board(con))
+                try:
+                    live.update(_render_board(con))
+                except Exception as exc:  # noqa: BLE001
+                    # a transient DB hiccup must not kill the board — rebuild the
+                    # connection and keep refreshing
+                    try:
+                        con = _con()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    live.update(Panel(f"[yellow]reconnecting… ({str(exc)[:70]})[/yellow]",
+                                      style="yellow"))
     except KeyboardInterrupt:
         pass
 

@@ -102,21 +102,50 @@ class PgConnection:
         self._conn = conn
         self._temp_schema = temp_schema
 
+    def _reconnect(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+        self._conn = _connect()
+
+    def _run(self, fn):
+        """Run a DB op, reconnecting ONCE on a dropped connection.
+
+        A long-lived connection (e.g. the `momentum watch` board) gets closed by
+        the server on idle/restart; without this the next query raised
+        OperationalError and crashed. Isolated test schemas (temp_schema) can't
+        be safely re-created, so they don't auto-reconnect.
+        """
+        try:
+            return fn()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError):
+            if self._temp_schema:
+                raise
+            self._reconnect()
+            return fn()
+
     # --- DuckDB-style convenience -------------------------------------
     def execute(self, sql: str, params: Any = None) -> _Result:
-        cur = self._conn.cursor()
-        cur.execute(_translate(sql), params)
-        return _Result(cur)
+        def go():
+            cur = self._conn.cursor()
+            cur.execute(_translate(sql), params)
+            return _Result(cur)
+        return self._run(go)
 
     def executemany(self, sql: str, seq) -> "PgConnection":
-        cur = self._conn.cursor()
-        cur.executemany(_translate(sql), list(seq))
-        cur.close()
-        return self
+        seq = list(seq)
+
+        def go():
+            cur = self._conn.cursor()
+            cur.executemany(_translate(sql), seq)
+            cur.close()
+            return self
+        return self._run(go)
 
     # --- psycopg2-style passthrough -----------------------------------
     def cursor(self) -> _Cursor:
-        return _Cursor(self._conn.cursor())
+        return self._run(lambda: _Cursor(self._conn.cursor()))
 
     def commit(self) -> None:  # no-op under autocommit; kept for callers
         self._conn.commit()
