@@ -113,16 +113,19 @@ class AlpacaPaperSync:
 
     def sync_orders(self, status: str = "all", limit: int = 500) -> list[dict] | None:
         try:
-            raw = self.client.get_orders(status=status, limit=limit)
+            raw = self.client.get_orders(status=status, limit=limit, nested=True)
         except Exception as exc:
             logger.warning("alpaca orders sync failed: %s", exc)
             self._emit_health(f"orders: {exc}")
             return None
-        orders = [
-            {
+
+        def _flat(o: dict, parent: dict | None = None) -> dict:
+            return {
                 "broker_order_id": o.get("id"),
                 "client_order_id": o.get("client_order_id"),
-                "symbol": o.get("symbol"),
+                # bracket child legs (stop/take-profit) don't repeat the symbol —
+                # inherit it from the parent so an exit fill isn't dropped.
+                "symbol": o.get("symbol") or (parent or {}).get("symbol"),
                 "side": o.get("side"),
                 "quantity": float(o.get("qty") or 0),
                 "filled_quantity": float(o.get("filled_qty") or 0),
@@ -132,8 +135,16 @@ class AlpacaPaperSync:
                 "filled_avg_price": o.get("filled_avg_price"),
                 "submitted_at": o.get("submitted_at"),
             }
-            for o in raw
-        ]
+
+        # Flatten parent orders AND their child legs. A position exited by its
+        # bracket STOP or TAKE-PROFIT leg has that exit fill as a LEG, not a
+        # top-level order — recording only parents made every stop/TP exit
+        # invisible (positions showed falsely "open", realized P&L understated).
+        orders = []
+        for o in raw:
+            orders.append(_flat(o))
+            for leg in (o.get("legs") or []):
+                orders.append(_flat(leg, parent=o))
         self.store.emit(
             AccountOrdersUpdatedEvent(
                 timestamp=datetime.now(),

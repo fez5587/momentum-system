@@ -176,10 +176,34 @@ class AlpacaPaperClient:
         # the query to the handful of held names (no truncation risk); that's what
         # the exit manager / safety checks must do.
         params: dict = {"status": status, "limit": min(limit, 500),
-                        "nested": str(nested).lower()}
+                        "nested": str(nested).lower(), "direction": "desc"}
         if symbols:
+            # scoped to a few names — well under the cap, one page is complete
             params["symbols"] = ",".join(symbols)
-        return self._trading("GET", "/orders", params=params)
+            return self._trading("GET", "/orders", params=params)
+        # unscoped: page backwards with `until` so the whole history is captured,
+        # not just the most-recent page (the journal needs every fill, incl. early
+        # ones, or realized P&L silently drops the morning's round-trips). Dedup by
+        # id across page boundaries; cap pages as a runaway guard.
+        out: list[dict] = []
+        seen: set = set()
+        until: str | None = None
+        for _ in range(20):
+            page_params = dict(params)
+            if until:
+                page_params["until"] = until
+            page = self._trading("GET", "/orders", params=page_params) or []
+            fresh = [o for o in page if o.get("id") not in seen]
+            for o in fresh:
+                seen.add(o.get("id"))
+            out.extend(fresh)
+            if len(page) < params["limit"]:
+                break  # last page
+            subs = [o.get("submitted_at") for o in page if o.get("submitted_at")]
+            if not subs:
+                break
+            until = min(subs)  # next page: orders older than this one
+        return out
 
     def submit_order(
         self,
