@@ -402,14 +402,14 @@ def test_reentry_blocked_after_position_closes(store):
     svc = TradingExecutionService(
         store, executor=AlpacaPaperExecutor(store, client=cli),
         settings=ExecutionSettings(reentry_block_after_exit=True, auto_approve=True,
-                                   max_daily_loss_pct=0.5),
+                                   reentry_min_loss_pct=0.01, max_daily_loss_pct=0.5),
         session_id="t",
     )
-    cli.pos = [{"symbol": "AAA", "qty": "100"}]
-    svc.expire_stale_entries()                 # records AAA as held
+    cli.pos = [{"symbol": "AAA", "qty": "100", "unrealized_plpc": "-0.05"}]  # down 5%
+    svc.expire_stale_entries()                 # records AAA as held (losing)
     assert "AAA" not in svc._exited_today
-    cli.pos = []                               # AAA's position closes
-    svc.expire_stale_entries()                 # detects the departure
+    cli.pos = []                               # AAA stops out
+    svc.expire_stale_entries()                 # detects the losing departure
     assert "AAA" in svc._exited_today
     # fast path blocked
     res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.0)
@@ -417,6 +417,43 @@ def test_reentry_blocked_after_position_closes(store):
     # slow path blocked too
     emit_signal(store, symbol="AAA", entry=10.0, stop=9.5)
     assert svc.request_approvals_for_ready_signals() == []
+
+
+def test_reentry_allowed_after_winning_exit(store):
+    """A name that scratched or WON is not benched — a quick re-entry can be the
+    right call (the GRAB +513 case the blunt guard would have killed)."""
+    from alpaca_paper.execution import AlpacaPaperExecutor
+
+    class _Cli:
+        def __init__(self):
+            self.pos = []
+
+        def get_positions(self, fresh=False):
+            return list(self.pos)
+
+        def get_account(self):
+            return {"equity": "100000", "last_equity": "100000"}
+
+        def submit_order(self, **kw):
+            return {"id": "o", "status": "new", "filled_qty": "0"}
+
+        def cancel_order(self, order_id):
+            pass
+
+    cli = _Cli()
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=cli),
+        settings=ExecutionSettings(reentry_block_after_exit=True, auto_approve=True,
+                                   reentry_min_loss_pct=0.01, max_daily_loss_pct=0.5),
+        session_id="t",
+    )
+    cli.pos = [{"symbol": "WIN", "qty": "100", "unrealized_plpc": "0.04"}]  # up 4%
+    svc.expire_stale_entries()
+    cli.pos = []                               # WIN exits in profit
+    svc.expire_stale_entries()
+    assert "WIN" not in svc._exited_today       # not benched -> re-entry allowed
+    res = svc.submit_breakout_now("WIN", trigger=10.0, stop=9.5, last_price=10.0)
+    assert res["ok"] is True
 
 
 def test_repeated_backouts_bench_symbol_for_session(store):

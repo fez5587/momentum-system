@@ -117,11 +117,15 @@ class ExecutionSettings:
     # after this many backouts in a session, bench the symbol for the rest of the
     # day (a setup that has failed to fill repeatedly isn't going to start). 0 = no cap.
     max_backouts_per_symbol: int = 3
-    # once a position in a symbol CLOSES (stop-out / trail / target), don't re-enter
-    # that name for the rest of the session. Stops the "throw good money after bad"
-    # re-entry into a name that already failed (observed live: APWC stopped out
-    # -904, was bought back, lost another -645). One round-trip per symbol per day.
+    # once a position in a symbol closes at a LOSS, don't re-enter that name this
+    # session. Stops the "throw good money after bad" re-entry into a name that
+    # already failed (observed live: APWC stopped out -904, was bought back, lost
+    # another -1012). Only blocks LOSING exits (see reentry_min_loss_pct) so a
+    # quick scratch-then-re-enter winner isn't killed (GRAB +513 in the replay).
     reentry_block_after_exit: bool = True
+    # only bench a closed name if it exited DOWN more than this fraction — a real
+    # stop-out, not a scratch/win. 0 = bench on any close (the blunt original).
+    reentry_min_loss_pct: float = 0.01
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -168,6 +172,9 @@ class ExecutionSettings:
                 values.get("TRADING_MAX_BACKOUTS_PER_SYMBOL", "3")
             ),
             reentry_block_after_exit=flag("TRADING_BLOCK_REENTRY_AFTER_EXIT", "1"),
+            reentry_min_loss_pct=float(
+                values.get("TRADING_REENTRY_MIN_LOSS_PCT", "0.01")
+            ),
         )
 
 
@@ -218,6 +225,10 @@ class TradingExecutionService:
         # fresh broker snapshot used to spot departures.
         self._exited_today: set[str] = set()
         self._prev_held: set[str] = set()
+        # last-seen unrealized return (fraction) per held symbol — used to decide,
+        # when a name leaves the book, whether it exited at a real loss (bench) or
+        # a scratch/win (allow re-entry).
+        self._held_ret: dict[str, float] = {}
         # daily-loss circuit breaker: once tripped, no new entries this session
         # (a REAL loss is permanent for the session — a bounce can't re-open it)
         self._halted = False
@@ -913,27 +924,53 @@ class TradingExecutionService:
             return f"cooldown {secs:.0f}s (backout {n})"
         return f"backout {n}"
 
+    def _broker_positions(self) -> list[dict] | None:
+        """Fresh broker positions (full dicts), or None if unreadable."""
+        client = getattr(self.executor, "client", None)
+        if client is None or not hasattr(client, "get_positions"):
+            return None
+        try:
+            return client.get_positions(fresh=True) or []
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("broker positions unreadable in re-entry guard: %s", exc)
+            return None
+
     def _note_position_exits(self) -> None:
-        """Detect names whose position CLOSED since last pass and bench them from
-        re-entry this session. A symbol leaving the broker's held set means its
-        round-trip is done — re-buying it is throwing good money after bad."""
+        """Detect names whose position closed since last pass and bench the ones
+        that exited at a real LOSS from re-entry this session — re-buying a name
+        that just stopped out is throwing good money after bad. A name that
+        scratched or won is left alone (a quick re-entry can be the right call)."""
         if not self.settings.reentry_block_after_exit:
             return
-        held = self._broker_held_symbols()
-        if held is None:   # broker unreadable — don't trust a stale snapshot here
+        positions = self._broker_positions()
+        if positions is None:   # broker unreadable — don't trust a stale snapshot
             return
-        departed = self._prev_held - held
-        if departed:
-            self._exited_today |= departed
-            for sym in departed:
-                self.store.emit(RiskRuleTriggeredEvent(
-                    timestamp=datetime.now(), mode=self.mode,
-                    correlation_id=self.session_id,
-                    message=f"{sym} position closed — benched from re-entry today",
-                    rule_type="reentry_block", rule_value=0.0,
-                    current_state={"symbol": sym}, action_taken="reentry_blocked",
-                ))
-        self._prev_held = set(held)
+        held: set[str] = set()
+        for p in positions:
+            sym = p.get("symbol")
+            if not sym:
+                continue
+            held.add(sym)
+            try:
+                self._held_ret[sym] = float(p.get("unrealized_plpc") or 0.0)
+            except (TypeError, ValueError):
+                pass
+        thr = abs(float(self.settings.reentry_min_loss_pct or 0.0))
+        for sym in (self._prev_held - held):
+            last_ret = self._held_ret.pop(sym, 0.0)
+            if thr > 0 and last_ret >= -thr:
+                continue  # scratched or won — allow re-entry
+            self._exited_today.add(sym)
+            self.store.emit(RiskRuleTriggeredEvent(
+                timestamp=datetime.now(), mode=self.mode,
+                correlation_id=self.session_id,
+                message=(f"{sym} closed at {last_ret*100:+.1f}% — benched from "
+                         f"re-entry today"),
+                rule_type="reentry_block", rule_value=last_ret,
+                current_state={"symbol": sym, "exit_return": last_ret},
+                action_taken="reentry_blocked",
+            ))
+        self._prev_held = held
 
     def expire_stale_entries(self) -> list[dict]:
         """Back out of unfilled entries that timed out or broke their trigger.
