@@ -162,14 +162,24 @@ class AlpacaPaperClient:
         return self._cached("positions", lambda: self._trading("GET", "/positions"))
 
     def get_orders(
-        self, status: str = "all", limit: int = 100, nested: bool = True
+        self, status: str = "all", limit: int = 500, nested: bool = True,
+        symbols: list[str] | None = None,
     ) -> list[dict]:
         # nested=true includes bracket child legs (stop/target) so working risk
         # isn't under-reported in the orders snapshot.
-        return self._trading(
-            "GET", "/orders",
-            params={"status": status, "limit": limit, "nested": str(nested).lower()},
-        )
+        #
+        # IMPORTANT: Alpaca's `limit` truncates to the most-RECENT orders (and
+        # counts child legs toward the cap). On a busy day the order list runs to
+        # hundreds (every backed-out entry is an order), so a small limit silently
+        # drops the stop legs of older OPEN positions — a stop-leg lookup then
+        # reads "no stop" on a fully-protected position. Pass `symbols` to scope
+        # the query to the handful of held names (no truncation risk); that's what
+        # the exit manager / safety checks must do.
+        params: dict = {"status": status, "limit": min(limit, 500),
+                        "nested": str(nested).lower()}
+        if symbols:
+            params["symbols"] = ",".join(symbols)
+        return self._trading("GET", "/orders", params=params)
 
     def submit_order(
         self,

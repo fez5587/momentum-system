@@ -57,9 +57,13 @@ class LiveExitManager:
     _ACTIVE = {"held", "new", "accepted", "pending_new",
                "accepted_for_bidding", "partially_filled"}
 
-    def _all_orders(self):
+    def _all_orders(self, symbols=None):
+        # scope to the held symbols — Alpaca's `limit` keeps only the most-recent
+        # orders, so on a busy day an unscoped query drops older positions' stop
+        # legs and we'd misread a protected position as naked.
         try:
-            return self.client.get_orders(status="all", limit=100, nested=True)
+            return self.client.get_orders(status="all", limit=500, nested=True,
+                                          symbols=list(symbols) if symbols else None)
         except Exception:  # noqa: BLE001
             return None
 
@@ -126,8 +130,9 @@ class LiveExitManager:
         if not held:
             return []
         # fetch the orders snapshot ONCE per pass (status="all" is the heavy call;
-        # reuse it for every position's stop-leg + entry-time lookups)
-        orders = self._all_orders()
+        # reuse it for every position's stop-leg + entry-time lookups), scoped to
+        # the held symbols so a busy day's order volume can't truncate the legs.
+        orders = self._all_orders(held.keys())
 
         actions: list[str] = []
         for sym, p in held.items():
