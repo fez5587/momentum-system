@@ -54,9 +54,15 @@ def _daily_gappers(con, sess, universe):
     minute-backfill the handful that matter, not all 100 names."""
     out = []
     for sym in universe:
+        # Bars ON OR BEFORE the session date, newest first — so rows[0] is the
+        # session day and rows[1] the prior trading day. Without the `<= sess`
+        # bound this pulled the LATEST bar (always the most recent date in the
+        # table), so replaying any past date saw rows[0] != sess and skipped
+        # EVERY symbol — silently reporting "no qualifying gappers" for all
+        # history and making multi-day backtesting impossible.
         rows = con.execute(
             "SELECT trade_date, open, close, volume FROM daily_bars WHERE symbol=? "
-            "ORDER BY trade_date DESC LIMIT 25", [sym]).fetchall()
+            "AND trade_date <= ? ORDER BY trade_date DESC LIMIT 25", [sym, sess]).fetchall()
         if len(rows) < 2 or str(rows[0][0]) != str(sess):
             continue
         t_open, t_close, t_vol = float(rows[0][1]), float(rows[0][2]), float(rows[0][3])
