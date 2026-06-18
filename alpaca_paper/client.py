@@ -151,7 +151,14 @@ class AlpacaPaperClient:
     def get_account(self) -> dict:
         return self._cached("account", lambda: self._trading("GET", "/account"))
 
-    def get_positions(self) -> list[dict]:
+    def get_positions(self, fresh: bool = False) -> list[dict]:
+        # fresh=True bypasses the TTL cache — REQUIRED for the naked-stop guard,
+        # which must never decide an order is unfilled off a stale snapshot.
+        if fresh:
+            val = self._trading("GET", "/positions")
+            with self._cache_lock:
+                self._cache["positions"] = (val, time.monotonic())
+            return val
         return self._cached("positions", lambda: self._trading("GET", "/positions"))
 
     def get_orders(

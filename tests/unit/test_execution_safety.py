@@ -63,7 +63,7 @@ def test_close_session_flattens_and_blocks_new_entries():
     closed = []
 
     class _C(_FakeClient):
-        def get_positions(self):
+        def get_positions(self, fresh=False):
             return [{"symbol": "AAA", "qty": "100"}, {"symbol": "BBB", "qty": "50"}]
 
         def close_position(self, symbol, qty=None, percentage=None):

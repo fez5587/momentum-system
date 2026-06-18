@@ -291,6 +291,10 @@ def test_unfilled_entry_invalidated_by_price_break(store):
     )
     service.tick()
     assert len(service._armed) == 1
+    # backdate past the fill-grace window so the price-break logic can act
+    from datetime import datetime, timedelta
+    for a in service._armed.values():
+        a["armed_at"] = datetime.now() - timedelta(seconds=30)
     # price holds above entry -> no back-out
     assert service.expire_stale_entries() == []
     # price breaks back below the entry trigger -> cancel

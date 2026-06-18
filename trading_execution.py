@@ -96,6 +96,10 @@ class ExecutionSettings:
     # cap the marketable limit so a breakout FILLS on a runner instead of
     # resting forever at the trigger, while still bounding slippage.
     trigger_slippage_pct: float = 0.004
+    # don't cancel an entry within this many seconds of arming — a marketable
+    # fill needs a moment to confirm at the broker; cancelling first strips its
+    # bracket (the naked-stop failure mode).
+    entry_grace_seconds: float = 5.0
     # --- account-aware sizing (matters most on a small REAL account) -------
     # one position's dollar value <= this fraction of equity, so a single trade
     # can't exceed buying power (critical at $300: 3 positions must fit, so ~1/3).
@@ -137,6 +141,7 @@ class ExecutionSettings:
             trigger_slippage_pct=float(
                 values.get("TRADING_TRIGGER_SLIP_PCT", "0.004")
             ),
+            entry_grace_seconds=float(values.get("TRADING_ENTRY_GRACE_SECONDS", "5")),
             max_position_pct=float(values.get("TRADING_MAX_POSITION_PCT", "0.33")),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
@@ -251,7 +256,7 @@ class TradingExecutionService:
         if client is None or not hasattr(client, "get_positions"):
             return None
         try:
-            positions = client.get_positions() or []
+            positions = client.get_positions(fresh=True) or []
             return {str(p.get("symbol")) for p in positions if p.get("symbol")}
         except Exception as exc:  # noqa: BLE001
             logger.warning("broker positions unreadable in entry guard: %s", exc)
@@ -854,6 +859,11 @@ class TradingExecutionService:
             # (this is the naked-stop fix: cancelling here killed the stop leg).
             if symbol in broker_held:
                 self._armed.pop(order_id, None)
+                continue
+            # grace window: a just-armed entry may still be filling — don't strip
+            # its bracket before the fill can confirm (belt to the fresh-positions
+            # check above; together they close the naked-stop race)
+            if (now - armed["armed_at"]).total_seconds() < self.settings.entry_grace_seconds:
                 continue
 
             armed["checks"] += 1

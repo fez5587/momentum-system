@@ -126,7 +126,7 @@ class _FakeClient:
     def get_account(self):
         return self.account
 
-    def get_positions(self):
+    def get_positions(self, fresh=False):
         return self._positions
 
     def close_position(self, symbol):
@@ -196,3 +196,21 @@ def test_guard_never_cancels_a_filled_position():
     assert backed == []              # not backed out
     assert client.canceled == []     # stop/TP legs NOT stripped
     assert "o1" not in svc._armed    # but we stop tracking the filled entry
+
+
+def test_guard_grace_window_protects_just_armed_entry():
+    """A marketable entry that just armed (still filling) must NOT be cancelled
+    even if price dipped below the trigger — cancelling strips its bracket."""
+    from datetime import datetime
+    store = EventStore(":memory:")
+    client = _FakeClient()  # no positions reported yet (fill not reflected)
+    svc = TradingExecutionService(
+        store, executor=AlpacaPaperExecutor(store, client=client),
+        settings=ExecutionSettings(entry_invalidate_pct=0.0, entry_grace_seconds=5,
+                                   max_daily_loss_pct=0.5),
+        session_id="t", price_provider=lambda s: 0.5,  # well below trigger
+    )
+    svc._armed["o1"] = {"symbol": "AAA", "entry_price": 1.0, "broker_order_id": "b1",
+                        "armed_at": datetime.now(), "checks": 0}  # armed just now
+    assert svc.expire_stale_entries() == []     # grace -> not cancelled
+    assert "o1" in svc._armed and client.canceled == []
