@@ -18,7 +18,7 @@ class _FakeBroker:
     def get_positions(self):
         return self._positions
 
-    def get_orders(self, status="open", limit=200, nested=True):
+    def get_orders(self, status="open", limit=200, nested=True, symbols=None):
         return [self._stop_leg]
 
     def replace_order(self, order_id, stop_price=None, **kw):
@@ -58,6 +58,39 @@ def test_manager_ratchets_stop_up_and_never_cancels():
     order_id, new_stop = broker.replaced[-1]
     assert order_id == "stop1" and new_stop > 9.0   # ratcheted UP
     assert broker.canceled == []                    # never cancels the protective leg
+
+
+def test_flatten_cancels_protective_orders_then_closes():
+    """A market close is rejected while the bracket legs hold the qty
+    (held_for_orders). _flatten must cancel the protective sells FIRST, then
+    liquidate — otherwise the trail/first-red exit 403s every pass forever."""
+    class _HeldBroker:
+        def __init__(self):
+            self.canceled = []
+            self.closed = []
+            self._held = True  # qty locked by the resting protective orders
+
+        def close_position(self, symbol, qty=None, percentage=None):
+            if self._held:
+                raise RuntimeError("403 insufficient qty available for order")
+            self.closed.append(symbol)
+            return {"id": "c"}
+
+        def cancel_order(self, order_id):
+            self.canceled.append(order_id)
+            self._held = False  # releasing the legs frees the shares
+
+    broker = _HeldBroker()
+    mgr = LiveExitManager(broker, EventStore(":memory:"), lambda s: None,
+                          cfg=ExitConfig(trail_mode=TRAIL_PRIOR_LOW), session_id="t")
+    orders = [
+        {"symbol": "AAA", "side": "sell", "status": "held", "type": "stop", "id": "stop1"},
+        {"symbol": "AAA", "side": "sell", "status": "new", "type": "limit", "id": "tp1"},
+        {"symbol": "BBB", "side": "sell", "status": "held", "type": "stop", "id": "other"},
+    ]
+    mgr._flatten("AAA", orders)
+    assert set(broker.canceled) == {"stop1", "tp1"}   # released AAA's qty (not BBB's)
+    assert broker.closed == ["AAA"]                    # then liquidated
 
 
 def test_manager_noop_for_static_bracket():

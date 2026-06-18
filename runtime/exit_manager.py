@@ -14,6 +14,7 @@ path.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 
 import pandas as pd
@@ -84,6 +85,37 @@ class LiveExitManager:
                     sp = c.get("stop_price")
                     return (c.get("id"), float(sp) if sp else None)
         return (None, None)
+
+    def _flatten(self, symbol: str, orders) -> None:
+        """Market-close a position that has resting protective orders.
+
+        The bracket stop/TP legs RESERVE the full quantity (held_for_orders), so
+        a bare close_position is rejected 403 "insufficient qty available". We
+        must cancel the protective sell legs first to release the shares, THEN
+        liquidate. Brief naked window between cancel and close is acceptable here
+        because the intent IS to exit — but retry the close so a not-yet-settled
+        cancel doesn't leave the position hanging (it would re-arm protection
+        next pass otherwise). Raises if the close ultimately fails (caller logs).
+        """
+        if orders:
+            for o in orders:
+                for c in [o, *(o.get("legs") or [])]:
+                    sym = c.get("symbol") or o.get("symbol")
+                    if (sym == symbol and c.get("side") == "sell"
+                            and c.get("status") in self._ACTIVE and c.get("id")):
+                        try:
+                            self.client.cancel_order(c.get("id"))
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("cancel protective %s failed: %s", symbol, exc)
+        last_exc = None
+        for attempt in range(4):  # let the cancels settle so qty frees up
+            try:
+                self.client.close_position(symbol)
+                return
+            except Exception as exc:  # noqa: BLE001
+                last_exc = exc
+                time.sleep(0.3 * (attempt + 1))
+        raise last_exc if last_exc else RuntimeError("flatten failed")
 
     def _entry_time(self, symbol: str, orders):
         """UTC-naive fill time of the most recent FILLED buy entry for symbol."""
@@ -163,7 +195,7 @@ class LiveExitManager:
             # (1) first-red: exit the whole position now
             if d.exit_now:
                 try:
-                    self.client.close_position(sym)
+                    self._flatten(sym, orders)
                     self._emit(sym, f"first-red exit {sym} @~mkt", "exit_first_red",
                                {"reason": d.reason})
                     actions.append(f"{sym} first-red exit")
@@ -195,7 +227,7 @@ class LiveExitManager:
                     # prior swing low) — a sell-stop above market would be
                     # rejected, so exit at market now (this is the trail firing).
                     try:
-                        self.client.close_position(sym)
+                        self._flatten(sym, orders)
                         self._emit(sym, f"trail breached, exit {sym} @~{last_px:.2f}",
                                    "exit_trail", {"trail": d.desired_stop, "price": last_px})
                         actions.append(f"{sym} trail-exit @{last_px:.2f}")
