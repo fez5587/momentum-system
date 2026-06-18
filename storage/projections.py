@@ -515,10 +515,38 @@ def query_session_pnl(store, session_id: str | None = None) -> dict:
     win_rate = round(wins / closed_count, 3) if closed_count else None
     avg_r = round(sum(r_multiples) / len(r_multiples), 2) if r_multiples else None
 
+    # BROKER-AUTHORITATIVE day P&L. The closed-event `realized` above is $0
+    # whenever position_closed events aren't emitted (they currently aren't), so
+    # the strip read $0 on a real -$2,322 day — the operator flew blind. Prefer
+    # the broker equity delta: day P&L = latest equity - prior-session close
+    # (last_equity); matched (realized) = day P&L - current unrealized.
+    broker_day = None
+    summ = store.query_events(event_type="account_summary_updated", limit=None)
+    if summ:
+        sp = json.loads(summ[-1].get("payload_json", "{}"))  # ASC order -> latest
+        try:
+            eq = float(sp.get("total_equity") or 0.0)
+            le = float(sp.get("last_equity") or 0.0)
+            if eq and le:
+                broker_day = eq - le
+        except (TypeError, ValueError):
+            pass
+
+    if broker_day is not None:
+        realized_out = round(broker_day - unrealized, 2)   # broker-authoritative matched
+        total_out = round(broker_day, 2)
+        pnl_source = "broker"
+    else:
+        realized_out = round(realized, 2)
+        total_out = round(realized + unrealized, 2)
+        pnl_source = "closed_events"
+
     return {
-        "realized_pnl": round(realized, 2),
+        "realized_pnl": realized_out,
         "unrealized_pnl": round(unrealized, 2),
-        "total_pnl": round(realized + unrealized, 2),
+        "total_pnl": total_out,
+        "broker_day_pnl": round(broker_day, 2) if broker_day is not None else None,
+        "pnl_source": pnl_source,
         "wins": wins,
         "losses": losses,
         "closed_trades": closed_count,
