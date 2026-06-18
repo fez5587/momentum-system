@@ -554,6 +554,46 @@ def _open_unrealized(con):
     return total
 
 
+_PROT_ACTIVE = {"held", "new", "accepted", "pending_new",
+                "accepted_for_bidding", "partially_filled"}
+
+
+def _unprotected_positions(con):
+    """Long positions whose RESTING protective sell coverage is short of the held
+    quantity — i.e. naked / under-protected. Computed from the latest synced
+    positions + orders snapshots (the order sync now flattens bracket legs, so a
+    held stop/TP leg is visible). This is the alarm we lacked when APWC/NOWL went
+    naked and the board showed nothing. Returns [{symbol, qty, protected}]."""
+    pos_ev = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='account_positions_updated' "
+        "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    ord_ev = con.execute(
+        "SELECT payload_json FROM events WHERE event_type='account_orders_updated' "
+        "ORDER BY timestamp DESC LIMIT 1").fetchall()
+    if not pos_ev:
+        return []
+    positions = json.loads(pos_ev[0][0]).get("positions") or []
+    orders = json.loads(ord_ev[0][0]).get("orders") or [] if ord_ev else []
+    sell_cover: dict = {}
+    for o in orders:
+        if (o.get("side") == "sell" and o.get("status") in _PROT_ACTIVE
+                and o.get("type") in ("stop", "stop_limit", "limit", "trailing_stop")):
+            sym = o.get("symbol")
+            qty = float(o.get("quantity") or 0) - float(o.get("filled_quantity") or 0)
+            sell_cover[sym] = sell_cover.get(sym, 0.0) + max(qty, 0.0)
+    out = []
+    for p in positions:
+        sym = p.get("symbol")
+        try:
+            qty = float(p.get("quantity") if p.get("quantity") is not None
+                        else p.get("qty") or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if qty > 0 and sell_cover.get(sym, 0.0) < qty - 1e-6:  # long, under-covered
+            out.append({"symbol": sym, "qty": qty, "protected": sell_cover.get(sym, 0.0)})
+    return out
+
+
 def _matched_realized(day_pnl, open_unreal, fifo_realized):
     """Broker-authoritative realized for the header: day P&L minus current open
     unrealized, so the parenthetical reconciles exactly (matched + open == day
@@ -650,16 +690,25 @@ def _render_board(con):
         rk.add_row(str(ts)[11:19], m or "")
 
     n_eval = len(_latest_eval_board(con))
+    # naked/under-protected alarm — the failure that cost us this session and the
+    # board never showed. A red banner the instant a held long lacks stop coverage.
+    naked = _unprotected_positions(con)
+    naked_line = ""
+    if naked:
+        names = ", ".join(f"{n['symbol']}({n['protected']:.0f}/{n['qty']:.0f})" for n in naked)
+        naked_line = (f"\n[bold white on red] ⚠ UNPROTECTED: {names} — held long with no/short "
+                      f"protective stop [/]")
     header = Panel(
         f"[bold]momentum live[/bold]   "
         f"[{pcolor}]{phase}[/{pcolor}] [dim]{detail}[/dim]   "
         f"equity [green]{eq}[/green]   "
         f"day P&L [bold {dcol}]{day_pnl:+,.0f}[/]   "
         f"[{hb_color}]♥ {hb_text}[/{hb_color}]   "
-        f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scanning\n"
-        f"[dim]hunting $1–20 gappers (≥ gap% on ≥ 2× volume); buy the break of the "
+        f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scanning"
+        f"{naked_line}\n"
+        f"[dim]hunting $1–5 gappers (≥ gap% on ≥ 2× volume); buy the break of the "
         f"opening-range high, stop at its low · Ctrl-C to exit[/dim]",
-        style="cyan")
+        style="red" if naked else "cyan")
     return Group(header, tt, st, pt, rk)
 
 

@@ -12,7 +12,13 @@ class AlpacaPaperSettings:
     secret_key: str = ""
     trading_base_url: str = "https://paper-api.alpaca.markets"
     data_base_url: str = "https://data.alpaca.markets"
+    # live realtime feed. IEX is free + realtime but THIN (~2-5% of true volume),
+    # which corrupts every rvol / $-volume decision computed off it.
     feed: str = "iex"
+    # historical/backfill feed. SIP is the consolidated tape (full volume) — use
+    # it for backtests/backfill so rvol & $-volume reflect reality. SIP realtime
+    # has a ~15-min embargo on free plans, which is why live stays on `feed`.
+    backfill_feed: str = "sip"
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "AlpacaPaperSettings":
@@ -27,11 +33,13 @@ class AlpacaPaperSettings:
         )
         base = values.get("APCA_API_BASE_URL", "https://paper-api.alpaca.markets")
         feed = values.get("ALPACA_DATA_FEED", "iex")
+        backfill_feed = values.get("ALPACA_BACKFILL_FEED", "sip")
         return cls(
             api_key=api_key,
             secret_key=secret,
             trading_base_url=base.rstrip("/"),
             feed=feed,
+            backfill_feed=backfill_feed,
         )
 
     @property

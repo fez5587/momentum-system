@@ -183,6 +183,17 @@ def test_breakout_now_dedups_second_attempt():
     assert res2["ok"] is False and res2["skipped"] == "already_active"
 
 
+def test_breakout_now_blocks_when_gross_notional_full():
+    """Portfolio gross-notional cap: when open positions already fill the budget,
+    a new entry is blocked instead of piling the book toward ~100% gross."""
+    # equity 100k, cap 0.60 -> 60k budget; an open position worth 60k exhausts it
+    client = _FakeClient(positions=[{"symbol": "HELD", "qty": "1",
+                                     "market_value": "60000"}])
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.0)
+    assert res["ok"] is False and res["skipped"] == "gross_notional_cap"
+
+
 def test_breakout_now_rejects_bad_geometry():
     store, svc = _svc(_FakeClient())
     res = svc.submit_breakout_now("AAA", 10.0, 10.5, last_price=10.0)  # stop > entry

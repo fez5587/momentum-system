@@ -123,7 +123,18 @@ class AlpacaPaperClient:
                     raw = resp.read().decode()
                     return json.loads(raw) if raw else {}
             except urllib.error.HTTPError as exc:
-                # a real API response (4xx/5xx) — do not retry, surface it
+                # 429 (rate limit) and 5xx (server) are TRANSIENT — retry with
+                # backoff, honoring Retry-After. Previously these hard-failed,
+                # which fed silent-stale ingest (a rate-limited bar fetch looked
+                # like a clean "0 rows" pass). Other 4xx are real — surface them.
+                if exc.code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                    try:
+                        delay = float(retry_after) if retry_after else 0.0
+                    except (TypeError, ValueError):
+                        delay = 0.0
+                    _time.sleep(max(delay, 0.5 * (2 ** attempt)))  # exp backoff floor
+                    continue
                 raise AlpacaApiError(exc.code, exc.read().decode(errors="replace")) from exc
             except urllib.error.URLError:
                 # transient network/DNS (e.g. gaierror) — retry a couple times

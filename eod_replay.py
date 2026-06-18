@@ -107,9 +107,14 @@ def main(argv=None):
     print(f"daily-screen gappers (${PRICE_MIN:g}-{PRICE_MAX:g}, gap {GAP_MIN:g}-{GAP_MAX:g}%, "
           f"rvol>={RVOL_MIN:g}): {len(gapper_syms)}")
 
-    # 3) minute-backfill ONLY the gappers (fast), then rank them, and grow the dataset
-    ing = ingest_live_minute_bars(con, client, gapper_syms, lookback_minutes=440)
-    print(f"backfilled {ing.minute_rows} minute rows across {len(ing.symbols)} gappers\n")
+    # 3) minute-backfill ONLY the gappers (fast), then rank them, and grow the
+    # dataset. Use the SIP (full-volume) feed so rvol/$-volume in the replay
+    # reflect REAL volume — the live IEX feed sees only ~2-5% of it, which was
+    # silently corrupting every volume-based backtest conclusion.
+    ing = ingest_live_minute_bars(con, client, gapper_syms, lookback_minutes=440,
+                                  feed=client.settings.backfill_feed)
+    print(f"backfilled {ing.minute_rows} minute rows ({client.settings.backfill_feed}) "
+          f"across {len(ing.symbols)} gappers\n")
     keep = set(gapper_syms)
     gappers = [g for g in scan_gappers(con, sess, min_gap_pct=GAP_MIN, min_relative_volume=RVOL_MIN,
                                        price_min=PRICE_MIN, price_max=PRICE_MAX, limit=200)

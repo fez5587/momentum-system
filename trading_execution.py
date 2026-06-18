@@ -108,6 +108,12 @@ class ExecutionSettings:
     # liquidity cap: shares <= this fraction of the symbol's day volume so at
     # SIZE you don't move the market. 0 = off (irrelevant at small size).
     liquidity_max_volume_pct: float = 0.0
+    # PORTFOLIO gross-notional cap: total $ across ALL open+pending positions must
+    # stay under this fraction of equity. Without it, max_concurrent (6) x
+    # max_position_pct (0.16) = ~96% gross in correlated small-cap gappers — one
+    # regime move hits the whole book together. A later entry is shrunk to fit the
+    # remaining budget, or blocked if none remains. 0 = off.
+    max_gross_notional_pct: float = 0.60
     # --- backout cooldown (anti-thrash) ------------------------------------
     # after an entry backs out (timeout / price-break) the symbol is benched for
     # this many seconds before it can re-arm. Without it a breakout that won't
@@ -164,6 +170,9 @@ class ExecutionSettings:
             max_position_pct=float(values.get("TRADING_MAX_POSITION_PCT", "0.33")),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
+            ),
+            max_gross_notional_pct=float(
+                values.get("TRADING_MAX_GROSS_NOTIONAL_PCT", "0.60")
             ),
             backout_cooldown_seconds=float(
                 values.get("TRADING_BACKOUT_COOLDOWN_SECONDS", "180")
@@ -285,6 +294,23 @@ class TradingExecutionService:
             except Exception:  # noqa: BLE001
                 pass
         return self.equity
+
+    def _remaining_gross_budget(self, equity: float) -> float:
+        """$ of new notional still allowed under the portfolio gross-notional cap
+        (cap*equity minus the market value of currently-open positions). Inf when
+        the cap is disabled. Caps how big the NEXT entry can be so the whole book
+        can't pile into ~100% gross of correlated small-caps."""
+        cap = float(self.settings.max_gross_notional_pct or 0.0)
+        if cap <= 0:
+            return float("inf")
+        positions = self._broker_positions() or []
+        open_gross = 0.0
+        for p in positions:
+            try:
+                open_gross += abs(float(p.get("market_value") or 0.0))
+            except (TypeError, ValueError):
+                pass
+        return max(0.0, cap * equity - open_gross)
 
     def _broker_held_symbols(self) -> set[str] | None:
         """Symbols the broker reports as OPEN POSITIONS right now (truth).
@@ -504,6 +530,10 @@ class TradingExecutionService:
                 continue
 
             eq = self._current_equity()
+            # cap this entry to BOTH the per-position limit AND the portfolio's
+            # remaining gross-notional budget (so the book can't pile into ~100%).
+            pos_cap = min(eq * self.settings.max_position_pct,
+                          self._remaining_gross_budget(eq))
             sizing = calculate_position_size(
                 float(entry),
                 float(stop),
@@ -512,7 +542,7 @@ class TradingExecutionService:
                     risk_per_trade_pct=self.settings.risk_per_trade_pct,
                     default_equity=self.settings.default_equity,
                 ),
-                max_position_value=eq * self.settings.max_position_pct,
+                max_position_value=pos_cap,
             )
             if sizing.position_size <= 0:
                 continue
@@ -650,6 +680,11 @@ class TradingExecutionService:
         eq = self._current_equity()
         liq = self.settings.liquidity_max_volume_pct
         max_shares = int(liq * cum_volume) if (liq > 0 and cum_volume > 0) else None
+        # per-position cap AND remaining portfolio gross-notional budget
+        pos_cap = min(eq * self.settings.max_position_pct,
+                      self._remaining_gross_budget(eq))
+        if pos_cap <= 0:
+            return {"ok": False, "skipped": "gross_notional_cap"}
         sizing = calculate_position_size(
             entry_ref,
             stop_f,
@@ -658,7 +693,7 @@ class TradingExecutionService:
                 risk_per_trade_pct=self.settings.risk_per_trade_pct,
                 default_equity=self.settings.default_equity,
             ),
-            max_position_value=eq * self.settings.max_position_pct,
+            max_position_value=pos_cap,
             max_shares=max_shares,
         )
         if sizing.position_size <= 0:

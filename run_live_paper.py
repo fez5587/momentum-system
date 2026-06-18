@@ -347,6 +347,12 @@ def main(argv: list[str] | None = None) -> int:
     lookback = int(os.environ.get("LIVE_BARS_LOOKBACK_MINUTES", "240"))
     refresh_lb = int(os.environ.get("LIVE_BARS_REFRESH_MINUTES", "20"))
     _ingest_first = {"v": True}
+    # freshness watchdog: warn when the newest bar is older than this during RTH.
+    _ingest_stale_secs = float(os.environ.get("INGEST_STALE_SECONDS", "180"))
+    # block arming on stale data? OFF by default — observability first; a
+    # mis-tuned threshold must not silently halt trading.
+    _ingest_stale_block = os.environ.get("INGEST_STALE_BLOCK", "0").strip() in {"1", "true", "yes"}
+    _data_stale = {"v": False}
 
     def _first_pass_lookback() -> int:
         # The first ingest must cover the whole session-so-far so the
@@ -363,6 +369,31 @@ def main(argv: list[str] | None = None) -> int:
             since_open = 0.0
         return int(max(lookback, since_open + 15))
 
+    def _freshest_bar_age():
+        """Seconds since the newest stored minute bar (UTC), or None. The bar
+        timestamp is its START, and IEX lags ~1 bar, so ~90-120s is NORMAL during
+        RTH — only flag well beyond that."""
+        from datetime import timezone
+        try:
+            row = rt["research_con"].execute(
+                "SELECT max(timestamp) FROM minute_bars WHERE session_date = ?",
+                [_now_session_date()]).fetchone()
+            if not row or not row[0]:
+                return None
+            ts = row[0]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _is_rth():
+        from zoneinfo import ZoneInfo
+        n = datetime.now(ZoneInfo("America/New_York"))
+        return n.weekday() < 5 and (9, 30) <= (n.hour, n.minute) < (16, 0)
+
     def step_ingest():
         if not client:
             return "skipped (no keys)"
@@ -372,6 +403,21 @@ def main(argv: list[str] | None = None) -> int:
         else:
             lb = refresh_lb
         res = ingest_live_minute_bars(rt["research_con"], client, symbols, lookback_minutes=lb)
+        # Freshness watchdog: 45% of passes historically returned 0 rows with NO
+        # error — indistinguishable from a feed outage. Make staleness VISIBLE
+        # (emit + display); hard-block arming only if explicitly enabled, so a
+        # mis-tuned threshold can't silently halt trading.
+        age = _freshest_bar_age()
+        stale = bool(_is_rth() and age is not None and age > _ingest_stale_secs)
+        _data_stale["v"] = stale
+        if stale:
+            rt["store"].emit(ModuleTickEvent(
+                timestamp=datetime.now(), mode=EventMode.PAPER,
+                correlation_id=rt["session_id"],
+                message=f"INGEST STALE: freshest bar {age:.0f}s old (> {_ingest_stale_secs:.0f}s)",
+                module="ingestion", stage="stale", duration_ms=0.0,
+                input_count=len(symbols), output_count=res.minute_rows,
+                metrics={"bar_age_s": age}, errors=[{"error": "stale_data"}]))
         rt["store"].emit(
             ModuleTickEvent(
                 timestamp=datetime.now(),
@@ -387,7 +433,9 @@ def main(argv: list[str] | None = None) -> int:
                 errors=[{"error": e} for e in res.errors],
             )
         )
-        return f"{res.minute_rows} rows (lookback {lb}m)" + (f", errors={res.errors}" if res.errors else "")
+        note = (f" STALE({age:.0f}s)" if stale else "")
+        return (f"{res.minute_rows} rows (lookback {lb}m){note}"
+                + (f", errors={res.errors}" if res.errors else ""))
 
     def step_watch():
         res = rt["watcher"].tick(_now_session_date())
@@ -465,6 +513,10 @@ def main(argv: list[str] | None = None) -> int:
         from research.ingestion.signals import scan_gappers
         from strategy.evaluation.structure import opening_range
 
+        # don't arm new triggers on stale data when blocking is enabled — a break
+        # computed off a frozen feed could fire into a name that has already moved.
+        if _ingest_stale_block and _data_stale["v"]:
+            return "skipped: data stale (INGEST_STALE_BLOCK)"
         session_date = _now_session_date()
         # fresh catalysts (the discover step ingests the feeds; we just read them)
         news_map = recent_news_map(
