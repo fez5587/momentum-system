@@ -43,6 +43,19 @@ class EventStore:
                 created_at TIMESTAMP DEFAULT current_timestamp
             );
         """)
+        # Composite (event_type, timestamp DESC) — THE hot-path index. Almost
+        # every projection runs `WHERE event_type=? ORDER BY timestamp DESC
+        # LIMIT n` (latest snapshot of a type). With only a plain timestamp
+        # index, looking up the latest of a STALE type backward-scans the whole
+        # table (measured: 235k rows filtered, ~370ms). This makes it an index
+        # range seek (sub-ms) regardless of how long ago that type last fired,
+        # and also serves bare `WHERE event_type=?` as the leftmost prefix.
+        cursor.execute("""
+            CREATE INDEX IF NOT EXISTS idx_events_type_ts
+            ON events(event_type, timestamp DESC);
+        """)
+        # plain timestamp index still earns its keep for type-agnostic range
+        # scans (e.g. `WHERE timestamp::date = CURRENT_DATE`).
         cursor.execute("""
             CREATE INDEX IF NOT EXISTS idx_events_timestamp
             ON events(timestamp);
