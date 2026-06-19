@@ -51,6 +51,7 @@ from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
+from runtime.market_calendar import is_regular_hours, session_close_hm
 from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
 from strategy.exits import ExitConfig
@@ -392,9 +393,8 @@ def main(argv: list[str] | None = None) -> int:
             return None
 
     def _is_rth():
-        from zoneinfo import ZoneInfo
-        n = datetime.now(ZoneInfo("America/New_York"))
-        return n.weekday() < 5 and (9, 30) <= (n.hour, n.minute) < (16, 0)
+        # holiday/early-close aware (was weekday<5 only, which traded holidays)
+        return is_regular_hours()
 
     def step_ingest():
         if not client:
@@ -697,9 +697,13 @@ def main(argv: list[str] | None = None) -> int:
         except Exception:  # noqa: BLE001
             return None
         cur = (now_et.hour, now_et.minute)
-        # only inside [flatten_time, 16:00): after the close a market order just
-        # queues uselessly, so don't fire then (e.g. on a post-close restart)
-        if now_et.weekday() >= 5 or not ((eod_h, eod_m) <= cur < (16, 0)):
+        # only inside [flatten_time, close): after the close a market order just
+        # queues uselessly, so don't fire then (e.g. on a post-close restart).
+        # Skip entirely on weekends/holidays — flattening into a closed market
+        # cancels the protective bracket legs but can't fill the sell, which is
+        # how positions went naked over the Juneteenth-style holiday weekend.
+        close_hm = session_close_hm(now_et.date())
+        if close_hm is None or not ((eod_h, eod_m) <= cur < close_hm):
             return None
         res = rt["execution"].close_session("eod_flatten")
         # only mark done if it actually succeeded — otherwise RETRY on the next
