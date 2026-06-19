@@ -46,6 +46,21 @@ def _state_until(for_date: str | None = None) -> str | None:
     return None
 
 
+def _hist_window(for_date: str | None = None) -> tuple[str | None, str | None]:
+    """(since, until) for DAY-SCOPED reads (fills, closed trades). Live = UNBOUNDED
+    (these event types are tiny — fills/closed are rare), so an idle loop or a
+    test's fixed-date fixtures still show. A 'YYYY-MM-DD' = that whole day."""
+    from datetime import datetime, timedelta
+    if for_date and str(for_date).lower() not in ("live", "today", ""):
+        try:
+            d = datetime.fromisoformat(str(for_date)).date()
+            start = datetime(d.year, d.month, d.day)
+            return (start.isoformat(), (start + timedelta(days=1)).isoformat())
+        except (TypeError, ValueError):
+            pass
+    return (None, None)
+
+
 def _latest_event_payload(store, event_type: str, until: str | None = None):
     """The single most-recent event payload of a type (optionally before
     `until`) via a DESC-LIMIT-1 index seek — O(1) vs loading the whole history.
@@ -447,7 +462,7 @@ def query_symbol_criteria(store, symbol: str, session_id: str | None = None) -> 
 
 def query_fills_feed(store, limit: int = 50, for_date: str | None = None) -> list[dict]:
     """Chronological fills + submissions for the activity feed (newest first)."""
-    since, until = _evt_window(for_date)
+    since, until = _hist_window(for_date)
     rows: list[dict] = []
     for event_type in ("order_filled", "order_submitted"):
         for event in store.query_events(event_type=event_type, since=since,
@@ -488,7 +503,7 @@ def query_session_pnl(store, session_id: str | None = None,
     """Day P&L + trade stats. Realized comes from the broker equity delta (the
     closed-event reconstruction reads $0); unrealized from the latest positions
     snapshot. ``for_date`` scopes it to a past session for the date picker."""
-    since, until = _evt_window(for_date)
+    since, until = _hist_window(for_date)
     closed = store.query_events(event_type="position_closed",
                                 since=since, until=until, limit=None)
 
