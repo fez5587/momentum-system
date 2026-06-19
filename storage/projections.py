@@ -661,3 +661,22 @@ def query_risk_state(store) -> dict:
         "data_age_s": round(age, 1) if age is not None else None,
         "unprotected": unprotected,
     }
+
+
+def query_armed_triggers(store) -> dict:
+    """The live armed-trigger book — the heart of the ORB strategy: which gappers
+    are loaded and how close each is to firing its opening-range breakout. The
+    fast trigger thread emits this every few seconds as a module_tick(triggers);
+    the dashboard renders it as a proximity radar. Bounded to the last 15 min so
+    it's a cheap range scan, not a full module_tick load."""
+    from datetime import datetime, timedelta
+    since = (datetime.now() - timedelta(minutes=15)).isoformat()
+    events = store.query_events(event_type="module_tick", since=since, limit=None)
+    for event in reversed(events):  # ASC order -> newest first
+        p = json.loads(event.get("payload_json", "{}"))
+        if p.get("module") == "triggers":
+            m = p.get("metrics") or {}
+            return {"triggers": m.get("triggers") or [],
+                    "armed": m.get("armed", 0),
+                    "timestamp": event.get("timestamp")}
+    return {"triggers": [], "armed": 0, "timestamp": None}

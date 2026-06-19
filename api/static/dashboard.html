@@ -146,6 +146,28 @@
   .risk-strip b { color: var(--text); font-weight: 650; }
   .rdot { font-weight: 700; }
   .rdot.ok { color: #2ecc71; } .rdot.warn { color: #f1c40f; } .rdot.critical { color: #ff4d4f; }
+  /* armed-trigger proximity radar */
+  .trig-row { display: flex; align-items: center; gap: 11px; padding: 6px 6px;
+    border-bottom: 1px solid var(--border); font: 600 12px var(--mono); }
+  .trig-row:last-child { border-bottom: 0; }
+  .trig-sym { width: 62px; font-weight: 700; }
+  .trig-state { width: 52px; font-size: 9px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .5px; }
+  .trig-meta { width: 96px; color: var(--muted); font: 500 10px var(--mono); }
+  .trig-bar { flex: 1; height: 16px; position: relative; background: #0d1117;
+    border: 1px solid var(--border); border-radius: 3px; overflow: hidden; min-width: 120px; }
+  .trig-fill { position: absolute; left: 0; top: 0; bottom: 0; transition: width .35s ease; }
+  .trig-trigline { position: absolute; top: -1px; bottom: -1px; width: 2px; background: #e6edf3;
+    box-shadow: 0 0 4px rgba(230,237,243,.6); }
+  .trig-dist { width: 70px; text-align: right; font-weight: 700; }
+  .trig-cat { width: 150px; color: var(--accent); font: 500 10px var(--mono); overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .st-armed   .trig-state { color: #58a6ff; } .st-armed   .trig-fill { background: linear-gradient(90deg,#1f6feb,#58a6ff); }
+  .st-fired   .trig-state { color: #2ecc71; } .st-fired   .trig-fill { background: #2ecc71; }
+  .st-filled  .trig-state { color: #2ecc71; } .st-filled  .trig-fill { background: linear-gradient(90deg,#1f8f4e,#2ecc71); }
+  .st-weak    .trig-state { color: #7d8590; } .st-weak    .trig-fill { background: #39414d; }
+  .st-waiting .trig-state { color: #7d8590; } .st-waiting .trig-fill { background: #30363d; }
+  .st-armed.near .trig-bar { box-shadow: 0 0 0 1px #f1c40f55; }
 
   /* activity feed */
   .feed-row { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid #151a26; font: 500 12px var(--mono); }
@@ -206,6 +228,11 @@
 </div>
 
 <main>
+  <section class="panel full">
+    <h2>Armed Triggers <span id="trig-count" class="count">0</span><span class="hint">live proximity to the opening-range breakout &middot; closest to fire on top</span></h2>
+    <div id="armed-triggers"><span class="empty">No armed gappers — waiting for the open / first bars.</span></div>
+  </section>
+
   <section class="panel full">
     <h2>Account <span id="acct-count" class="count">0</span></h2>
     <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
@@ -436,6 +463,44 @@ function renderWatch(ws) {
   });
 }
 
+// Armed-trigger proximity radar — for each loaded gapper, a bar showing where the
+// LIVE price sits between the stop (left) and the breakout trigger (the marker).
+// The fill grows toward the marker as price nears the break; crossing it = fired.
+const TRIG_ORDER = { fired: 0, filled: 1, armed: 2, weak: 3, waiting: 4 };
+function renderTriggers(tw) {
+  const arr = (tw && tw.triggers) || [];
+  $("trig-count").textContent = tw && tw.armed != null ? tw.armed : 0;
+  const host = $("armed-triggers");
+  if (!arr.length) { host.innerHTML = '<span class="empty">No armed gappers — waiting for the open / first bars.</span>'; return; }
+  const rows = arr.slice().sort((a, b) =>
+    (TRIG_ORDER[a.state] ?? 9) - (TRIG_ORDER[b.state] ?? 9) || ((b.dist ?? -9) - (a.dist ?? -9)));
+  host.innerHTML = rows.map(t => {
+    const trig = t.trigger, stop = t.stop, price = t.price;
+    const hasBar = trig != null && stop != null && price != null && trig > stop;
+    let fill = 0, trigPos = 100;
+    if (hasBar) {
+      const lo = stop, hi = trig + (trig - stop) * 0.30;   // headroom so 'fired' shows past the marker
+      fill = Math.max(0, Math.min(100, (price - lo) / (hi - lo) * 100));
+      trigPos = Math.max(0, Math.min(100, (trig - lo) / (hi - lo) * 100));
+    }
+    const dist = t.dist != null ? t.dist * 100 : null;
+    const fired = t.state === 'fired' || t.state === 'filled';
+    const distTxt = fired ? '▲' : (dist != null ? (dist >= 0 ? '▲ ' : '') + dist.toFixed(1) + '%' : '—');
+    const distCls = dist == null ? '' : (dist >= 0 ? 'pos' : dist > -1 ? 'warn' : 'neg');
+    const near = (t.state === 'armed' && dist != null && dist > -1.0) ? ' near' : '';
+    return '<div class="trig-row st-' + esc(t.state) + near + '">'
+      + '<div class="trig-sym">' + (t.catalyst ? '📰 ' : '') + esc(t.symbol) + '</div>'
+      + '<div class="trig-state">' + esc(t.state) + '</div>'
+      + '<div class="trig-meta">' + (t.gap != null ? 'gap ' + t.gap.toFixed(0) + '% ' : '') + (t.rvol != null ? t.rvol.toFixed(1) + 'x' : '') + '</div>'
+      + '<div class="trig-bar" title="' + (price != null ? '$' + price : '?') + ' &rarr; trigger $' + (trig != null ? trig : '?') + ' (stop $' + (stop != null ? stop : '?') + ')">'
+      + (hasBar ? '<div class="trig-fill" style="width:' + fill.toFixed(1) + '%"></div><div class="trig-trigline" style="left:' + trigPos.toFixed(1) + '%"></div>' : '')
+      + '</div>'
+      + '<div class="trig-dist ' + distCls + '">' + distTxt + '</div>'
+      + '<div class="trig-cat">' + (t.catalyst ? esc(t.catalyst) : '') + '</div>'
+      + '</div>';
+  }).join('');
+}
+
 function render(d) {
   latest = d;
 
@@ -473,6 +538,8 @@ function render(d) {
   fr.textContent = rk.data_age_s != null ? rk.data_age_s.toFixed(0) + "s" : "—";
   // broker sync runs ~every 60s, so >90s = a missed sync (amber), >180s = stale (red)
   fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 180 ? "#ff4d4f" : rk.data_age_s > 90 ? "#f1c40f" : "");
+
+  renderTriggers(d.triggers);
 
   const accts = d.accounts || [];
   $("acct-count").textContent = accts.length;
