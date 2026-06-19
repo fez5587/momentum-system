@@ -11,6 +11,61 @@ if TYPE_CHECKING:
     pass
 
 
+def _evt_window(for_date: str | None = None) -> tuple[str | None, str | None]:
+    """(since, until) event-time bounds for a dashboard view.
+
+    LIVE (None / 'live' / 'today'): the last 45 min — enough to surface the
+    LATEST snapshot of every account/symbol while turning a full-history scan
+    into a tiny range read (the dashboard projections only need the latest, but
+    used to load the ENTIRE history — 112s on watch_states, 78s on orders).
+
+    A 'YYYY-MM-DD': that whole local calendar day, so the date picker can review
+    a past session's end-of-day P&L / trades / activity.
+    """
+    from datetime import datetime, timedelta
+    if for_date and str(for_date).lower() not in ("live", "today", ""):
+        try:
+            d = datetime.fromisoformat(str(for_date)).date()
+            start = datetime(d.year, d.month, d.day)
+            return (start.isoformat(), (start + timedelta(days=1)).isoformat())
+        except (TypeError, ValueError):
+            pass
+    return ((datetime.now() - timedelta(minutes=45)).isoformat(), None)
+
+
+def _state_until(for_date: str | None = None) -> str | None:
+    """Upper time bound for a 'latest state' read: end-of-day for a historical
+    date, None (= now) for live."""
+    from datetime import datetime, timedelta
+    if for_date and str(for_date).lower() not in ("live", "today", ""):
+        try:
+            d = datetime.fromisoformat(str(for_date)).date()
+            return (datetime(d.year, d.month, d.day) + timedelta(days=1)).isoformat()
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+def _latest_event_payload(store, event_type: str, until: str | None = None):
+    """The single most-recent event payload of a type (optionally before
+    `until`) via a DESC-LIMIT-1 index seek — O(1) vs loading the whole history.
+    Used by the latest-state snapshots (account orders/positions carry big
+    payloads; loading every one just to take the newest was 78s)."""
+    safe_type = "".join(c for c in str(event_type) if c.isalnum() or c == "_")
+    cond = f"event_type = '{safe_type}'"
+    if until:
+        safe_until = str(until).replace("'", "")
+        cond += f" AND timestamp < '{safe_until}'"
+    try:
+        rows = store.con.execute(
+            f"SELECT payload_json, timestamp FROM events WHERE {cond} "
+            f"ORDER BY timestamp DESC LIMIT 1"
+        ).fetchall()
+        return rows[0] if rows else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def query_session_summary(store) -> list[dict]:
     """Query all session summaries from events."""
     events = store.query_events(event_type="session_summary")
@@ -163,15 +218,17 @@ def query_ready_signals_snapshot(store, session_id: str | None = None) -> list[d
     )
 
 
-def query_watch_states_snapshot(store, session_id: str | None = None) -> list[dict]:
+def query_watch_states_snapshot(store, session_id: str | None = None,
+                                for_date: str | None = None) -> list[dict]:
+    since, until = _evt_window(for_date)
     state_events = store.query_events(
         event_type="symbol_state_changed",
-        session_id=session_id,
+        session_id=session_id, since=since, until=until,
         limit=None,
     )
     criteria_events = store.query_events(
         event_type="criteria_evaluated",
-        session_id=session_id,
+        session_id=session_id, since=since, until=until,
         limit=None,
     )
 
@@ -213,88 +270,56 @@ def query_watch_states_snapshot(store, session_id: str | None = None) -> list[di
     return sorted(latest_by_symbol.values(), key=lambda row: row["symbol"])
 
 
-def query_account_summary_snapshot(store, broker_name: str | None = None) -> list[dict]:
-    events = store.query_events(event_type="account_summary_updated", limit=None)
-    latest_by_account: dict[tuple[str, str], dict] = {}
-
-    for event in events:
-        payload = json.loads(event.get("payload_json", "{}"))
-        broker = str(payload.get("broker_name") or "")
-        account_id = str(payload.get("account_id") or "")
-        if not broker or not account_id:
-            continue
-        if broker_name is not None and broker != broker_name:
-            continue
-
-        latest_by_account[(broker, account_id)] = {
-            "broker_name": broker,
-            "account_id": account_id,
-            "account_desc": payload.get("account_desc"),
-            "total_equity": payload.get("total_equity"),
-            "cash_balance": payload.get("cash_balance"),
-            "buying_power": payload.get("buying_power"),
-            "net_liquidating_value": payload.get("net_liquidating_value"),
-            "timestamp": event.get("timestamp"),
-        }
-
-    return sorted(
-        latest_by_account.values(),
-        key=lambda row: (str(row["broker_name"]), str(row["account_id"])),
-    )
+def query_account_summary_snapshot(store, broker_name: str | None = None,
+                                   for_date: str | None = None) -> list[dict]:
+    row = _latest_event_payload(store, "account_summary_updated", _state_until(for_date))
+    if not row:
+        return []
+    payload = json.loads(row[0] or "{}")
+    broker = str(payload.get("broker_name") or "")
+    account_id = str(payload.get("account_id") or "")
+    if not broker or not account_id or (broker_name is not None and broker != broker_name):
+        return []
+    return [{
+        "broker_name": broker, "account_id": account_id,
+        "account_desc": payload.get("account_desc"),
+        "total_equity": payload.get("total_equity"),
+        "cash_balance": payload.get("cash_balance"),
+        "buying_power": payload.get("buying_power"),
+        "net_liquidating_value": payload.get("net_liquidating_value"),
+        "timestamp": row[1],
+    }]
 
 
 def query_account_positions_snapshot(
-    store, broker_name: str | None = None
+    store, broker_name: str | None = None, for_date: str | None = None
 ) -> list[dict]:
-    events = store.query_events(event_type="account_positions_updated", limit=None)
-    latest_by_account: dict[tuple[str, str], dict] = {}
-
-    for event in events:
-        payload = json.loads(event.get("payload_json", "{}"))
-        broker = str(payload.get("broker_name") or "")
-        account_id = str(payload.get("account_id") or "")
-        if not broker or not account_id:
-            continue
-        if broker_name is not None and broker != broker_name:
-            continue
-
-        latest_by_account[(broker, account_id)] = {
-            "broker_name": broker,
-            "account_id": account_id,
-            "positions": payload.get("positions", []),
-            "timestamp": event.get("timestamp"),
-        }
-
-    return sorted(
-        latest_by_account.values(),
-        key=lambda row: (str(row["broker_name"]), str(row["account_id"])),
-    )
+    row = _latest_event_payload(store, "account_positions_updated", _state_until(for_date))
+    if not row:
+        return []
+    payload = json.loads(row[0] or "{}")
+    broker = str(payload.get("broker_name") or "")
+    account_id = str(payload.get("account_id") or "")
+    if not broker or not account_id or (broker_name is not None and broker != broker_name):
+        return []
+    return [{"broker_name": broker, "account_id": account_id,
+             "positions": payload.get("positions", []), "timestamp": row[1]}]
 
 
-def query_account_orders_snapshot(store, broker_name: str | None = None) -> list[dict]:
-    events = store.query_events(event_type="account_orders_updated", limit=None)
-    latest_by_account: dict[tuple[str, str], dict] = {}
-
-    for event in events:
-        payload = json.loads(event.get("payload_json", "{}"))
-        broker = str(payload.get("broker_name") or "")
-        account_id = str(payload.get("account_id") or "")
-        if not broker or not account_id:
-            continue
-        if broker_name is not None and broker != broker_name:
-            continue
-
-        latest_by_account[(broker, account_id)] = {
-            "broker_name": broker,
-            "account_id": account_id,
-            "orders": payload.get("orders", []),
-            "timestamp": event.get("timestamp"),
-        }
-
-    return sorted(
-        latest_by_account.values(),
-        key=lambda row: (str(row["broker_name"]), str(row["account_id"])),
-    )
+def query_account_orders_snapshot(store, broker_name: str | None = None,
+                                  for_date: str | None = None) -> list[dict]:
+    # O(1) latest event — these payloads are huge (every order incl. legs), so
+    # loading the full history to take the newest was the 78s offender.
+    row = _latest_event_payload(store, "account_orders_updated", _state_until(for_date))
+    if not row:
+        return []
+    payload = json.loads(row[0] or "{}")
+    broker = str(payload.get("broker_name") or "")
+    account_id = str(payload.get("account_id") or "")
+    if not broker or not account_id or (broker_name is not None and broker != broker_name):
+        return []
+    return [{"broker_name": broker, "account_id": account_id,
+             "orders": payload.get("orders", []), "timestamp": row[1]}]
 
 
 def query_order_lifecycle_snapshot(store) -> list[dict]:
@@ -420,11 +445,13 @@ def query_symbol_criteria(store, symbol: str, session_id: str | None = None) -> 
     }
 
 
-def query_fills_feed(store, limit: int = 50) -> list[dict]:
+def query_fills_feed(store, limit: int = 50, for_date: str | None = None) -> list[dict]:
     """Chronological fills + submissions for the activity feed (newest first)."""
+    since, until = _evt_window(for_date)
     rows: list[dict] = []
     for event_type in ("order_filled", "order_submitted"):
-        for event in store.query_events(event_type=event_type, limit=None):
+        for event in store.query_events(event_type=event_type, since=since,
+                                        until=until, limit=None):
             payload = json.loads(event.get("payload_json", "{}"))
             rows.append(
                 {
@@ -456,13 +483,14 @@ def _r_multiple(entry, stop, exit_price, side: str) -> float | None:
     return round((exit_price - entry) * direction / risk, 2)
 
 
-def query_session_pnl(store, session_id: str | None = None) -> dict:
-    """Day P&L + trade stats from position_closed events and live positions.
-
-    Realized stats come from closed positions; unrealized comes from the most
-    recent account positions snapshot so the strip matches the broker.
-    """
-    closed = store.query_events(event_type="position_closed", limit=None)
+def query_session_pnl(store, session_id: str | None = None,
+                      for_date: str | None = None) -> dict:
+    """Day P&L + trade stats. Realized comes from the broker equity delta (the
+    closed-event reconstruction reads $0); unrealized from the latest positions
+    snapshot. ``for_date`` scopes it to a past session for the date picker."""
+    since, until = _evt_window(for_date)
+    closed = store.query_events(event_type="position_closed",
+                                since=since, until=until, limit=None)
 
     realized = 0.0
     wins = 0
@@ -502,7 +530,7 @@ def query_session_pnl(store, session_id: str | None = None) -> dict:
     # unrealized from the latest positions snapshot (any broker)
     unrealized = 0.0
     open_positions = 0
-    snapshots = query_account_positions_snapshot(store)
+    snapshots = query_account_positions_snapshot(store, for_date=for_date)
     if snapshots:
         for position in snapshots[-1].get("positions") or []:
             open_positions += 1
@@ -521,9 +549,9 @@ def query_session_pnl(store, session_id: str | None = None) -> dict:
     # the broker equity delta: day P&L = latest equity - prior-session close
     # (last_equity); matched (realized) = day P&L - current unrealized.
     broker_day = None
-    summ = store.query_events(event_type="account_summary_updated", limit=None)
-    if summ:
-        sp = json.loads(summ[-1].get("payload_json", "{}"))  # ASC order -> latest
+    _ar = _latest_event_payload(store, "account_summary_updated", _state_until(for_date))
+    if _ar:
+        sp = json.loads(_ar[0] or "{}")  # latest equity snapshot (O(1))
         try:
             eq = float(sp.get("total_equity") or 0.0)
             le = float(sp.get("last_equity") or 0.0)
@@ -562,7 +590,7 @@ _PROT_ACTIVE = {"held", "new", "accepted", "pending_new",
                 "accepted_for_bidding", "partially_filled"}
 
 
-def query_risk_state(store) -> dict:
+def query_risk_state(store, for_date: str | None = None) -> dict:
     """Portfolio risk/health for the dashboard gauge — the conditions that
     silently cost money this session: concentration vs the caps, day P&L vs the
     daily-loss limit, data freshness, and any UNPROTECTED (naked) long. Returns a
@@ -572,11 +600,11 @@ def query_risk_state(store) -> dict:
 
     equity = None
     day_pnl = None
-    summ = store.query_events(event_type="account_summary_updated", limit=None)
+    _ar = _latest_event_payload(store, "account_summary_updated", _state_until(for_date))
     ts_latest = None
-    if summ:
-        sp = json.loads(summ[-1].get("payload_json", "{}"))
-        ts_latest = summ[-1].get("timestamp")
+    if _ar:
+        sp = json.loads(_ar[0] or "{}")
+        ts_latest = _ar[1]
         try:
             equity = float(sp.get("total_equity") or 0.0) or None
             le = float(sp.get("last_equity") or 0.0)
@@ -585,9 +613,9 @@ def query_risk_state(store) -> dict:
         except (TypeError, ValueError):
             pass
 
-    psnap = query_account_positions_snapshot(store)
+    psnap = query_account_positions_snapshot(store, for_date=for_date)
     positions = (psnap[-1].get("positions") if psnap else []) or []
-    osnap = query_account_orders_snapshot(store)
+    osnap = query_account_orders_snapshot(store, for_date=for_date)
     orders = (osnap[-1].get("orders") if osnap else []) or []
 
     sell_cover: dict = {}
@@ -682,13 +710,17 @@ def query_armed_triggers(store) -> dict:
     return {"triggers": [], "armed": 0, "timestamp": None}
 
 
-def query_equity_curve(store, points: int = 200) -> dict:
-    """Recent total-equity series for an intraday P&L-shape sparkline, plus the
-    prior-session-close baseline (last_equity). Bounded to the last 10h so it's a
-    cheap range scan and naturally scopes to the trading day."""
+def query_equity_curve(store, points: int = 200, for_date: str | None = None) -> dict:
+    """Total-equity series for an intraday P&L-shape sparkline, plus the prior-
+    session-close baseline (last_equity). Live = last 10h (the trading day); a
+    YYYY-MM-DD = that whole day, for the date picker."""
     from datetime import datetime, timedelta
-    since = (datetime.now() - timedelta(hours=10)).isoformat()
-    events = store.query_events(event_type="account_summary_updated", since=since, limit=None)
+    if for_date and str(for_date).lower() not in ("live", "today", ""):
+        since, until = _evt_window(for_date)
+    else:
+        since, until = (datetime.now() - timedelta(hours=10)).isoformat(), None
+    events = store.query_events(event_type="account_summary_updated",
+                                since=since, until=until, limit=None)
     series: list[float] = []
     baseline = None
     for e in events:

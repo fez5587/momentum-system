@@ -55,6 +55,10 @@
     padding: 5px 9px; cursor: pointer;
   }
   .hdr-btn.on { color: var(--accent); border-color: #2a4a78; }
+  .hdr-sel { margin-left: 10px; background: var(--panel, #0d1117); color: var(--text);
+    border: 1px solid var(--border); border-radius: 5px; padding: 4px 8px;
+    font: 600 11px var(--mono); cursor: pointer; }
+  .hdr-sel.histor { color: #f1c40f; border-color: #6b5a16; }
 
   /* P&L strip */
   .pnl-strip {
@@ -211,6 +215,7 @@
 <header>
   <h1>MOMENTUM <span>/ control room</span></h1>
   <span id="mode-badge" class="badge paper">PAPER</span>
+  <select id="date-select" class="hdr-sel" title="View LIVE or review a past session"><option value="">● LIVE</option></select>
   <div class="spacer"></div>
   <button id="sound-toggle" class="hdr-btn" title="Toggle signal alert sound">SOUND OFF</button>
   <button id="kbd-toggle" class="hdr-btn" title="Keyboard shortcuts (?)">KEYS</button>
@@ -555,6 +560,7 @@ function rBar(entry, cur, stop) {
 
 function render(d) {
   latest = d;
+  populateDates(d.available_dates);
 
   const live = d.execution_mode === "schwab_live";
   const badge = $("mode-badge");
@@ -706,7 +712,34 @@ function render(d) {
   lastSignalKey = key;
 }
 
-let es = null, pollTimer = null;
+let es = null, pollTimer = null, viewDate = null;
+
+// populate the date picker from the snapshot's available_dates (LIVE + past days)
+function populateDates(dates) {
+  const sel = document.getElementById("date-select"); if (!sel) return;
+  if (sel.options.length === ((dates || []).length + 1)) return;  // already built
+  sel.innerHTML = '<option value="">● LIVE</option>' +
+    (dates || []).map(d => '<option value="' + d + '">' + d + '</option>').join('');
+  sel.value = viewDate || '';
+}
+// switch between live and a historical session
+function setView(date) {
+  viewDate = date || null;
+  const sel = document.getElementById("date-select");
+  if (sel) sel.classList.toggle("histor", !!viewDate);
+  if (es) { es.close(); es = null; }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (viewDate) loadHistorical(); else startStream();   // live resumes the stream
+}
+async function loadHistorical() {
+  setConn(true, "loading " + viewDate + " ...");
+  try {
+    const r = await fetch("/api/snapshots?date=" + encodeURIComponent(viewDate));
+    if (!r.ok) throw new Error("HTTP " + r.status);
+    render(await r.json());
+    setConn(true, "VIEWING " + viewDate + " (historical)");
+  } catch (e) { setConn(false, "load failed — " + e.message); }
+}
 function setConn(ok, msg) {
   $("conn-dot").className = "dot " + (ok ? "live" : "err");
   $("stamp").textContent = msg;
@@ -741,6 +774,7 @@ $("sound-toggle").onclick = () => {
   $("sound-toggle").className = "hdr-btn" + (soundOn ? " on" : "");
   if (soundOn) beep();
 };
+$("date-select").onchange = (e) => setView(e.target.value);
 $("kbd-toggle").onclick = () => $("kbd-help").classList.toggle("show");
 $("kbd-help").onclick = (e) => { if (e.target.id === "kbd-help") $("kbd-help").classList.remove("show"); };
 

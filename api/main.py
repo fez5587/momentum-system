@@ -57,6 +57,20 @@ def _eastern_session_date():
     return datetime.now(ZoneInfo("America/New_York")).date()
 
 
+def _available_dates(store) -> list[str]:
+    """Distinct session dates with account data — populates the date picker so
+    you can switch from LIVE to review a past day."""
+    try:
+        rows = store.con.execute(
+            "SELECT DISTINCT timestamp::date AS d FROM events "
+            "WHERE event_type = 'account_summary_updated' "
+            "ORDER BY d DESC LIMIT 90"
+        ).fetchall()
+        return [str(r[0]) for r in rows]
+    except Exception:  # noqa: BLE001
+        return []
+
+
 class DashboardState:
     """Shared state: event store path + optional live execution service."""
 
@@ -79,7 +93,10 @@ class DashboardState:
     def open_store(self) -> EventStore:
         return EventStore(self.event_db_path)
 
-    def snapshots(self) -> dict:
+    def snapshots(self, for_date: str | None = None) -> dict:
+        # for_date=None/'live' -> the live view (latest snapshots, fast windowed
+        # query); a 'YYYY-MM-DD' -> that past session's end-of-day review.
+        is_live = not for_date or str(for_date).lower() in ("live", "today")
         with self._lock:
             store = self.open_store()
             try:
@@ -87,18 +104,23 @@ class DashboardState:
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "execution_mode": self.execution_mode,
                     "has_execution": self.execution_service is not None,
-                    "pnl": query_session_pnl(store),
-                    "risk": query_risk_state(store),
-                    "triggers": query_armed_triggers(store),
-                    "equity_curve": query_equity_curve(store),
-                    "approval_queue": query_approval_queue(store),
-                    "ready_signals": query_ready_signals_snapshot(store),
-                    "watch_states": query_watch_states_snapshot(store),
-                    "accounts": query_account_summary_snapshot(store),
-                    "positions": query_account_positions_snapshot(store),
-                    "orders": query_account_orders_snapshot(store),
+                    "view_date": None if is_live else for_date,
+                    "available_dates": _available_dates(store),
+                    "pnl": query_session_pnl(store, for_date=for_date),
+                    "risk": query_risk_state(store, for_date=for_date),
+                    "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
+                    "equity_curve": query_equity_curve(store, for_date=for_date),
+                    "approval_queue": query_approval_queue(store) if is_live else [],
+                    "ready_signals": query_ready_signals_snapshot(store) if is_live else [],
+                    # watch_states is a LIVE concept (and the heaviest projection
+                    # — ~99k criteria rows for a whole past day); skip it for a
+                    # historical review, which is about that day's P&L/trades.
+                    "watch_states": query_watch_states_snapshot(store) if is_live else [],
+                    "accounts": query_account_summary_snapshot(store, for_date=for_date),
+                    "positions": query_account_positions_snapshot(store, for_date=for_date),
+                    "orders": query_account_orders_snapshot(store, for_date=for_date),
                     "order_lifecycle": query_order_lifecycle_snapshot(store),
-                    "fills": query_fills_feed(store, limit=30),
+                    "fills": query_fills_feed(store, limit=30, for_date=for_date),
                     "sessions": query_session_summary(store),
                 }
             finally:
@@ -301,7 +323,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             elif route == "/api/stream":
                 self._stream()
             elif route == "/api/snapshots":
-                self._send_json(self.state.snapshots())
+                d = (self._query().get("date") or [""])[0]
+                self._send_json(self.state.snapshots(for_date=d or None))
             elif route == "/api/approval-queue":
                 self._send_json({"approval_queue": self.state.approval_queue()})
             elif route == "/api/criteria":
