@@ -35,7 +35,8 @@ class _Tracked:
 
 
 def _is_active(cfg: ExitConfig) -> bool:
-    return bool(cfg and (cfg.breakeven_at_r or cfg.trail_mode != TRAIL_NONE
+    return bool(cfg and (cfg.breakeven_at_r or cfg.breakeven_at_pct
+                         or cfg.trail_mode != TRAIL_NONE
                          or cfg.scale_out_r or cfg.first_red_exit
                          or cfg.profit_lock_tiers))
 

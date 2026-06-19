@@ -587,10 +587,13 @@ def main(argv: list[str] | None = None) -> int:
             # recent $-volume (last 5 regular-hours bars) — the liquidity gate.
             # rvol is relative; this is the absolute "can it absorb an order" check.
             dollar_vol = 0.0
+            day_open = None
             try:
                 rth = bars[bars["is_regular_hours"]] if "is_regular_hours" in bars else bars
                 tail = rth.tail(5)
                 dollar_vol = float((tail["close"] * tail["volume"]).sum())
+                if len(rth):  # session open = first regular-hours bar's open
+                    day_open = float(rth.iloc[0]["open"])
             except Exception:  # noqa: BLE001
                 dollar_vol = 0.0
             candidates.append({
@@ -603,6 +606,7 @@ def main(argv: list[str] | None = None) -> int:
                 "cum_volume": g.cumulative_volume,
                 "dollar_vol": dollar_vol,
                 "catalyst": catalyst,
+                "day_open": day_open,
                 # a fresh catalyst is WHY a small-cap runs — boost it up the rank;
                 # times an optional manual per-symbol weight (default 1.0)
                 "_score": (g.gap_pct * max(g.relative_volume, 0.1)
@@ -668,11 +672,13 @@ def main(argv: list[str] | None = None) -> int:
                 res = rt["execution"].submit_breakout_now(
                     t.symbol, t.trigger, t.stop, last_price=t.price,
                     cum_volume=t.cum_volume, halted=_recently_halted(t.symbol),
+                    day_open=t.day_open,
                 )
                 if res.get("ok"):
                     book.mark_fired(t.symbol)
                     fired.append(t.symbol)
-                elif res.get("skipped") in ("over_extended", "halted_symbol"):
+                elif res.get("skipped") in ("over_extended", "over_extended_day",
+                                            "halted_symbol"):
                     # surface the anti-chase / halt skips once per symbol (they
                     # re-check every 4s; routine dedup skips stay quiet entirely)
                     key = f"{t.symbol}:{res['skipped']}"

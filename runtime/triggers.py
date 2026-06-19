@@ -63,6 +63,7 @@ class ArmedTrigger:
     cum_volume: float = 0.0       # session cumulative volume (for liquidity sizing)
     dollar_vol: float = 0.0       # recent $-volume (liquidity gate: skip thin spikes)
     catalyst: str = ""            # fresh news headline (if any) — why it's hot
+    day_open: float | None = None  # session-open price (for the day-extension gate)
     state: str = WAITING
     rank: int = 0
 
@@ -155,6 +156,7 @@ class ArmedTriggerBook:
             t.cum_volume = float(c.get("cum_volume") or 0.0)
             t.dollar_vol = float(c.get("dollar_vol") or 0.0)
             t.catalyst = c.get("catalyst") or ""
+            t.day_open = c.get("day_open")
             t.rank = rank
             if not c.get("complete") or t.trigger is None:
                 t.state = WAITING

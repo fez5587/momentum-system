@@ -55,6 +55,11 @@ def parse_profit_tiers(raw: str) -> list[tuple[float, float]]:
 class ExitConfig:
     target_r: float = 2.0          # final take-profit in R (0 = no fixed target)
     breakeven_at_r: float = 0.0    # move stop to entry once +this R is reached (0 = off)
+    # move stop to entry once price is +this FRACTION above entry (0 = off). A
+    # percentage breakeven that fires once the breakout confirms — sooner than
+    # +1R for a wide opening-range stop — so a winner can't round-trip to a loss
+    # (the documented failure mode: small-cap pops then reverses through entry).
+    breakeven_at_pct: float = 0.0
     trail_mode: str = TRAIL_NONE   # none | prior_low | pct
     trail_pct: float = 0.0         # pct trail: stop = high_water * (1 - trail_pct)
     trail_after_r: float = 1.0     # only start trailing once +this R is reached
@@ -84,6 +89,7 @@ class ExitConfig:
         return cls(
             target_r=f("TRADING_REWARD_MULTIPLE", "2.0"),
             breakeven_at_r=f("TRADING_EXIT_BREAKEVEN_R", "0.0"),
+            breakeven_at_pct=f("TRADING_EXIT_BREAKEVEN_PCT", "0.05"),
             trail_mode=v.get("TRADING_EXIT_TRAIL_MODE", TRAIL_NONE).strip().lower(),
             trail_pct=f("TRADING_EXIT_TRAIL_PCT", "0.0"),
             trail_after_r=f("TRADING_EXIT_TRAIL_AFTER_R", "1.0"),
@@ -97,6 +103,8 @@ class ExitConfig:
         parts = [f"target {self.target_r:g}R"]
         if self.breakeven_at_r:
             parts.append(f"BE@{self.breakeven_at_r:g}R")
+        if self.breakeven_at_pct:
+            parts.append(f"BE@+{self.breakeven_at_pct:.0%}")
         if self.trail_mode != TRAIL_NONE:
             how = f"{self.trail_pct:.1%}" if self.trail_mode == TRAIL_PCT else "prior-low"
             parts.append(f"trail {how} after {self.trail_after_r:g}R")
@@ -130,6 +138,11 @@ def _trail_stop(stop: float, entry: float, high_water: float,
     """The stop after processing one bar — only ever ratchets UP."""
     new = stop
     if cfg.breakeven_at_r and reached_r >= cfg.breakeven_at_r:
+        new = max(new, entry)
+    # percentage breakeven: once the move clears +breakeven_at_pct above entry,
+    # the trade can't go red (stop to entry). Fires off the high-water mark, so
+    # it latches once reached and only ratchets the stop up, never down.
+    if cfg.breakeven_at_pct and entry > 0 and high_water >= entry * (1.0 + cfg.breakeven_at_pct):
         new = max(new, entry)
     if reached_r >= cfg.trail_after_r:
         if cfg.trail_mode == TRAIL_PRIOR_LOW:

@@ -239,6 +239,38 @@ def test_breakout_now_rejects_nonpositive_price():
     assert client.last is None
 
 
+def test_breakout_now_blocks_over_extended_on_day():
+    """Day ceiling: a CLEAN trigger break (+3.8% above trigger, passes the trigger
+    ceiling) of a name already +35% above the session open is a parabolic chase —
+    the real ATPC case (clean break, +32% on the day, lost). Blocked by the day
+    ceiling that the trigger ceiling can't see."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=13.0, stop=12.5,
+                                  last_price=13.5, day_open=10.0)
+    assert res["ok"] is False and res["skipped"] == "over_extended_day"
+    assert client.last is None
+
+
+def test_breakout_now_allows_modest_day_extension():
+    """+10% above the session open (a normal gapper) is under the 30% day ceiling."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5,
+                                  last_price=11.0, day_open=10.0)
+    assert res["ok"] is True
+
+
+def test_day_extension_skipped_without_day_open():
+    """No day_open (e.g. pre-open / missing bars) -> the day ceiling can't apply,
+    entry proceeds under the other gates."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5,
+                                  last_price=11.0, day_open=None)
+    assert res["ok"] is True
+
+
 def test_breakout_now_allows_clean_break_within_ceiling():
     """A clean break crosses the trigger smoothly (+3%, well under the 15%
     ceiling) and still fires — the guard must not kill normal breakouts."""

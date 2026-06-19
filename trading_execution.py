@@ -143,6 +143,14 @@ class ExecutionSettings:
     # ICCM @64%/26%, BIRD @30%). 15% sits in that dead zone — it blocks the
     # spike-top chases and passes every normal breakout.
     extension_max_pct: float = 0.15
+    # Day-extension ceiling: block when the entry is more than this fraction ABOVE
+    # the SESSION OPEN — i.e. the stock is already parabolic on the day. This
+    # catches what extension_max_pct can't: a name up huge intraday whose ORB-high
+    # break is itself clean (small trigger-extension) but is a chase of a parabolic
+    # (e.g. ATPC entered +1.7% above trigger yet +32% above the open, and lost).
+    # Default 0.30 calibrated on real fires: normal entries are <=14% above the
+    # open, the parabolic tail is 20-83%. 0 = off. Needs day_open from the trigger.
+    day_extension_max_pct: float = 0.30
     # Skip entries on a name that looks HALTED: in a trading halt you can't exit
     # and it gaps through your stop on resume. The caller passes a per-symbol
     # halt flag (a bar-gap heuristic over the liquid gappers we trade). This flag
@@ -206,6 +214,9 @@ class ExecutionSettings:
             ),
             extension_max_pct=float(
                 values.get("TRADING_EXTENSION_MAX_PCT", "0.15")
+            ),
+            day_extension_max_pct=float(
+                values.get("TRADING_DAY_EXTENSION_MAX_PCT", "0.30")
             ),
             halt_guard_enabled=flag("TRADING_HALT_GUARD_ENABLED", "1"),
             halt_max_bar_gap_min=float(
@@ -670,6 +681,7 @@ class TradingExecutionService:
         reason: str = "orb_live_break",
         cum_volume: float = 0.0,
         halted: bool = False,
+        day_open: float | None = None,
     ) -> dict:
         """Fire a breakout entry immediately on a LIVE price cross.
 
@@ -720,6 +732,13 @@ class TradingExecutionService:
         ext_max = self.settings.extension_max_pct
         if ext_max > 0 and entry_ref > trigger_f * (1.0 + ext_max):
             return {"ok": False, "skipped": "over_extended"}
+        # Day-extension ceiling: the stock is already parabolic on the DAY (far
+        # above the session open) — chasing that is the "+100% then halts down"
+        # trap even when the trigger break itself looks clean.
+        day_max = self.settings.day_extension_max_pct
+        if (day_max > 0 and day_open is not None and float(day_open) > 0
+                and entry_ref > float(day_open) * (1.0 + day_max)):
+            return {"ok": False, "skipped": "over_extended_day"}
         # Halt guard: you can't exit during a trading halt and it gaps through the
         # stop on resume — don't enter a name the caller flagged as halted.
         if halted and self.settings.halt_guard_enabled:

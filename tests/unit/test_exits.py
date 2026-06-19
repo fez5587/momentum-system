@@ -37,6 +37,29 @@ def test_profit_lock_live_desired_stop():
     assert round(d.desired_stop, 2) == 10.30  # +3% locked (only +8% tier reached)
 
 
+def test_pct_breakeven_live_moves_stop_to_entry():
+    # entry 10, stop 9; once price tags +5% (10.5) the % breakeven pins stop to entry
+    d = manage_live(10.0, 9.0, _bars([(10.5, 10.1, 10.4)]), ExitConfig(breakeven_at_pct=0.05))
+    assert round(d.desired_stop, 2) == 10.0
+
+
+def test_pct_breakeven_not_reached_holds_initial_stop():
+    # only +3% high-water, under the 5% threshold -> stop stays at the initial 9.0
+    d = manage_live(10.0, 9.0, _bars([(10.3, 10.0, 10.2)]), ExitConfig(breakeven_at_pct=0.05))
+    assert round(d.desired_stop, 2) == 9.0
+
+
+def test_pct_breakeven_saves_a_reversing_winner():
+    # pops +6% then collapses below the original stop; the % breakeven turns a
+    # -1R loss into a 0R scratch (the "winner round-trips to a loss" failure)
+    bars = _bars([(10.6, 10.2, 10.5), (10.1, 8.5, 8.6)])
+    cfg = ExitConfig(target_r=20.0, breakeven_at_pct=0.05)
+    r = simulate_exit(10.0, 9.0, bars, cfg)
+    assert r.fills[-1].price >= 10.0 - 1e-6   # exited at breakeven, not the 9.0 stop
+    assert r.reason == "breakeven"
+    assert abs(r.r_multiple) < 1e-6           # scratch, not a loss
+
+
 def _bars(seq):
     return pd.DataFrame([{"high": h, "low": lo, "close": c} for h, lo, c in seq])
 
