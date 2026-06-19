@@ -196,6 +196,33 @@ def build_runtime(args: argparse.Namespace) -> dict:
               f"(tuned {str(_learned.get('as_of', ''))[:10]} over {_learned.get('sessions')} "
               f"sessions; backtest pnl {_learned.get('pnl')}, entry@{_learned.get('entry_min')}min)")
 
+    ollama_cfg = OllamaConfig.from_env()
+
+    # Catalyst advisory provider, TTL-cached so a pass doesn't re-query per symbol;
+    # returns None on any fault so neither the (gated) dilution veto nor the score
+    # blend ever block/skew on a DB blip. Shared by the watcher AND the execution
+    # service (one cache). catalyst_score_provider maps the advisory -> a 0..1 score
+    # OUTSIDE the pure evaluator, and is only handed to the watcher when the score
+    # blend is explicitly enabled (so Phase 1 advisory never changes scoring).
+    _catalyst_cache: dict = {"map": {}, "at": 0.0}
+    _CATALYST_TTL = 30.0
+
+    def catalyst_provider(symbol: str):
+        import time as _time
+        from research.ingestion.news_enrichment import catalyst_map
+        now = _time.monotonic()
+        if (now - _catalyst_cache["at"]) >= _CATALYST_TTL:
+            try:
+                _catalyst_cache["map"] = catalyst_map(research_con)
+            except Exception:  # noqa: BLE001
+                _catalyst_cache["map"] = {}
+            _catalyst_cache["at"] = now
+        return _catalyst_cache["map"].get((symbol or "").upper())
+
+    def catalyst_score_provider(symbol: str):
+        from research.ingestion.news_enrichment import catalyst_score
+        return catalyst_score(catalyst_provider(symbol))
+
     watcher = Watcher(
         store,
         ResearchWatchlistProvider(
@@ -212,6 +239,9 @@ def build_runtime(args: argparse.Namespace) -> dict:
             ready_score_pct=float(os.environ.get(
                 "WATCHER_READY_SCORE", str(_learned.get("ready_score_pct", 60.0)))),
             min_quality=float(os.environ.get("WATCHER_MIN_QUALITY", "0.30")),
+        ),
+        catalyst_score_provider=(
+            catalyst_score_provider if ollama_cfg.catalyst_score_enabled else None
         ),
     )
 
@@ -247,24 +277,6 @@ def build_runtime(args: argparse.Namespace) -> dict:
         if price is not None:
             _price_cache[symbol] = (price, now)
         return price
-
-    # Catalyst advisory provider for the (gated) dilution veto. TTL-cached so a
-    # guard pass doesn't re-query per symbol; returns None on any fault so the
-    # veto simply doesn't fire rather than blocking entries on a DB blip.
-    _catalyst_cache: dict = {"map": {}, "at": 0.0}
-    _CATALYST_TTL = 30.0
-
-    def catalyst_provider(symbol: str):
-        import time as _time
-        from research.ingestion.news_enrichment import catalyst_map
-        now = _time.monotonic()
-        if (now - _catalyst_cache["at"]) >= _CATALYST_TTL:
-            try:
-                _catalyst_cache["map"] = catalyst_map(research_con)
-            except Exception:  # noqa: BLE001
-                _catalyst_cache["map"] = {}
-            _catalyst_cache["at"] = now
-        return _catalyst_cache["map"].get((symbol or "").upper())
 
     execution = (
         TradingExecutionService(
@@ -306,6 +318,8 @@ def build_runtime(args: argparse.Namespace) -> dict:
         "sync": sync,
         "book": book,
         "latest_price": latest_price,
+        "catalyst_provider": catalyst_provider,
+        "ollama_cfg": ollama_cfg,
         "session_id": session_id,
         "event_db": event_db,
     }
@@ -314,6 +328,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rt = build_runtime(args)
+    ollama_cfg = rt["ollama_cfg"]
     symbols: list[str] = rt["symbols"]
     client = rt["client"]
 
@@ -580,6 +595,32 @@ def main(argv: list[str] | None = None) -> int:
         news_map = recent_news_map(
             rt["research_con"], lookback_hours=int(os.environ.get("NEWS_LOOKBACK_HOURS", "8")))
         news_boost = float(os.environ.get("NEWS_RANK_BOOST", "2.0"))
+        # GATED graded ranking from the LLM catalyst read. When the score blend is
+        # off, ranking is the existing binary `news_boost if catalyst else 1.0`.
+        # When on, a bullish catalyst boosts by `1 + gain*score` and a confirmed
+        # dilutive offering is sunk below the armed cut (multiplied by a small
+        # penalty) so the book stops arming the gap-and-fade traps.
+        cat_map: dict = {}
+        if ollama_cfg.catalyst_score_enabled:
+            from research.ingestion.news_enrichment import catalyst_map as _cmap
+            try:
+                cat_map = _cmap(rt["research_con"])
+            except Exception:  # noqa: BLE001
+                cat_map = {}
+        news_rank_gain = float(os.environ.get("NEWS_RANK_BOOST_GAIN", "2.0"))
+        dilutive_penalty = float(os.environ.get("NEWS_DILUTIVE_PENALTY", "0.1"))
+
+        def _cat_mult(sym: str, has_headline: bool) -> float:
+            if not ollama_cfg.catalyst_score_enabled:
+                return news_boost if has_headline else 1.0
+            from research.ingestion.news_enrichment import catalyst_score as _cscore
+            adv = cat_map.get((sym or "").upper())
+            if not adv:
+                return 1.0
+            if adv.get("is_dilutive") and float(adv.get("conviction") or 0.0) >= (
+                    ollama_cfg.dilution_veto_min_conviction):
+                return dilutive_penalty
+            return 1.0 + news_rank_gain * (_cscore(adv) or 0.0)
         # optional MANUAL per-symbol priority nudge (SYMBOL_WEIGHTS=ABCD:1.2,XYZ:1.1)
         # — a small boost to names you want watched; keep modest so it doesn't
         # override the gap/volume logic.
@@ -631,7 +672,7 @@ def main(argv: list[str] | None = None) -> int:
                 # a fresh catalyst is WHY a small-cap runs — boost it up the rank;
                 # times an optional manual per-symbol weight (default 1.0)
                 "_score": (g.gap_pct * max(g.relative_volume, 0.1)
-                           * (news_boost if catalyst else 1.0)
+                           * _cat_mult(g.symbol, bool(catalyst))
                            * weights.get(g.symbol, 1.0)),
                 "complete": complete,
             })
@@ -792,8 +833,6 @@ def main(argv: list[str] | None = None) -> int:
     # path. Classifies recently-ingested headlines (catalyst type / sentiment /
     # dilution) into news_catalyst_cache for the dashboard. Gated by both the
     # enrichment flag AND ollama.enabled; degrades to a no-op if Ollama is down.
-    ollama_cfg = OllamaConfig.from_env()
-
     def step_enrich():
         if not (ollama_cfg.enabled and ollama_cfg.enrichment_enabled):
             return "skipped (disabled)"
@@ -830,7 +869,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits", "eod"):
+        for name in ("discover", "ingest", "enrich", "watch", "arm", "sync", "execute", "exits", "eod"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

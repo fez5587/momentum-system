@@ -166,6 +166,9 @@ class OllamaConfig(BaseModel):
     # Phase 2 dilution veto (ships OFF).
     dilution_veto_enabled: bool = False
     dilution_veto_min_conviction: float = 0.6
+    # Phase 2 score blend (ships OFF; separate from enrichment so turning on the
+    # advisory/dashboard does NOT silently change trade scoring).
+    catalyst_score_enabled: bool = False
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "OllamaConfig":
@@ -205,6 +208,7 @@ class OllamaConfig(BaseModel):
             enrichment_batch_limit=i("NEWS_ENRICH_BATCH_LIMIT", 50),
             dilution_veto_enabled=b("NEWS_DILUTION_VETO_ENABLED", False),
             dilution_veto_min_conviction=f("NEWS_DILUTION_VETO_CONVICTION", 0.6),
+            catalyst_score_enabled=b("NEWS_CATALYST_SCORE_ENABLED", False),
         )
 
 
