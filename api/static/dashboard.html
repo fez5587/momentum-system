@@ -586,9 +586,9 @@ function render(d) {
     nb.textContent = "⚠ UNPROTECTED: " + rk.unprotected.join(", ") + " — held long with no / short protective stop";
     nb.classList.add("show");
   } else { nb.classList.remove("show"); }
-  const rs = $("risk-status");
-  rs.textContent = (rk.status || "—").toUpperCase();
-  rs.className = "rdot " + (rk.status || "");
+  const rsEl = $("risk-status");
+  rsEl.textContent = (rk.status || "—").toUpperCase();
+  rsEl.className = "rdot " + (rk.status || "");
   $("risk-pos").textContent = (rk.open_positions != null ? rk.open_positions : "—") + " / " + (rk.max_concurrent != null ? rk.max_concurrent : "—");
   $("risk-gross").textContent = rk.gross_pct != null ? (rk.gross_pct * 100).toFixed(0) + "% / " + (rk.max_gross_pct * 100).toFixed(0) + "%" : "—";
   $("risk-day").textContent = rk.day_pnl_pct != null ? (rk.day_pnl_pct * 100).toFixed(1) + "% / -" + (rk.daily_loss_limit_pct * 100).toFixed(0) + "%" : "—";
