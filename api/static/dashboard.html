@@ -793,13 +793,18 @@ function setConn(ok, msg) {
   $("stamp").textContent = msg;
 }
 function startStream() {
+  // Render immediately from a plain fetch (the same reliable path the date
+  // selector uses) so LIVE shows data even if EventSource never connects in
+  // this browser/proxy. SSE then layers on for low-latency pushes.
+  pollOnce();
+  if (typeof EventSource === "undefined") { startPolling(); return; }
   try {
     es = new EventSource("/api/stream");
     es.addEventListener("snapshot", (ev) => {
       try { render(JSON.parse(ev.data)); setConn(true, "live · " + new Date().toLocaleTimeString()); }
-      catch (e) {}
+      catch (e) { console.error("render failed:", e); setConn(false, "render error (see console)"); }
     });
-    es.onerror = () => { setConn(false, "stream lost — polling"); es.close(); es = null; startPolling(); };
+    es.onerror = () => { setConn(false, "stream lost — polling"); if (es) es.close(); es = null; startPolling(); };
   } catch (e) { startPolling(); }
 }
 async function pollOnce() {

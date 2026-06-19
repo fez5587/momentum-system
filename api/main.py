@@ -257,6 +257,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        # never cache the dashboard shell — a stale cached page was serving old
+        # JS/CSS, so pushed fixes (and live-vs-cached behaviour) didn't reach the
+        # browser. The page is tiny and the data is fetched separately anyway.
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate")
+        self.send_header("Pragma", "no-cache")
         self.end_headers()
         self.wfile.write(body)
 
