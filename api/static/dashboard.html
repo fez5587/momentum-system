@@ -470,6 +470,19 @@ function riskChip(req) {
   return '<span class="risk">risk <b>' + money(dollarRisk) + '</b> &middot; ' + qty + 'sh &middot; notional <b>' + money(notional) + '</b> &middot; stop <b>' + (perShare/entry*100).toFixed(1) + '%</b></span>';
 }
 
+// Local-LLM catalyst advisory cell for the approval queue. adv = {catalyst_type,
+// sentiment, conviction, is_dilutive, rationale}. Empty when not enriched.
+function catalystCell(adv) {
+  if (!adv || !adv.catalyst_type) return '<span class="muted">—</span>';
+  const s = adv.sentiment;
+  const tone = s == null ? "" : (s > 0.15 ? "long" : (s < -0.15 ? "short" : ""));
+  const type = String(adv.catalyst_type).replace(/_/g, " ");
+  const dil = adv.is_dilutive ? ' <span class="pill short" title="confirmed dilution — Phase 2 veto candidate">⚠ DILUTIVE</span>' : '';
+  const chip = '<span class="pill ' + tone + '" title="' + esc(adv.rationale || "") + '">📰 ' + esc(type)
+    + (s != null ? ' ' + (s > 0 ? '+' : '') + Number(s).toFixed(2) : '') + '</span>';
+  return chip + dil;
+}
+
 function table(headers, rows) {
   if (!rows.length) return null;
   return "<table><thead><tr>" + headers.map(h => "<th>" + h + "</th>").join("") + "</tr></thead><tbody>" + rows.join("") + "</tbody></table>";
@@ -664,12 +677,13 @@ function render(d) {
   const aq = d.approval_queue || [];
   $("aq-count").textContent = aq.length;
   fill("approval-queue", table(
-    ["Symbol", "Side", "Risk preview", "Mode", "Actions"],
+    ["Symbol", "Side", "Risk preview", "Catalyst", "Mode", "Actions"],
     aq.map(q => {
       const r = q.execution_request || {};
       return '<tr><td class="sym">' + esc(q.symbol) + '</td>' +
         '<td><span class="pill ' + (r.side === "sell" ? "short" : "long") + '">' + esc(r.side || "buy") + '</span></td>' +
         '<td>' + riskChip(r) + '</td>' +
+        '<td>' + catalystCell(q.catalyst) + '</td>' +
         '<td class="num">' + esc(q.approval_mode || "manual") + '</td>' +
         '<td><div class="actions">' +
         '<button class="btn-approve" onclick="approve(\'' + esc(q.order_id) + '\')">Approve</button>' +

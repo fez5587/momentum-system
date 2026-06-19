@@ -390,6 +390,28 @@ CREATE INDEX IF NOT EXISTS idx_raw_news_items_fetch_attempt
 CREATE INDEX IF NOT EXISTS idx_raw_news_items_source_published
     ON raw_news_items (source, raw_published_at);
 
+-- Local-LLM (Ollama) catalyst enrichment cache. One row per (headline, ticker);
+-- headline_hash = raw_news_items.payload_hash (sha256(source|url|title)) so we
+-- dedupe and join for free. Read model for the dashboard advisory + Phase 2.
+CREATE TABLE IF NOT EXISTS news_catalyst_cache (
+    headline_hash   VARCHAR,
+    symbol          VARCHAR,
+    headline        VARCHAR,
+    source          VARCHAR,
+    catalyst_type   VARCHAR,
+    sentiment       DOUBLE PRECISION,
+    conviction      DOUBLE PRECISION,
+    is_dilutive     BOOLEAN DEFAULT FALSE,
+    rationale       VARCHAR,
+    model           VARCHAR,
+    enriched_at     TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (headline_hash, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_news_catalyst_cache_symbol
+    ON news_catalyst_cache (symbol);
+CREATE INDEX IF NOT EXISTS idx_news_catalyst_cache_enriched
+    ON news_catalyst_cache (enriched_at);
+
 CREATE TABLE IF NOT EXISTS telemetry_events (
     id VARCHAR PRIMARY KEY,
     event_type VARCHAR,

@@ -49,6 +49,8 @@ from research.ingestion.market_data import (
 from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
+from research.ingestion.news_enrichment import enrich_recent_news
+from config import OllamaConfig
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
 from runtime.halt_guard import is_halt_gap
@@ -246,6 +248,24 @@ def build_runtime(args: argparse.Namespace) -> dict:
             _price_cache[symbol] = (price, now)
         return price
 
+    # Catalyst advisory provider for the (gated) dilution veto. TTL-cached so a
+    # guard pass doesn't re-query per symbol; returns None on any fault so the
+    # veto simply doesn't fire rather than blocking entries on a DB blip.
+    _catalyst_cache: dict = {"map": {}, "at": 0.0}
+    _CATALYST_TTL = 30.0
+
+    def catalyst_provider(symbol: str):
+        import time as _time
+        from research.ingestion.news_enrichment import catalyst_map
+        now = _time.monotonic()
+        if (now - _catalyst_cache["at"]) >= _CATALYST_TTL:
+            try:
+                _catalyst_cache["map"] = catalyst_map(research_con)
+            except Exception:  # noqa: BLE001
+                _catalyst_cache["map"] = {}
+            _catalyst_cache["at"] = now
+        return _catalyst_cache["map"].get((symbol or "").upper())
+
     execution = (
         TradingExecutionService(
             store,
@@ -254,6 +274,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
             trading_mode=TradingModeSettings.from_env(),
             session_id=session_id,
             price_provider=latest_price,
+            catalyst_provider=catalyst_provider,
         )
         if executor
         else None
@@ -767,7 +788,23 @@ def main(argv: list[str] | None = None) -> int:
         return (f"EOD FLATTEN closed [{closed}]"
                 + (f" errors={res['errors']} (will retry)" if res["errors"] else ""))
 
+    # Local-LLM (Ollama) news/catalyst enrichment — advisory layer, OFF the hot
+    # path. Classifies recently-ingested headlines (catalyst type / sentiment /
+    # dilution) into news_catalyst_cache for the dashboard. Gated by both the
+    # enrichment flag AND ollama.enabled; degrades to a no-op if Ollama is down.
+    ollama_cfg = OllamaConfig.from_env()
+
+    def step_enrich():
+        if not (ollama_cfg.enabled and ollama_cfg.enrichment_enabled):
+            return "skipped (disabled)"
+        res = enrich_recent_news(rt["research_con"], ollama_cfg)
+        return (f"enriched={res['enriched']} skipped={res['skipped']} "
+                f"errors={res['errors']}")
+
     scheduler = Scheduler()
+    scheduler.add("enrich", step_enrich,
+                  float(ollama_cfg.enrichment_interval_seconds),
+                  enabled=ollama_cfg.enabled and ollama_cfg.enrichment_enabled)
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
                   enabled=_flag("DISCOVER_ENABLED", "1"))

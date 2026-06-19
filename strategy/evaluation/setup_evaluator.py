@@ -37,6 +37,7 @@ def evaluate_setup(
     entry_cutoff: EntryCutoffConfig | None = None,
     ready_score_pct: float = 60.0,
     min_bars: int = MIN_BARS,
+    catalyst_score: float | None = None,
 ) -> SetupEvaluationResult:
     """Evaluate a symbol's session bars for a momentum setup.
 
@@ -137,6 +138,7 @@ def evaluate_setup(
         above_vwap=above_vwap,
         opening_strength=first.opening_strength,
         data_quality=dq.score,
+        catalyst_score=catalyst_score,
     )
 
     entry_price = structure.breakout_level or price

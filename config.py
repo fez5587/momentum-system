@@ -1,5 +1,6 @@
 """Configuration loading from YAML files."""
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -144,16 +145,67 @@ class NewsSourcesConfig(BaseModel):
 
 
 class OllamaConfig(BaseModel):
-    """Ollama local LLM settings for enrichment."""
+    """Ollama local LLM settings for news/catalyst enrichment."""
 
     model_config = ConfigDict(extra="ignore")
 
     enabled: bool = False
     host: str = "http://localhost:11434"
-    model: str = "mistral"
+    # qwen2.5:7b-instruct (Q4, ~4.7GB) fits a 12GB GPU with headroom and has the
+    # best small-model strict-JSON adherence. Alts: llama3.1:8b-instruct-q4_K_M,
+    # mistral:7b-instruct, qwen2.5:3b-instruct (throughput).
+    model: str = "qwen2.5:7b-instruct"
     timeout_seconds: int = 30
     max_tokens: int = 256
     temperature: float = 0.3
+    # News/catalyst enrichment (advisory layer).
+    enrichment_enabled: bool = False
+    enrichment_interval_seconds: int = 120
+    enrichment_lookback_hours: int = 12
+    enrichment_batch_limit: int = 50  # max headlines per pass (GPU budget)
+    # Phase 2 dilution veto (ships OFF).
+    dilution_veto_enabled: bool = False
+    dilution_veto_min_conviction: float = 0.6
+
+    @classmethod
+    def from_env(cls, env: dict[str, str] | None = None) -> "OllamaConfig":
+        """Build from OLLAMA_* / NEWS_* env vars (run_live_paper reads env, not YAML)."""
+        v = dict(os.environ)
+        if env:
+            v.update(env)
+
+        def b(key: str, default: bool) -> bool:
+            raw = v.get(key)
+            if raw is None:
+                return default
+            return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+        def i(key: str, default: int) -> int:
+            try:
+                return int(v.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        def f(key: str, default: float) -> float:
+            try:
+                return float(v.get(key, default))
+            except (TypeError, ValueError):
+                return default
+
+        return cls(
+            enabled=b("OLLAMA_ENABLED", False),
+            host=v.get("OLLAMA_HOST", cls.model_fields["host"].default),
+            model=v.get("OLLAMA_MODEL", cls.model_fields["model"].default),
+            timeout_seconds=i("OLLAMA_TIMEOUT_SECONDS", 30),
+            max_tokens=i("OLLAMA_MAX_TOKENS", 256),
+            temperature=f("OLLAMA_TEMPERATURE", 0.3),
+            enrichment_enabled=b("NEWS_ENRICH_ENABLED", False),
+            enrichment_interval_seconds=i("NEWS_ENRICH_INTERVAL_SECONDS", 120),
+            enrichment_lookback_hours=i("NEWS_ENRICH_LOOKBACK_HOURS", 12),
+            enrichment_batch_limit=i("NEWS_ENRICH_BATCH_LIMIT", 50),
+            dilution_veto_enabled=b("NEWS_DILUTION_VETO_ENABLED", False),
+            dilution_veto_min_conviction=f("NEWS_DILUTION_VETO_CONVICTION", 0.6),
+        )
 
 
 class CapabilityRegistryConfig(BaseModel):

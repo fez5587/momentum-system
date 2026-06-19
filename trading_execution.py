@@ -160,6 +160,13 @@ class ExecutionSettings:
     # than this many minutes WHILE other names are still printing (LULD halts run
     # >= 5 min, so 3 catches a real halt without tripping on normal IEX lag).
     halt_max_bar_gap_min: float = 3.0
+    # --- catalyst dilution veto (Phase 2; ships OFF) -----------------------
+    # block an entry when the LLM catalyst advisory says the move is driven by a
+    # CONFIRMED dilutive offering (a gap that fades as new shares hit). Requires
+    # a catalyst_provider AND a conviction at/above the floor below. Default OFF
+    # so the LLM stays advisory-only until its accuracy is trusted.
+    catalyst_veto_enabled: bool = False
+    catalyst_veto_min_conviction: float = 0.6
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -222,6 +229,10 @@ class ExecutionSettings:
             halt_max_bar_gap_min=float(
                 values.get("TRADING_HALT_MAX_BAR_GAP_MIN", "3")
             ),
+            catalyst_veto_enabled=flag("NEWS_DILUTION_VETO_ENABLED", "0"),
+            catalyst_veto_min_conviction=float(
+                values.get("NEWS_DILUTION_VETO_CONVICTION", "0.6")
+            ),
         )
 
 
@@ -238,9 +249,14 @@ class TradingExecutionService:
         equity: float | None = None,
         price_provider=None,
         now_fn=None,
+        catalyst_provider=None,
     ):
         self.store = store
         self.settings = settings or ExecutionSettings.from_env()
+        # optional callable: symbol -> catalyst advisory dict (or None), from the
+        # LLM enrichment cache. Used ONLY for the (gated) dilution veto. Injected
+        # so the execution service never reads the DB itself.
+        self.catalyst_provider = catalyst_provider
         self.trading_mode = trading_mode or TradingModeSettings.from_env()
         self.session_id = session_id
         self.equity = equity or self.settings.default_equity
@@ -525,6 +541,46 @@ class TradingExecutionService:
         return self._halted
 
     @_locked
+    def _dilution_vetoed(self, symbol: str) -> dict | None:
+        """If the gated catalyst veto is on AND the LLM advisory flags a confirmed
+        dilutive offering at/above the conviction floor, return the advisory (so
+        the caller can emit a risk event + skip). Otherwise None. Never raises —
+        a missing/odd advisory simply doesn't veto."""
+        if not (self.settings.catalyst_veto_enabled and self.catalyst_provider):
+            return None
+        try:
+            adv = self.catalyst_provider(symbol)
+        except Exception:  # noqa: BLE001 — advisory is best-effort, never blocks on its own fault
+            return None
+        if not adv or not adv.get("is_dilutive"):
+            return None
+        try:
+            conviction = float(adv.get("conviction") or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if conviction >= self.settings.catalyst_veto_min_conviction:
+            return adv
+        return None
+
+    def _emit_dilution_veto(self, symbol: str, adv: dict) -> None:
+        self.store.emit(
+            RiskRuleTriggeredEvent(
+                timestamp=datetime.now(),
+                mode=self.mode,
+                correlation_id=self.session_id,
+                message=f"{symbol}: entry blocked — confirmed dilutive catalyst",
+                rule_type="catalyst_dilution_veto",
+                rule_value=float(adv.get("conviction") or 0.0),
+                current_state={
+                    "symbol": symbol,
+                    "catalyst_type": adv.get("catalyst_type"),
+                    "sentiment": adv.get("sentiment"),
+                    "rationale": adv.get("rationale"),
+                },
+                action_taken="blocked_dilutive_offering",
+            )
+        )
+
     def request_approvals_for_ready_signals(self) -> list[str]:
         """Turn fresh ready signals into approval requests. Returns order ids."""
         if not self.settings.enabled:
@@ -561,6 +617,11 @@ class TradingExecutionService:
                     or symbol in self._requested_symbols
                     or self._in_cooldown(symbol)        # benched after recent backouts
                     or symbol in self._exited_today):   # already round-tripped today
+                continue
+            vetoed = self._dilution_vetoed(symbol)
+            if vetoed is not None:
+                self._emit_dilution_veto(symbol, vetoed)
+                self._requested_symbols.add(symbol)  # don't re-evaluate every tick
                 continue
             entry = signal.get("entry_price")
             stop = signal.get("stop_loss_price")
@@ -710,6 +771,10 @@ class TradingExecutionService:
             return {"ok": False, "skipped": "cooldown"}
         if symbol in self._exited_today:  # already round-tripped today — no re-entry
             return {"ok": False, "skipped": "reentry_blocked"}
+        vetoed = self._dilution_vetoed(symbol)  # gated catalyst dilution veto
+        if vetoed is not None:
+            self._emit_dilution_veto(symbol, vetoed)
+            return {"ok": False, "skipped": "dilution_veto"}
 
         # Use last_price only when it's a real positive tick. `last_price or
         # trigger` would coerce a 0.0/garbage price to the trigger — silently
