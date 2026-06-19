@@ -471,7 +471,8 @@ function render(d) {
   $("risk-day").textContent = rk.day_pnl_pct != null ? (rk.day_pnl_pct * 100).toFixed(1) + "% / -" + (rk.daily_loss_limit_pct * 100).toFixed(0) + "%" : "—";
   const fr = $("risk-fresh");
   fr.textContent = rk.data_age_s != null ? rk.data_age_s.toFixed(0) + "s" : "—";
-  fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 90 ? "#ff4d4f" : rk.data_age_s > 30 ? "#f1c40f" : "");
+  // broker sync runs ~every 60s, so >90s = a missed sync (amber), >180s = stale (red)
+  fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 180 ? "#ff4d4f" : rk.data_age_s > 90 ? "#f1c40f" : "");
 
   const accts = d.accounts || [];
   $("acct-count").textContent = accts.length;

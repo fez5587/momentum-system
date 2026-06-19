@@ -625,8 +625,12 @@ def query_risk_state(store) -> dict:
             t = (datetime.fromisoformat(ts_latest.replace("Z", "+00:00"))
                  if isinstance(ts_latest, str) else ts_latest)
             if t.tzinfo is None:
-                t = t.replace(tzinfo=timezone.utc)
-            age = (datetime.now(timezone.utc) - t).total_seconds()
+                # event timestamps are stored NAIVE LOCAL (datetime.now()), so
+                # compare against naive-local now — comparing to UTC would be off
+                # by the whole timezone offset (the chip read ~4h on fresh data).
+                age = (datetime.now() - t).total_seconds()
+            else:
+                age = (datetime.now(timezone.utc) - t).total_seconds()
         except Exception:  # noqa: BLE001
             pass
 
