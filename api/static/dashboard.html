@@ -257,6 +257,46 @@
   .kbd-card .row { display: flex; justify-content: space-between; padding: 6px 0; font-size: 13px; color: var(--muted); }
   kbd { background: var(--panel-2); border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 4px; padding: 2px 7px; font: 600 12px var(--mono); color: var(--text); }
   @media (max-width: 1040px) { .panel { grid-column: span 12; } }
+
+  /* ---- phones / small screens ---- */
+  @media (max-width: 640px) {
+    header { flex-wrap: wrap; padding: 10px 14px; gap: 8px 10px; }
+    header h1 { font-size: 14px; }
+    #sound-toggle, #kbd-toggle, .spacer { display: none; }  /* desktop-only conveniences */
+    .hdr-sel { margin-left: 0; }
+    .conn { margin-left: auto; }
+    .stamp { font-size: 11px; }
+
+    .risk-strip { flex-wrap: wrap; gap: 6px 16px; padding: 8px 14px; }
+
+    /* P&L: 2-up grid so cells don't crush; day curve gets its own full row */
+    .pnl-strip { display: grid; grid-template-columns: 1fr 1fr; }
+    .pnl-cell { border-right: 1px solid var(--border-soft);
+                border-bottom: 1px solid var(--border-soft); padding: 9px 14px; }
+    .pnl-cell .value { font-size: 18px; }
+    #pnl-total { font-size: 22px; }
+    .pnl-cell.pnl-spark { grid-column: 1 / -1; }
+
+    main { padding: 10px 10px 44px; gap: 10px; }
+    .panel { border-radius: 10px; }
+    .panel h2 { padding: 10px 13px; font-size: 11px; }
+    .panel h2 .hint { display: none; }  /* secondary helper text — save width */
+
+    /* wide tables scroll horizontally instead of crushing to multi-line cells */
+    .panel > div { overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    th, td { white-space: nowrap; padding: 7px 11px; }
+
+    /* armed-trigger radar: drop the wide meta/catalyst cols, keep sym+bar+dist */
+    .trig-meta, .trig-cat { display: none; }
+    .trig-sym { width: 46px; }
+    .trig-state { width: 40px; }
+    .trig-bar { min-width: 70px; }
+    .trig-dist { width: 54px; }
+
+    .acct-row { gap: 12px 16px; }
+    .feed-time { min-width: 54px; }
+    .toast { left: 14px; right: 14px; bottom: 14px; max-width: none; }
+  }
 </style>
 </head>
 <body>
