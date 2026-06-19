@@ -699,16 +699,24 @@ class TradingExecutionService:
         if symbol in self._exited_today:  # already round-tripped today — no re-entry
             return {"ok": False, "skipped": "reentry_blocked"}
 
-        entry_ref = float(last_price or trigger)
+        # Use last_price only when it's a real positive tick. `last_price or
+        # trigger` would coerce a 0.0/garbage price to the trigger — silently
+        # skipping the extension guard AND sizing on a phantom price.
+        if last_price is not None and float(last_price) <= 0:
+            return {"ok": False, "skipped": "bad_price"}
+        entry_ref = float(last_price) if last_price is not None else float(trigger)
         stop_f = float(stop)
         trigger_f = float(trigger)
         if stop_f >= entry_ref or trigger_f <= 0:
             return {"ok": False, "skipped": "bad_geometry"}
 
-        # Anti-chase ceiling: a clean break crosses the trigger smoothly (~0%
-        # extension), but a violent gap-THROUGH — a parabolic spike, or a halt
-        # reopening past the level — lands far above it. Chasing that buys the top
-        # tick that then reverses/halts down (the "+100% then halts down" trap).
+        # Anti-chase ceiling: distance of the entry price ABOVE the breakout
+        # trigger (ORB high). A clean break crosses the level smoothly (~0%) and
+        # passes; a violent gap-THROUGH — an intraday parabolic, or a halt
+        # reopening past the level — lands far above it, and chasing that buys
+        # the top tick that reverses/halts down. (Overnight +100% gappers are
+        # already excluded upstream by the trigger book's gap_max; this catches
+        # the intraday chase / gap-through that gap_max can't see.)
         ext_max = self.settings.extension_max_pct
         if ext_max > 0 and entry_ref > trigger_f * (1.0 + ext_max):
             return {"ok": False, "skipped": "over_extended"}

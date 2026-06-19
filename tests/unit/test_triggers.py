@@ -229,9 +229,19 @@ def test_breakout_now_allows_extended_under_default_ceiling():
     assert res["ok"] is True
 
 
+def test_breakout_now_rejects_nonpositive_price():
+    """A 0.0/garbage last price must be rejected, not coerced to the trigger
+    (which would skip the extension guard and size on a phantom price)."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=0.0)
+    assert res["ok"] is False and res["skipped"] == "bad_price"
+    assert client.last is None
+
+
 def test_breakout_now_allows_clean_break_within_ceiling():
-    """A clean break crosses the trigger smoothly (+3%, under the 6% ceiling) and
-    still fires — the guard must not kill normal breakouts."""
+    """A clean break crosses the trigger smoothly (+3%, well under the 15%
+    ceiling) and still fires — the guard must not kill normal breakouts."""
     client = _FakeClient()
     store, svc = _svc(client)
     res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.3)

@@ -51,6 +51,7 @@ from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
+from runtime.halt_guard import is_halt_gap
 from runtime.market_calendar import is_regular_hours, session_close_hm
 from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
@@ -426,15 +427,9 @@ def main(argv: list[str] | None = None) -> int:
         if ex is None or not ex.settings.halt_guard_enabled or not _is_rth():
             return False
         gap_s = ex.settings.halt_max_bar_gap_min * 60.0
-        if gap_s <= 0:
-            return False
-        sym_age = _symbol_bar_age(symbol)
-        if sym_age is None or sym_age <= gap_s:
-            return False
-        # only blame the symbol if ingestion is healthy globally — otherwise it's
-        # an ingest lag, not a halt, and we must not block every name on a hiccup
-        global_age = _freshest_bar_age()
-        return global_age is not None and global_age <= gap_s
+        # is_halt_gap also gates the global-ingestion-health check, so a feed-wide
+        # lag can't flag the whole book (pure + unit-tested in runtime.halt_guard)
+        return is_halt_gap(_symbol_bar_age(symbol), _freshest_bar_age(), gap_s)
 
     def step_ingest():
         if not client:
