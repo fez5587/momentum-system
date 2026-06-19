@@ -396,6 +396,46 @@ def main(argv: list[str] | None = None) -> int:
         # holiday/early-close aware (was weekday<5 only, which traded holidays)
         return is_regular_hours()
 
+    def _symbol_bar_age(symbol):
+        """Seconds since this symbol's newest minute bar today (UTC), or None."""
+        from datetime import timezone
+        try:
+            row = rt["research_con"].execute(
+                "SELECT max(timestamp) FROM minute_bars "
+                "WHERE symbol = ? AND session_date = ?",
+                [symbol, _now_session_date()]).fetchone()
+            if not row or not row[0]:
+                return None
+            ts = row[0]
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            return (datetime.now(timezone.utc) - ts).total_seconds()
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _recently_halted(symbol):
+        """Halt heuristic for the entry guard: during RTH this symbol has gone
+        silent (freshest bar older than the configured gap) WHILE ingestion is
+        otherwise healthy (some name printed recently). For the liquid gappers we
+        trade, a multi-minute silence is a trading halt, not thin coverage — and
+        entering a halted name is the "+100% then halts down" trap. Conservative
+        on purpose: a false positive just skips one entry (it retries next tick)."""
+        ex = rt.get("execution")
+        if ex is None or not ex.settings.halt_guard_enabled or not _is_rth():
+            return False
+        gap_s = ex.settings.halt_max_bar_gap_min * 60.0
+        if gap_s <= 0:
+            return False
+        sym_age = _symbol_bar_age(symbol)
+        if sym_age is None or sym_age <= gap_s:
+            return False
+        # only blame the symbol if ingestion is healthy globally — otherwise it's
+        # an ingest lag, not a halt, and we must not block every name on a hiccup
+        global_age = _freshest_bar_age()
+        return global_age is not None and global_age <= gap_s
+
     def step_ingest():
         if not client:
             return "skipped (no keys)"
@@ -613,6 +653,8 @@ def main(argv: list[str] | None = None) -> int:
                     pass
         return out
 
+    _block_logged: set[str] = set()  # dedup TRIGGER BLOCKED spam (re-checked every pass)
+
     def _trigger_pass():
         snap = book.snapshot()
         syms = [r["symbol"] for r in snap]
@@ -621,6 +663,7 @@ def main(argv: list[str] | None = None) -> int:
         for s, px in _batch_prices(syms).items():
             book.update_price(s, px)
         fired: list[str] = []
+        blocked: list[str] = []
         if rt["execution"] is not None:
             try:
                 book.mark_filled(rt["execution"]._held_symbols())
@@ -629,11 +672,18 @@ def main(argv: list[str] | None = None) -> int:
             for t in book.fires():
                 res = rt["execution"].submit_breakout_now(
                     t.symbol, t.trigger, t.stop, last_price=t.price,
-                    cum_volume=t.cum_volume,
+                    cum_volume=t.cum_volume, halted=_recently_halted(t.symbol),
                 )
                 if res.get("ok"):
                     book.mark_fired(t.symbol)
                     fired.append(t.symbol)
+                elif res.get("skipped") in ("over_extended", "halted_symbol"):
+                    # surface the anti-chase / halt skips once per symbol (they
+                    # re-check every 4s; routine dedup skips stay quiet entirely)
+                    key = f"{t.symbol}:{res['skipped']}"
+                    if key not in _block_logged:
+                        _block_logged.add(key)
+                        blocked.append(key)
         snap = book.snapshot()
         armed_n = sum(1 for r in snap if r["state"] == "armed")
         rt["store"].emit(
@@ -648,6 +698,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         if fired:
             print(f"[{datetime.now():%H:%M:%S}] TRIGGER FIRED {', '.join(fired)}", flush=True)
+        if blocked:
+            print(f"[{datetime.now():%H:%M:%S}] TRIGGER BLOCKED {', '.join(blocked)}", flush=True)
 
     def trigger_loop():
         while not stop_event.wait(trigger_interval):

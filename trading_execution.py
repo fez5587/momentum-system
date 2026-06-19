@@ -132,6 +132,26 @@ class ExecutionSettings:
     # only bench a closed name if it exited DOWN more than this fraction — a real
     # stop-out, not a scratch/win. 0 = bench on any close (the blunt original).
     reentry_min_loss_pct: float = 0.01
+    # --- anti-chase / halt protection (the "+100% then 3 halts down" failure) ---
+    # Block a live entry whose price has already extended more than this fraction
+    # ABOVE the trigger (opening-range high). A clean break crosses the level
+    # smoothly (~0% extension and passes); a violent gap-THROUGH — a parabolic
+    # spike, or a halt reopening past the level — lands far above it, and chasing
+    # that buys the top tick that then reverses/halts down. 0 = off.
+    # Default 0.15 calibrated on real fires: historical entries cluster <=9.8%
+    # extension, with a clean gap to a disaster tail at 26-64% (NEOV x4 @27%,
+    # ICCM @64%/26%, BIRD @30%). 15% sits in that dead zone — it blocks the
+    # spike-top chases and passes every normal breakout.
+    extension_max_pct: float = 0.15
+    # Skip entries on a name that looks HALTED: in a trading halt you can't exit
+    # and it gaps through your stop on resume. The caller passes a per-symbol
+    # halt flag (a bar-gap heuristic over the liquid gappers we trade). This flag
+    # only gates whether that signal is honoured.
+    halt_guard_enabled: bool = True
+    # treat a symbol as halted when, during RTH, its freshest minute bar is older
+    # than this many minutes WHILE other names are still printing (LULD halts run
+    # >= 5 min, so 3 catches a real halt without tripping on normal IEX lag).
+    halt_max_bar_gap_min: float = 3.0
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "ExecutionSettings":
@@ -183,6 +203,13 @@ class ExecutionSettings:
             reentry_block_after_exit=flag("TRADING_BLOCK_REENTRY_AFTER_EXIT", "1"),
             reentry_min_loss_pct=float(
                 values.get("TRADING_REENTRY_MIN_LOSS_PCT", "0.01")
+            ),
+            extension_max_pct=float(
+                values.get("TRADING_EXTENSION_MAX_PCT", "0.15")
+            ),
+            halt_guard_enabled=flag("TRADING_HALT_GUARD_ENABLED", "1"),
+            halt_max_bar_gap_min=float(
+                values.get("TRADING_HALT_MAX_BAR_GAP_MIN", "3")
             ),
         )
 
@@ -642,6 +669,7 @@ class TradingExecutionService:
         last_price: float | None = None,
         reason: str = "orb_live_break",
         cum_volume: float = 0.0,
+        halted: bool = False,
     ) -> dict:
         """Fire a breakout entry immediately on a LIVE price cross.
 
@@ -676,6 +704,18 @@ class TradingExecutionService:
         trigger_f = float(trigger)
         if stop_f >= entry_ref or trigger_f <= 0:
             return {"ok": False, "skipped": "bad_geometry"}
+
+        # Anti-chase ceiling: a clean break crosses the trigger smoothly (~0%
+        # extension), but a violent gap-THROUGH — a parabolic spike, or a halt
+        # reopening past the level — lands far above it. Chasing that buys the top
+        # tick that then reverses/halts down (the "+100% then halts down" trap).
+        ext_max = self.settings.extension_max_pct
+        if ext_max > 0 and entry_ref > trigger_f * (1.0 + ext_max):
+            return {"ok": False, "skipped": "over_extended"}
+        # Halt guard: you can't exit during a trading halt and it gaps through the
+        # stop on resume — don't enter a name the caller flagged as halted.
+        if halted and self.settings.halt_guard_enabled:
+            return {"ok": False, "skipped": "halted_symbol"}
 
         eq = self._current_equity()
         liq = self.settings.liquidity_max_volume_pct

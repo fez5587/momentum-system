@@ -209,6 +209,75 @@ def test_breakout_now_blocks_when_gross_notional_full():
     assert res["ok"] is False and res["skipped"] == "gross_notional_cap"
 
 
+def test_breakout_now_blocks_when_over_extended():
+    """Anti-chase ceiling: a price already +27% above the trigger gapped THROUGH
+    the ORB high (a parabolic spike or a halt re-open, like the real NEOV/ICCM
+    chases) — block it before it reaches the broker. Default ceiling is 15%."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=12.7)
+    assert res["ok"] is False and res["skipped"] == "over_extended"
+    assert client.last is None  # never submitted
+
+
+def test_breakout_now_allows_extended_under_default_ceiling():
+    """A +9% break (real entries cluster <=9.8%) is under the 15% default and
+    still fires — the ceiling targets the 26-64% disaster tail, not normal moves."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.9)
+    assert res["ok"] is True
+
+
+def test_breakout_now_allows_clean_break_within_ceiling():
+    """A clean break crosses the trigger smoothly (+3%, under the 6% ceiling) and
+    still fires — the guard must not kill normal breakouts."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", trigger=10.0, stop=9.5, last_price=10.3)
+    assert res["ok"] is True
+
+
+def test_breakout_now_blocks_halted_symbol():
+    """A name flagged halted is skipped — you can't exit during a halt and it
+    gaps through the stop on resume."""
+    client = _FakeClient()
+    store, svc = _svc(client)
+    res = svc.submit_breakout_now("AAA", 10.0, 9.5, last_price=10.0, halted=True)
+    assert res["ok"] is False and res["skipped"] == "halted_symbol"
+    assert client.last is None
+
+
+def test_halt_guard_can_be_disabled():
+    """With the halt guard off, the halted flag is ignored and the entry fires."""
+    client = _FakeClient()
+    store = EventStore(":memory:")
+    svc = TradingExecutionService(
+        store,
+        executor=AlpacaPaperExecutor(store, client=client),
+        settings=ExecutionSettings(auto_approve=True, max_daily_loss_pct=0.5,
+                                   halt_guard_enabled=False),
+        session_id="t",
+    )
+    res = svc.submit_breakout_now("AAA", 10.0, 9.5, last_price=10.0, halted=True)
+    assert res["ok"] is True
+
+
+def test_extension_ceiling_off_when_zero():
+    """extension_max_pct=0 disables the ceiling (an over-extended price fires)."""
+    client = _FakeClient()
+    store = EventStore(":memory:")
+    svc = TradingExecutionService(
+        store,
+        executor=AlpacaPaperExecutor(store, client=client),
+        settings=ExecutionSettings(auto_approve=True, max_daily_loss_pct=0.5,
+                                   extension_max_pct=0.0),
+        session_id="t",
+    )
+    res = svc.submit_breakout_now("AAA", 10.0, 9.5, last_price=11.2)
+    assert res["ok"] is True
+
+
 def test_breakout_now_rejects_bad_geometry():
     store, svc = _svc(_FakeClient())
     res = svc.submit_breakout_now("AAA", 10.0, 10.5, last_price=10.0)  # stop > entry
