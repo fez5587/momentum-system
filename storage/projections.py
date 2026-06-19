@@ -680,3 +680,29 @@ def query_armed_triggers(store) -> dict:
                     "armed": m.get("armed", 0),
                     "timestamp": event.get("timestamp")}
     return {"triggers": [], "armed": 0, "timestamp": None}
+
+
+def query_equity_curve(store, points: int = 200) -> dict:
+    """Recent total-equity series for an intraday P&L-shape sparkline, plus the
+    prior-session-close baseline (last_equity). Bounded to the last 10h so it's a
+    cheap range scan and naturally scopes to the trading day."""
+    from datetime import datetime, timedelta
+    since = (datetime.now() - timedelta(hours=10)).isoformat()
+    events = store.query_events(event_type="account_summary_updated", since=since, limit=None)
+    series: list[float] = []
+    baseline = None
+    for e in events:
+        p = json.loads(e.get("payload_json", "{}"))
+        try:
+            eq = float(p.get("total_equity") or 0.0)
+            if eq:
+                series.append(round(eq, 2))
+            if baseline is None:
+                le = float(p.get("last_equity") or 0.0)
+                if le:
+                    baseline = round(le, 2)
+        except (TypeError, ValueError):
+            pass
+    if len(series) > points:  # keep the most recent N
+        series = series[-points:]
+    return {"equity": series, "baseline": baseline if baseline else (series[0] if series else None)}

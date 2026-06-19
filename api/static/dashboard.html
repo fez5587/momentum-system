@@ -168,6 +168,14 @@
   .st-weak    .trig-state { color: #7d8590; } .st-weak    .trig-fill { background: #39414d; }
   .st-waiting .trig-state { color: #7d8590; } .st-waiting .trig-fill { background: #30363d; }
   .st-armed.near .trig-bar { box-shadow: 0 0 0 1px #f1c40f55; }
+  /* intraday equity sparkline */
+  .pnl-spark { flex: 1.5 1 200px; }
+  .eqspark { margin-top: 2px; } .eqspark svg { display: block; }
+  /* per-position R / risk bar */
+  .rbar { position: relative; display: inline-block; width: 72px; height: 13px;
+    background: #0d1117; border: 1px solid var(--border); border-radius: 2px;
+    vertical-align: middle; overflow: hidden; }
+  .rtxt { font: 700 11px var(--mono); margin-left: 7px; vertical-align: middle; }
 
   /* activity feed */
   .feed-row { display: flex; align-items: center; gap: 10px; padding: 7px 14px; border-bottom: 1px solid #151a26; font: 500 12px var(--mono); }
@@ -225,6 +233,7 @@
   <div class="pnl-cell"><div class="label">Win Rate</div><div class="value num" id="pnl-winrate">—</div></div>
   <div class="pnl-cell"><div class="label">Avg R</div><div class="value num" id="pnl-avgr">—</div></div>
   <div class="pnl-cell"><div class="label">Open / Closed</div><div class="value num" id="pnl-counts">—</div></div>
+  <div class="pnl-cell pnl-spark"><div class="label">Day Curve</div><div id="equity-spark" class="eqspark">—</div></div>
 </div>
 
 <main>
@@ -501,6 +510,49 @@ function renderTriggers(tw) {
   }).join('');
 }
 
+// intraday equity sparkline — the day's P&L shape vs the prior close (dashed)
+function renderEquity(ec) {
+  const host = $("equity-spark"); if (!host) return;
+  const eq = (ec && ec.equity) || []; const base = ec && ec.baseline;
+  if (eq.length < 2) { host.innerHTML = '<span class="muted" style="font:600 11px var(--mono)">—</span>'; return; }
+  const W = 190, H = 34, pad = 2;
+  const lo = Math.min(...eq, base != null ? base : Infinity);
+  const hi = Math.max(...eq, base != null ? base : -Infinity);
+  const rng = (hi - lo) || 1;
+  const X = i => (pad + i * (W - 2 * pad) / (eq.length - 1));
+  const Y = v => (pad + (H - 2 * pad) * (1 - (v - lo) / rng));
+  const pts = eq.map((v, i) => X(i).toFixed(1) + ',' + Y(v).toFixed(1)).join(' ');
+  const up = eq[eq.length - 1] >= (base != null ? base : eq[0]);
+  const col = up ? '#2ecc71' : '#ff4d4f';
+  let baseLine = '';
+  if (base != null) { const by = Y(base).toFixed(1); baseLine = '<line x1="0" y1="' + by + '" x2="' + W + '" y2="' + by + '" stroke="#7d8590" stroke-width="1" stroke-dasharray="3 3" opacity=".55"/>'; }
+  const area = 'M' + X(0).toFixed(1) + ',' + (H - pad) + ' L' + eq.map((v, i) => X(i).toFixed(1) + ',' + Y(v).toFixed(1)).join(' L') + ' L' + X(eq.length - 1).toFixed(1) + ',' + (H - pad) + ' Z';
+  host.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">'
+    + '<path d="' + area + '" fill="' + col + '" opacity=".12"/>' + baseLine
+    + '<polyline points="' + pts + '" fill="none" stroke="' + col + '" stroke-width="1.5"/></svg>';
+}
+
+// per-position R bar — current open profit/loss in R units; -1R = the stop.
+// breakeven (0R) is the white tick; the stop (-1R) is the red tick; fill shows
+// where the position sits (green right = in profit, red left = toward the stop).
+function rBar(entry, cur, stop) {
+  if (entry == null || cur == null) return '<span class="muted">—</span>';
+  let r = (stop != null && entry > stop) ? (cur - entry) / (entry - stop) : null;
+  const W = 72, LOR = -1.5, HIR = 3.0;            // visible R range
+  const xR = rr => W * (Math.max(LOR, Math.min(HIR, rr)) - LOR) / (HIR - LOR);
+  let inner = '';
+  if (r != null) {
+    const z = xR(0), c = xR(r), col = r >= 0 ? '#2ecc71' : '#ff4d4f';
+    inner += '<div style="position:absolute;top:0;bottom:0;left:' + Math.min(z, c).toFixed(1) + 'px;width:' + Math.abs(c - z).toFixed(1) + 'px;background:' + col + ';opacity:.6"></div>';
+    inner += '<div style="position:absolute;top:-1px;bottom:-1px;left:' + xR(-1).toFixed(1) + 'px;width:1px;background:#ff4d4f;opacity:.6"></div>';   // stop
+    inner += '<div style="position:absolute;top:-1px;bottom:-1px;left:' + z.toFixed(1) + 'px;width:1px;background:#e6edf3;opacity:.7"></div>';        // breakeven
+  }
+  const txt = r != null ? (r >= 0 ? '+' : '') + r.toFixed(2) + 'R'
+    : ((cur - entry) / entry >= 0 ? '+' : '') + ((cur - entry) / entry * 100).toFixed(1) + '%';
+  const sgn = (r != null ? r : (cur - entry)) >= 0 ? 'pos' : 'neg';
+  return '<div class="rbar">' + inner + '</div><span class="rtxt ' + sgn + '">' + txt + '</span>';
+}
+
 function render(d) {
   latest = d;
 
@@ -540,6 +592,7 @@ function render(d) {
   fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 180 ? "#ff4d4f" : rk.data_age_s > 90 ? "#f1c40f" : "");
 
   renderTriggers(d.triggers);
+  renderEquity(d.equity_curve);
 
   const accts = d.accounts || [];
   $("acct-count").textContent = accts.length;
@@ -584,20 +637,31 @@ function render(d) {
       '<td class="num">' + timeOf(s.timestamp) + '</td></tr>')
   ), "No ready signals this session.");
 
+  // map each symbol -> its resting protective stop (for the R bar + spark stop line)
+  const stopBy = {};
+  (d.orders || []).forEach(snap => (snap.orders || []).forEach(o => {
+    if (o.side === "sell" && (o.type === "stop" || o.type === "stop_limit") && o.stop_price != null && !(o.symbol in stopBy))
+      stopBy[o.symbol] = +o.stop_price;
+  }));
   const posRows = [];
   (d.positions || []).forEach(snap => (snap.positions || []).forEach(pos => {
     const qty = +(pos.quantity != null ? pos.quantity : pos.qty != null ? pos.qty : 0);
-    posRows.push('<tr><td class="sym">' + esc(pos.symbol) + '</td>' +
-      '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(pos.symbol) + '" data-entry="' + (pos.avg_entry_price != null ? pos.avg_entry_price : pos.average_price != null ? pos.average_price : "") + '" data-stop=""></canvas></td>' +
+    const entry = pos.avg_entry_price != null ? +pos.avg_entry_price : (pos.average_price != null ? +pos.average_price : null);
+    const cur = pos.current_price != null ? +pos.current_price : (pos.market_price != null ? +pos.market_price : null);
+    const stop = stopBy[pos.symbol] != null ? stopBy[pos.symbol] : null;
+    const upnl = (entry != null && cur != null) ? (cur - entry) * Math.abs(qty) : (pos.unrealized_pl || pos.unrealized_pnl);
+    posRows.push('<tr><td class="sym">' + esc(pos.symbol) + (stop == null ? ' <span class="rtxt neg" title="no protective stop">⚠</span>' : '') + '</td>' +
+      '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(pos.symbol) + '" data-entry="' + (entry != null ? entry : "") + '" data-stop="' + (stop != null ? stop : "") + '"></canvas></td>' +
       '<td><span class="pill ' + (qty < 0 ? "short" : "long") + '">' + (qty < 0 ? "short" : "long") + '</span></td>' +
       '<td class="num">' + esc(Math.abs(qty)) + '</td>' +
-      '<td class="num">' + fmt(pos.avg_entry_price != null ? pos.avg_entry_price : pos.average_price) + '</td>' +
-      '<td class="num">' + fmt(pos.current_price != null ? pos.current_price : pos.market_price) + '</td>' +
-      '<td class="num ' + (+(pos.unrealized_pl || 0) >= 0 ? "pos" : "neg") + '">' + money(pos.unrealized_pl) + '</td>' +
+      '<td class="num">' + fmt(entry) + '</td>' +
+      '<td class="num">' + fmt(cur) + '</td>' +
+      '<td>' + rBar(entry, cur, stop) + '</td>' +
+      '<td class="num ' + (+(upnl || 0) >= 0 ? "pos" : "neg") + '">' + money(upnl) + '</td>' +
       '<td><button class="btn-exit" onclick="exitPos(\'' + esc(pos.symbol) + '\')">Exit</button></td></tr>');
   }));
   $("pos-count").textContent = posRows.length;
-  fill("positions", table(["Symbol", "Chart", "Side", "Qty", "Avg", "Last", "P/L", ""], posRows), "No open positions.");
+  fill("positions", table(["Symbol", "Chart", "Side", "Qty", "Avg", "Last", "R / risk", "P/L", ""], posRows), "No open positions.");
 
   renderWatch(d.watch_states || []);
 

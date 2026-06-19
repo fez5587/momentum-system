@@ -132,6 +132,9 @@ class AlpacaPaperSync:
                 "type": o.get("type"),
                 "status": o.get("status"),
                 "limit_price": o.get("limit_price"),
+                # capture the stop trigger too — needed for the dashboard R bar /
+                # spark stop-line / any stop-level read (only limit_price was kept).
+                "stop_price": o.get("stop_price"),
                 "filled_avg_price": o.get("filled_avg_price"),
                 "submitted_at": o.get("submitted_at"),
             }
