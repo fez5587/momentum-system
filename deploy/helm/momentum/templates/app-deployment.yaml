@@ -1,0 +1,80 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "momentum.appName" . }}
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+    app.kubernetes.io/component: app
+spec:
+  # Stateful singleton: the loop holds in-memory trading state and a 1:1 broker
+  # session. Never scale > 1. Recreate avoids two loops overlapping on rollout.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "momentum.selectorLabels" (dict "ctx" . "component" "app") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "momentum.selectorLabels" (dict "ctx" . "component" "app") | nindent 8 }}
+      annotations:
+        # Roll the pod when config/secret content changes.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      initContainers:
+        # Block until Postgres accepts connections so the first app connection
+        # (which auto-applies storage/pg_schema.sql) succeeds.
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image | quote }}
+          command:
+            - sh
+            - -c
+            - |
+              until pg_isready -h {{ include "momentum.postgresName" . }} -p {{ .Values.postgres.port }} -U {{ .Values.postgres.username }}; do
+                echo "waiting for postgres..."; sleep 2;
+              done
+      containers:
+        - name: app
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: {{ toYaml .Values.app.command | nindent 12 }}
+          ports:
+            - name: http
+              containerPort: 8010
+          envFrom:
+            - configMapRef:
+                name: {{ include "momentum.configMapName" . }}
+            - secretRef:
+                name: {{ include "momentum.secretName" . }}
+          volumeMounts:
+            - name: app-data
+              mountPath: /app/data
+          {{- if .Values.app.probes.enabled }}
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.app.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.app.probes.periodSeconds }}
+          livenessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: {{ .Values.app.probes.initialDelaySeconds }}
+            periodSeconds: {{ .Values.app.probes.periodSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.app.resources | nindent 12 }}
+      volumes:
+        - name: app-data
+          {{- if .Values.app.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "momentum.appDataPvcName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}

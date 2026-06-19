@@ -1,0 +1,162 @@
+# Default values for the momentum chart.
+# Override per-environment with `-f my-values.yaml` or `--set key=value`.
+
+# -- Container image for every workload (app loop, dashboard, CronJobs).
+image:
+  repository: ghcr.io/fez5587/momentum-system
+  # Pin to a pushed tag (commit SHA or `latest`) from the docker-publish workflow.
+  tag: latest
+  pullPolicy: IfNotPresent
+
+# Optional image pull secrets for a private GHCR package.
+imagePullSecrets: []
+
+nameOverride: ""
+fullnameOverride: ""
+
+# ----------------------------------------------------------------------------
+# App: the live trading loop WITH its embedded dashboard (port 8010).
+# It is a stateful singleton — do not raise replicas above 1.
+# ----------------------------------------------------------------------------
+app:
+  # Runs the loop with the dashboard attached (the dashboard's approve/reject/
+  # exit endpoints require the in-process TradingExecutionService).
+  command: ["python", "run_live_paper.py"]
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  # Shared writable dir (DuckDB research file, logs, learned_params.json, tokens).
+  # The nightly-tune CronJob writes learned_params.json here for the loop to read.
+  persistence:
+    enabled: true
+    size: 5Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+  # HTTP probes hit the dashboard root.
+  probes:
+    enabled: true
+    initialDelaySeconds: 30
+    periodSeconds: 30
+
+# Dashboard service (ClusterIP by default; port-forward to reach it).
+service:
+  type: ClusterIP
+  port: 8010
+
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  host: momentum.local
+  tls: []
+
+# ----------------------------------------------------------------------------
+# In-cluster PostgreSQL — the single source of truth (StatefulSet + PVC).
+# Schema auto-creates on first app connection from storage/pg_schema.sql.
+# ----------------------------------------------------------------------------
+postgres:
+  image: postgres:16
+  database: momentum
+  username: momentum
+  # If empty, a random password is generated on first install and stored in the
+  # chart-managed Secret. Set explicitly to keep it stable across upgrades.
+  password: ""
+  port: 5432
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+  persistence:
+    size: 10Gi
+    storageClass: ""
+    accessMode: ReadWriteOnce
+
+# ----------------------------------------------------------------------------
+# Secrets — DB URL is built from the in-cluster Postgres service automatically.
+# Provide broker keys via --set or, better, an existingSecret (sealed-secrets,
+# external-secrets, etc). Never commit real keys into values.yaml.
+# ----------------------------------------------------------------------------
+secrets:
+  # If set, the chart will NOT render its own Secret and instead expects this
+  # one to already contain DATABASE_URL, ALPACA_*/APCA_*, and any SCHWAB_* keys.
+  existingSecret: ""
+  alpacaApiKey: ""
+  alpacaSecretKey: ""
+  alpacaBaseUrl: "https://paper-api.alpaca.markets"
+  schwab: {}   # e.g. SCHWAB_MARKET_DATA_APP_KEY: "..."
+
+# ----------------------------------------------------------------------------
+# Non-secret tuning env (ConfigMap). Mirrors .env.example; override freely.
+# ----------------------------------------------------------------------------
+config:
+  TRADING_EXECUTION_MODE: "alpaca_paper"
+  TRADING_EXECUTION_ENABLED: "1"
+  TRADING_AUTO_APPROVE: "0"
+  TRADING_MAX_CONCURRENT_POSITIONS: "6"
+  TRADING_RISK_PER_TRADE_PCT: "0.01"
+  TRADING_MAX_DAILY_LOSS_PCT: "0.03"
+  TRADING_EOD_FLATTEN_ENABLED: "1"
+  WATCHER_ENABLED: "1"
+  WATCHER_INTERVAL_SECONDS: "60"
+  WATCHER_SYMBOLS: "AAPL,TSLA,NVDA,AMD,SOFI"
+  WATCHER_PRICE_MIN: "1"
+  WATCHER_PRICE_MAX: "20"
+  STRATEGY_SETUPS: "opening_range_break"
+  LIVE_BARS_ENABLED: "1"
+  LIVE_BARS_INTERVAL_SECONDS: "60"
+  ALPACA_DATA_FEED: "iex"
+  ALPACA_BACKFILL_FEED: "sip"
+  TRIGGER_ENABLED: "1"
+  TRIGGER_GAP_MIN: "3.0"
+  TRIGGER_GAP_MAX: "35"
+  TRIGGER_RVOL_MIN: "2.0"
+  ORB_BARS: "5"
+  DASHBOARD_HOST: "0.0.0.0"
+  DASHBOARD_PORT: "8010"
+  # Leave schema auto-creation on (storage/db_pg.py applies pg_schema.sql).
+  PG_SKIP_SCHEMA: "0"
+
+# ----------------------------------------------------------------------------
+# Scheduled jobs (CronJobs). Times are US/Eastern via spec.timeZone (K8s >=1.27),
+# weekdays only — matching the existing *.sh crontab comments.
+# ----------------------------------------------------------------------------
+cronjobs:
+  enabled: true
+  timeZone: America/New_York
+  journal:
+    enabled: true
+    schedule: "2 16 * * 1-5"
+    command: ["python", "momentum_cli.py", "journal"]
+  eodReplay:
+    enabled: true
+    schedule: "5 16 * * 1-5"
+    command: ["python", "eod_replay.py"]
+  nightlyTune:
+    enabled: true
+    schedule: "30 17 * * 1-5"
+    command: ["python", "nightly_tune.py"]
+
+# ----------------------------------------------------------------------------
+# Grafana (optional) — provisioned against the in-cluster Postgres service.
+# ----------------------------------------------------------------------------
+grafana:
+  enabled: true
+  image: grafana/grafana:11.2.0
+  service:
+    type: ClusterIP
+    port: 3000
+  persistence:
+    enabled: true
+    size: 1Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi

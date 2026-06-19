@@ -1,0 +1,48 @@
+# VCS / CI
+.git
+.github
+.gitignore
+
+# Secrets and runtime data (never bake into the image; provided via Secret/PVC)
+.env
+.env.*
+data/
+*.duckdb
+*.wal
+
+# Local Grafana stack (provisioned via the Helm chart instead)
+grafana/
+
+# Deploy artifacts don't belong inside the app image
+deploy/
+Dockerfile
+.dockerignore
+
+# Python caches / build / venvs
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv
+venv/
+ENV/
+env/
+.ruff_cache/
+
+# Tests and coverage
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Editor / OS cruft
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Large artifacts
+*.zip
+archive/
+uv.lock

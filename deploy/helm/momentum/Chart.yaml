@@ -1,0 +1,14 @@
+apiVersion: v2
+name: momentum
+description: Small-cap momentum research & paper-trading system, with an in-cluster PostgreSQL datastore.
+type: application
+# Chart version is independent of the app; bump on chart changes.
+version: 0.1.0
+# Tracks the application release (pyproject.toml).
+appVersion: "0.4.0"
+kubeVersion: ">=1.27.0-0"
+keywords:
+  - trading
+  - postgres
+  - momentum
+home: https://github.com/fez5587/momentum-system
