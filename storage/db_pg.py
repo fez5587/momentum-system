@@ -210,10 +210,24 @@ def get_connection(db_path: str | Path = "momentum") -> PgConnection:
     ``db_path`` is retained for call-site compatibility but the datastore is a
     single Postgres database. The special value ":memory:" yields an isolated
     throwaway schema (used by the test suite for a fresh database per test).
+
+    ``MOMENTUM_PG_SCHEMA`` (set only by the test harness) pins every connection
+    to one named schema, so a test that seeds via one EventStore and reads via
+    another (e.g. the dashboard server fixture) shares an isolated database
+    instead of falling through to the production ``public`` schema. The fixture
+    that sets it owns cleanup, so the connection does not auto-drop the schema.
     """
     if str(db_path) == ":memory:":
         return _isolated_connection()
     conn = _connect()
+    pinned = os.environ.get("MOMENTUM_PG_SCHEMA", "").strip()
+    if pinned:
+        cur = conn.cursor()
+        cur.execute(f'CREATE SCHEMA IF NOT EXISTS "{pinned}"')
+        cur.execute(f'SET search_path TO "{pinned}"')
+        cur.close()
+        _apply_schema(conn, search_path=pinned)
+        return PgConnection(conn)
     if os.environ.get("PG_SKIP_SCHEMA", "").strip().lower() not in {"1", "true", "yes"}:
         _apply_schema(conn)
     return PgConnection(conn)

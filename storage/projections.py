@@ -74,7 +74,10 @@ def _latest_event_payload(store, event_type: str, until: str | None = None):
     try:
         rows = store.con.execute(
             f"SELECT payload_json, timestamp FROM events WHERE {cond} "
-            f"ORDER BY timestamp DESC LIMIT 1"
+            # created_at DESC tie-breaks events sharing a timestamp (e.g. two
+            # account snapshots emitted in the same second) so we return the
+            # truly newest by insertion order, not an arbitrary one.
+            f"ORDER BY timestamp DESC, created_at DESC LIMIT 1"
         ).fetchall()
         return rows[0] if rows else None
     except Exception:  # noqa: BLE001
@@ -236,10 +239,12 @@ def query_ready_signals_snapshot(store, session_id: str | None = None) -> list[d
 def query_watch_states_snapshot(store, session_id: str | None = None,
                                 for_date: str | None = None) -> list[dict]:
     since, until = _evt_window(for_date)
+    # symbol_state_changed is tiny (~2k all-time) and we want the current state
+    # of every watched symbol, so load it unbounded; only criteria_evaluated
+    # (the ~120k-row monster that made this projection 112s) needs the window.
     state_events = store.query_events(
         event_type="symbol_state_changed",
-        session_id=session_id, since=since, until=until,
-        limit=None,
+        session_id=session_id, limit=None,
     )
     criteria_events = store.query_events(
         event_type="criteria_evaluated",

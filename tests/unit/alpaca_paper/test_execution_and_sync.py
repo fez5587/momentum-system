@@ -43,7 +43,7 @@ class FakeClient:
             }
         ]
 
-    def get_orders(self, status="all", limit=100):
+    def get_orders(self, status="all", limit=100, nested=False):
         return [{"id": "broker-123", "symbol": "GOOD", "status": "filled"}]
 
 
@@ -116,7 +116,7 @@ def test_sync_survives_client_failure(store):
         def get_positions(self):
             raise AlpacaApiError(500, "down")
 
-        def get_orders(self, status="all", limit=100):
+        def get_orders(self, status="all", limit=100, nested=False):
             raise AlpacaApiError(500, "down")
 
     sync = AlpacaPaperSync(store, client=Down(), session_id="t")

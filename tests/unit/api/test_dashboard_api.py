@@ -1,9 +1,12 @@
 """Dashboard API endpoint tests over a real local HTTP server."""
 
 import json
+import os
 import urllib.request
+import uuid
 from datetime import datetime
 
+import psycopg2
 import pytest
 
 from api.main import DashboardState, serve_in_background
@@ -12,6 +15,25 @@ from storage.event_store import EventStore
 from tests.unit.test_trading_execution import FakeExecutor, make_service
 
 T0 = datetime(2026, 6, 11, 9, 45)
+
+
+@pytest.fixture(autouse=True)
+def _isolated_pg_schema(monkeypatch):
+    """Pin every connection in this test to one throwaway schema, so the
+    seed store and the dashboard's per-request stores share an ISOLATED
+    database. Without this the file-path db_paths these tests pass fall
+    through to the production ``public`` schema (the path is ignored under
+    Postgres) — they'd read live data and pollute it with fixtures. The
+    ``mem_`` prefix lets the session-scoped conftest cleanup catch any leak."""
+    schema = f"mem_{uuid.uuid4().hex[:12]}"
+    monkeypatch.setenv("MOMENTUM_PG_SCHEMA", schema)
+    yield
+    url = os.environ.get("DATABASE_URL")
+    if url:
+        conn = psycopg2.connect(url)
+        conn.autocommit = True
+        conn.cursor().execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+        conn.close()
 
 
 @pytest.fixture
