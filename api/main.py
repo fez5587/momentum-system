@@ -279,7 +279,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
         Falls back gracefully — a heartbeat every ~15s keeps proxies open even
         when nothing is happening, and the loop exits when the client drops or
-        the server signals shutdown (so the DuckDB handle is released cleanly).
+        the server signals shutdown (so the DB handle is released cleanly).
         """
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
@@ -395,7 +395,7 @@ def create_server(
 ) -> ThreadingHTTPServer:
     shutdown_event = threading.Event()
     server = ThreadingHTTPServer((host, port), make_handler(state, shutdown_event))
-    # let SSE loops notice shutdown and release their DuckDB handles cleanly
+    # let SSE loops notice shutdown and release their DB handles cleanly
     server._sse_shutdown = shutdown_event  # type: ignore[attr-defined]
     _orig_shutdown = server.shutdown
 

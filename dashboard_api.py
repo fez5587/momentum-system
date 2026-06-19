@@ -27,9 +27,9 @@ def main() -> None:
     host = os.environ.get("DASHBOARD_HOST", "0.0.0.0")
     port = int(os.environ.get("DASHBOARD_PORT", "8765"))
     # The datastore is Postgres (DATABASE_URL); the event store reads it directly.
-    # WATCHER_EVENT_DB_PATH is a legacy fallback only.
+    # WATCHER_EVENT_DB_PATH is a legacy fallback only (the path is ignored).
     db_path = os.environ.get("DATABASE_URL") or os.environ.get(
-        "WATCHER_EVENT_DB_PATH", "./data/momentum.duckdb")
+        "WATCHER_EVENT_DB_PATH", "momentum")
     mode = os.environ.get("TRADING_EXECUTION_MODE", "alpaca_paper")
     state = DashboardState(db_path, execution_service=None, execution_mode=mode)
     server = create_server(state, host, port)

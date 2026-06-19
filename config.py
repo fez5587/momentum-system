@@ -75,7 +75,9 @@ class QualityConfig(BaseModel):
 
 class DataConfig(BaseModel):
     dir: str = "./data"
-    db_path: str = "./data/momentum.duckdb"
+    # Datastore is Postgres (DATABASE_URL); this default is a legacy fallback
+    # only — the connection layer ignores the path. See storage.db_pg.
+    db_path: str = "momentum"
 
 
 class TelemetryConfig(BaseModel):

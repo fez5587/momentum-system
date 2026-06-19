@@ -136,8 +136,9 @@ def build_runtime(args: argparse.Namespace) -> dict:
     has_keys = alpaca_settings.is_configured
     client = AlpacaPaperClient(alpaca_settings) if has_keys else None
 
-    event_db = os.environ.get("WATCHER_EVENT_DB_PATH", "./data/momentum.duckdb")
-    os.makedirs(os.path.dirname(event_db) or ".", exist_ok=True)
+    # Datastore is Postgres (DATABASE_URL); WATCHER_EVENT_DB_PATH is a legacy
+    # fallback the connection layer ignores.
+    event_db = os.environ.get("WATCHER_EVENT_DB_PATH", "momentum")
     store = EventStore(event_db)
     research_con = open_research_db("market")
 

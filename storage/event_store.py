@@ -20,8 +20,9 @@ logger = logging.getLogger(__name__)
 class EventStore:
     """Append-only event store for canonical events."""
 
-    def __init__(self, db_path: str = "./data/momentum_events.duckdb"):
-        """Initialize event store with DuckDB connection."""
+    def __init__(self, db_path: str = "momentum"):
+        """Initialize event store. ``db_path`` is retained for call-site
+        compatibility; the datastore is Postgres (see storage.db_pg)."""
         self.con = get_connection(db_path)
         # serialize DB access: the fast trigger thread and the main loop share
         # this one psycopg2 connection, which is not safe for concurrent use.
