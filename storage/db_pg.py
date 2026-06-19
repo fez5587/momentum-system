@@ -37,6 +37,7 @@ from typing import Any
 
 import pandas as pd
 import psycopg2
+from psycopg2.extras import execute_batch
 
 SCHEMA_SQL_PATH = Path(__file__).with_name("pg_schema.sql")
 
@@ -138,7 +139,11 @@ class PgConnection:
 
         def go():
             cur = self._conn.cursor()
-            cur.executemany(_translate(sql), seq)
+            # execute_batch sends page_size statements per round-trip; plain
+            # psycopg2 executemany sends ONE per row. Over the remote LAN
+            # Postgres that was ~771 round-trips for a daily-bar upsert and
+            # froze the live loop's discovery step for ~40s each pass.
+            execute_batch(cur, _translate(sql), seq, page_size=200)
             cur.close()
             return self
         return self._run(go)
