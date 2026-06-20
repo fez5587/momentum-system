@@ -35,6 +35,7 @@ from storage.projections import (
     query_account_positions_snapshot,
     query_account_summary_snapshot,
     query_approval_queue,
+    query_catalyst_advisory,
     query_fills_feed,
     query_armed_triggers,
     query_equity_curve,
@@ -100,6 +101,14 @@ class DashboardState:
         with self._lock:
             store = self.open_store()
             try:
+                # Local-LLM catalyst advisory (live only). {} when enrichment has
+                # never run, so the dashboard simply shows no catalyst column.
+                catalyst = query_catalyst_advisory(store) if is_live else {}
+                approval_queue = query_approval_queue(store) if is_live else []
+                for row in approval_queue:  # attach advisory for the human approver
+                    adv = catalyst.get(str(row.get("symbol") or "").upper())
+                    if adv:
+                        row["catalyst"] = adv
                 return {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "execution_mode": self.execution_mode,
@@ -110,7 +119,8 @@ class DashboardState:
                     "risk": query_risk_state(store, for_date=for_date),
                     "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
                     "equity_curve": query_equity_curve(store, for_date=for_date),
-                    "approval_queue": query_approval_queue(store) if is_live else [],
+                    "catalyst": catalyst,
+                    "approval_queue": approval_queue,
                     "ready_signals": query_ready_signals_snapshot(store) if is_live else [],
                     # watch_states is a LIVE concept (and the heaviest projection
                     # — ~99k criteria rows for a whole past day); skip it for a

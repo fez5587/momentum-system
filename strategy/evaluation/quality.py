@@ -33,11 +33,18 @@ def calculate_setup_quality(
     opening_strength: str = "neutral",
     data_quality: float = 1.0,
     thresholds: QualityThresholds | None = None,
+    catalyst_score: float | None = None,
 ) -> QualityScore:
     """Blend setup ingredients into one 0..1 quality score.
 
-    Weights: gap 20%, RVOL 25%, structure 30%, VWAP 10%,
+    Default weights (no catalyst): gap 20%, RVOL 25%, structure 30%, VWAP 10%,
     opening strength 5%, data quality 10%.
+
+    When ``catalyst_score`` (a 0..1 'how bullish a catalyst' signal, computed
+    OUTSIDE from the LLM advisory) is provided, weights re-balance to make room
+    for a 15% catalyst component: gap 15%, RVOL 20%, structure 25%, VWAP 10%,
+    opening 5%, data 10%, catalyst 15%. Passing ``None`` reproduces the exact
+    pre-catalyst score (so existing behavior/tests are unchanged).
     """
     thresholds = thresholds or QualityThresholds()
 
@@ -50,14 +57,36 @@ def calculate_setup_quality(
     )
     dq_component = min(1.0, max(0.0, data_quality))
 
-    score = (
-        0.20 * gap_component
-        + 0.25 * rvol_component
-        + 0.30 * structure_component
-        + 0.10 * vwap_component
-        + 0.05 * opening_component
-        + 0.10 * dq_component
-    )
+    components = {
+        "gap": gap_component,
+        "relative_volume": rvol_component,
+        "structure": structure_component,
+        "vwap": vwap_component,
+        "opening_strength": opening_component,
+        "data_quality": dq_component,
+    }
+
+    if catalyst_score is None:
+        score = (
+            0.20 * gap_component
+            + 0.25 * rvol_component
+            + 0.30 * structure_component
+            + 0.10 * vwap_component
+            + 0.05 * opening_component
+            + 0.10 * dq_component
+        )
+    else:
+        catalyst_component = min(1.0, max(0.0, catalyst_score))
+        components["catalyst"] = catalyst_component
+        score = (
+            0.15 * gap_component
+            + 0.20 * rvol_component
+            + 0.25 * structure_component
+            + 0.10 * vwap_component
+            + 0.05 * opening_component
+            + 0.10 * dq_component
+            + 0.15 * catalyst_component
+        )
 
     if score >= thresholds.a_grade:
         grade = "A"
@@ -71,13 +100,6 @@ def calculate_setup_quality(
     return QualityScore(
         score=round(score, 4),
         grade=grade,
-        components={
-            "gap": gap_component,
-            "relative_volume": rvol_component,
-            "structure": structure_component,
-            "vwap": vwap_component,
-            "opening_strength": opening_component,
-            "data_quality": dq_component,
-        },
+        components=components,
         tradeable=score >= thresholds.min_tradeable,
     )

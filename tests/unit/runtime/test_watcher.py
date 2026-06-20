@@ -74,6 +74,56 @@ def test_tick_emits_canonical_events(store, provider):
     assert states  # discovered -> ... -> ready transitions recorded
 
 
+def _ready_quality(store, symbol="GOOD"):
+    import json
+    events = store.query_events(event_type="signal_ready", symbol=symbol)
+    assert events, "expected a signal_ready event"
+    payload = json.loads(events[-1]["payload_json"])
+    data = payload.get("signal_data") or payload.get("payload", {}).get("signal_data")
+    return data["quality_score"]
+
+
+def test_catalyst_score_provider_lifts_quality(store, provider):
+    # baseline: no provider -> today's exact quality score
+    base = make_watcher(store, provider)
+    base.tick(SESSION_DATE)
+    baseline_q = _ready_quality(store)
+
+    # a strong bullish catalyst for GOOD raises its blended quality score
+    store2 = EventStore(":memory:")
+    try:
+        watcher = Watcher(
+            store2, provider,
+            WatcherConfig(session_id="t2", mode=EventMode.PAPER, min_quality=0.0),
+            catalyst_score_provider=lambda sym: 1.0 if sym == "GOOD" else None,
+        )
+        watcher.tick(SESSION_DATE)
+        boosted_q = _ready_quality(store2)
+    finally:
+        store2.close()
+
+    assert boosted_q > baseline_q
+
+
+def test_none_catalyst_provider_is_unchanged(store, provider):
+    # an explicit provider that returns None must reproduce the baseline exactly
+    base = make_watcher(store, provider)
+    base.tick(SESSION_DATE)
+    baseline_q = _ready_quality(store)
+
+    store2 = EventStore(":memory:")
+    try:
+        watcher = Watcher(
+            store2, provider,
+            WatcherConfig(session_id="t3", mode=EventMode.PAPER, min_quality=0.0),
+            catalyst_score_provider=lambda sym: None,
+        )
+        watcher.tick(SESSION_DATE)
+        assert _ready_quality(store2) == baseline_q
+    finally:
+        store2.close()
+
+
 def test_signal_ready_debounced_across_ticks(store, provider):
     watcher = make_watcher(store, provider)
     watcher.tick(SESSION_DATE)

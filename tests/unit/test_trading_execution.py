@@ -472,3 +472,70 @@ def test_repeated_backouts_bench_symbol_for_session(store):
     service._register_backout("THRASH")
     clock.advance(10_000)  # hours later, still benched
     assert service._in_cooldown("THRASH")
+
+
+# --- catalyst dilution veto (Phase 2; gated OFF by default) -----------------
+
+def _service_with_catalyst(store, advisory, *, veto_enabled, executor=None):
+    settings = ExecutionSettings(
+        enabled=True, auto_approve=False, max_orders_per_tick=2,
+        max_concurrent_positions=3, risk_per_trade_pct=0.01,
+        default_equity=100_000.0,
+        catalyst_veto_enabled=veto_enabled,
+        catalyst_veto_min_conviction=0.6,
+    )
+    return TradingExecutionService(
+        store,
+        executor=executor or FakeExecutor(),
+        settings=settings,
+        trading_mode=TradingModeSettings(execution_mode="alpaca_paper"),
+        session_id="t",
+        catalyst_provider=lambda sym: advisory,
+    )
+
+
+def test_dilution_veto_blocks_entry_and_emits_event(store):
+    emit_signal(store, symbol="DILUT")
+    advisory = {"is_dilutive": True, "conviction": 0.9,
+                "catalyst_type": "offering_dilution", "sentiment": -0.8,
+                "rationale": "registered direct offering"}
+    service = _service_with_catalyst(store, advisory, veto_enabled=True)
+
+    requested = service.request_approvals_for_ready_signals()
+    assert requested == []                       # no approval created
+    assert query_approval_queue(store) == []
+    risk_events = store.query_events(event_type="risk_rule_triggered")
+    assert any(
+        __import__("json").loads(e["payload_json"]).get("rule_type")
+        == "catalyst_dilution_veto"
+        for e in risk_events
+    )
+
+
+def test_dilution_veto_disabled_allows_entry(store):
+    emit_signal(store, symbol="DILUT")
+    advisory = {"is_dilutive": True, "conviction": 0.9}
+    service = _service_with_catalyst(store, advisory, veto_enabled=False)
+    assert len(service.request_approvals_for_ready_signals()) == 1
+
+
+def test_dilution_veto_below_conviction_allows_entry(store):
+    emit_signal(store, symbol="MAYBE")
+    advisory = {"is_dilutive": True, "conviction": 0.4}  # under the 0.6 floor
+    service = _service_with_catalyst(store, advisory, veto_enabled=True)
+    assert len(service.request_approvals_for_ready_signals()) == 1
+
+
+def test_non_dilutive_catalyst_allows_entry(store):
+    emit_signal(store, symbol="FDA")
+    advisory = {"is_dilutive": False, "conviction": 0.95,
+                "catalyst_type": "fda_approval"}
+    service = _service_with_catalyst(store, advisory, veto_enabled=True)
+    assert len(service.request_approvals_for_ready_signals()) == 1
+
+
+def test_breakout_now_respects_dilution_veto(store):
+    advisory = {"is_dilutive": True, "conviction": 0.9}
+    service = _service_with_catalyst(store, advisory, veto_enabled=True)
+    res = service.submit_breakout_now("DILUT", trigger=14.0, stop=13.45, last_price=14.0)
+    assert res["ok"] is False and res["skipped"] == "dilution_veto"

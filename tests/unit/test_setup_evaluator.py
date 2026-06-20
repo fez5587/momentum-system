@@ -63,3 +63,15 @@ def test_criteria_results_cover_all_weights():
     }
     evaluated = set(result.criteria_names_passed) | set(result.criteria_names_failed)
     assert expected <= evaluated
+
+
+def test_catalyst_score_is_optional_passthrough():
+    """The Phase 2 catalyst_score is a pure pass-through: None == legacy, and a
+    strong catalyst lifts the setup's quality score without changing the gate."""
+    kw = dict(previous_close=10.0, avg_daily_volume=500_000, evaluation_time=EVAL_TIME)
+    legacy = evaluate_setup(bull_flag_bars(), **kw)
+    explicit_none = evaluate_setup(bull_flag_bars(), catalyst_score=None, **kw)
+    boosted = evaluate_setup(bull_flag_bars(), catalyst_score=1.0, **kw)
+
+    assert legacy.setups[0]["quality_score"] == explicit_none.setups[0]["quality_score"]
+    assert boosted.setups[0]["quality_score"] > legacy.setups[0]["quality_score"]

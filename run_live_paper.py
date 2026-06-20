@@ -50,6 +50,8 @@ from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.ingestion.alpaca_news import ingest_alpaca_news
+from research.ingestion.news_enrichment import enrich_recent_news
+from config import OllamaConfig
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
 from runtime.halt_guard import is_halt_gap
@@ -195,6 +197,33 @@ def build_runtime(args: argparse.Namespace) -> dict:
               f"(tuned {str(_learned.get('as_of', ''))[:10]} over {_learned.get('sessions')} "
               f"sessions; backtest pnl {_learned.get('pnl')}, entry@{_learned.get('entry_min')}min)")
 
+    ollama_cfg = OllamaConfig.from_env()
+
+    # Catalyst advisory provider, TTL-cached so a pass doesn't re-query per symbol;
+    # returns None on any fault so neither the (gated) dilution veto nor the score
+    # blend ever block/skew on a DB blip. Shared by the watcher AND the execution
+    # service (one cache). catalyst_score_provider maps the advisory -> a 0..1 score
+    # OUTSIDE the pure evaluator, and is only handed to the watcher when the score
+    # blend is explicitly enabled (so Phase 1 advisory never changes scoring).
+    _catalyst_cache: dict = {"map": {}, "at": 0.0}
+    _CATALYST_TTL = 30.0
+
+    def catalyst_provider(symbol: str):
+        import time as _time
+        from research.ingestion.news_enrichment import catalyst_map
+        now = _time.monotonic()
+        if (now - _catalyst_cache["at"]) >= _CATALYST_TTL:
+            try:
+                _catalyst_cache["map"] = catalyst_map(research_con)
+            except Exception:  # noqa: BLE001
+                _catalyst_cache["map"] = {}
+            _catalyst_cache["at"] = now
+        return _catalyst_cache["map"].get((symbol or "").upper())
+
+    def catalyst_score_provider(symbol: str):
+        from research.ingestion.news_enrichment import catalyst_score
+        return catalyst_score(catalyst_provider(symbol))
+
     watcher = Watcher(
         store,
         ResearchWatchlistProvider(
@@ -211,6 +240,9 @@ def build_runtime(args: argparse.Namespace) -> dict:
             ready_score_pct=float(os.environ.get(
                 "WATCHER_READY_SCORE", str(_learned.get("ready_score_pct", 60.0)))),
             min_quality=float(os.environ.get("WATCHER_MIN_QUALITY", "0.30")),
+        ),
+        catalyst_score_provider=(
+            catalyst_score_provider if ollama_cfg.catalyst_score_enabled else None
         ),
     )
 
@@ -255,6 +287,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
             trading_mode=TradingModeSettings.from_env(),
             session_id=session_id,
             price_provider=latest_price,
+            catalyst_provider=catalyst_provider,
         )
         if executor
         else None
@@ -286,6 +319,8 @@ def build_runtime(args: argparse.Namespace) -> dict:
         "sync": sync,
         "book": book,
         "latest_price": latest_price,
+        "catalyst_provider": catalyst_provider,
+        "ollama_cfg": ollama_cfg,
         "session_id": session_id,
         "event_db": event_db,
     }
@@ -294,6 +329,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     rt = build_runtime(args)
+    ollama_cfg = rt["ollama_cfg"]
     symbols: list[str] = rt["symbols"]
     client = rt["client"]
 
@@ -560,6 +596,32 @@ def main(argv: list[str] | None = None) -> int:
         news_map = recent_news_map(
             rt["research_con"], lookback_hours=int(os.environ.get("NEWS_LOOKBACK_HOURS", "8")))
         news_boost = float(os.environ.get("NEWS_RANK_BOOST", "2.0"))
+        # GATED graded ranking from the LLM catalyst read. When the score blend is
+        # off, ranking is the existing binary `news_boost if catalyst else 1.0`.
+        # When on, a bullish catalyst boosts by `1 + gain*score` and a confirmed
+        # dilutive offering is sunk below the armed cut (multiplied by a small
+        # penalty) so the book stops arming the gap-and-fade traps.
+        cat_map: dict = {}
+        if ollama_cfg.catalyst_score_enabled:
+            from research.ingestion.news_enrichment import catalyst_map as _cmap
+            try:
+                cat_map = _cmap(rt["research_con"])
+            except Exception:  # noqa: BLE001
+                cat_map = {}
+        news_rank_gain = float(os.environ.get("NEWS_RANK_BOOST_GAIN", "2.0"))
+        dilutive_penalty = float(os.environ.get("NEWS_DILUTIVE_PENALTY", "0.1"))
+
+        def _cat_mult(sym: str, has_headline: bool) -> float:
+            if not ollama_cfg.catalyst_score_enabled:
+                return news_boost if has_headline else 1.0
+            from research.ingestion.news_enrichment import catalyst_score as _cscore
+            adv = cat_map.get((sym or "").upper())
+            if not adv:
+                return 1.0
+            if adv.get("is_dilutive") and float(adv.get("conviction") or 0.0) >= (
+                    ollama_cfg.dilution_veto_min_conviction):
+                return dilutive_penalty
+            return 1.0 + news_rank_gain * (_cscore(adv) or 0.0)
         # optional MANUAL per-symbol priority nudge (SYMBOL_WEIGHTS=ABCD:1.2,XYZ:1.1)
         # — a small boost to names you want watched; keep modest so it doesn't
         # override the gap/volume logic.
@@ -611,7 +673,7 @@ def main(argv: list[str] | None = None) -> int:
                 # a fresh catalyst is WHY a small-cap runs — boost it up the rank;
                 # times an optional manual per-symbol weight (default 1.0)
                 "_score": (g.gap_pct * max(g.relative_volume, 0.1)
-                           * (news_boost if catalyst else 1.0)
+                           * _cat_mult(g.symbol, bool(catalyst))
                            * weights.get(g.symbol, 1.0)),
                 "complete": complete,
             })
@@ -784,6 +846,24 @@ def main(argv: list[str] | None = None) -> int:
             return f"+{len(res.new_items)} new / {res.item_count} fetched"
         return None
 
+    # Local-LLM (Ollama) news/catalyst enrichment — advisory layer. Runs on its
+    # OWN daemon thread with its OWN DB connection (started below), NOT the
+    # scheduler thread: a slow/hung Ollama pass (up to batch_limit x timeout) must
+    # never stall exits / guard / eod-flatten, which share the scheduler thread,
+    # and research_con is a single psycopg2 connection unsafe to share across
+    # threads. Gated by ollama.enabled AND enrichment_enabled; no-op if Ollama down.
+    def enrich_loop():
+        try:
+            econ = open_research_db("market")
+        except Exception as exc:  # noqa: BLE001
+            print(f"[enrich] no DB connection, enrichment off: {exc}", flush=True)
+            return
+        while not stop_event.wait(float(ollama_cfg.enrichment_interval_seconds)):
+            try:
+                enrich_recent_news(econ, ollama_cfg)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[enrich] error: {exc}", flush=True)
+
     scheduler = Scheduler()
     scheduler.add("news", step_news, float(os.environ.get("ALPACA_NEWS_INTERVAL_SECONDS", "120")),
                   enabled=_flag("ALPACA_NEWS_ENABLED", "1"))
@@ -845,6 +925,10 @@ def main(argv: list[str] | None = None) -> int:
         trigger_thread = threading.Thread(target=trigger_loop, name="trigger", daemon=True)
         trigger_thread.start()
         print(f"[boot] fast trigger thread started (every {trigger_interval:.0f}s)")
+    # news enrichment on its OWN thread (never blocks the scheduler's trade steps)
+    if ollama_cfg.enabled and ollama_cfg.enrichment_enabled:
+        threading.Thread(target=enrich_loop, name="enrich", daemon=True).start()
+        print(f"[boot] news enrichment thread started (every {ollama_cfg.enrichment_interval_seconds}s, model {ollama_cfg.model})")
     try:
         # one immediate full pass, then interval-driven
         run_pass()

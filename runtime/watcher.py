@@ -15,7 +15,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, date
-from typing import Protocol
+from typing import Callable, Protocol
 
 import pandas as pd
 
@@ -80,10 +80,14 @@ class Watcher:
         store: EventStore,
         provider: WatchlistProvider,
         config: WatcherConfig | None = None,
+        catalyst_score_provider: Callable[[str], float | None] | None = None,
     ):
         self.store = store
         self.provider = provider
         self.config = config or WatcherConfig()
+        # optional symbol -> 0..1 catalyst score (or None). Injected so the pure
+        # evaluator stays DB-free; None provider == today's behavior exactly.
+        self.catalyst_score_provider = catalyst_score_provider
         if not self.config.session_id:
             self.config.session_id = f"session-{date.today().isoformat()}"
         # symbol -> current state for this session
@@ -181,6 +185,15 @@ class Watcher:
                 except Exception:  # noqa: BLE001 - fall back to now()
                     eval_time = None
 
+                # optional LLM catalyst score (None unless the blend is enabled
+                # AND a provider is injected) — never raises into the loop.
+                cat_score = None
+                if self.catalyst_score_provider is not None:
+                    try:
+                        cat_score = self.catalyst_score_provider(symbol)
+                    except Exception:  # noqa: BLE001
+                        cat_score = None
+
                 evaluation = evaluate_setup(
                     bars,
                     previous_close=candidate.previous_close,
@@ -188,6 +201,7 @@ class Watcher:
                     ready_score_pct=self.config.ready_score_pct,
                     evaluation_time=eval_time,
                     min_bars=self.config.min_bars,
+                    catalyst_score=cat_score,
                 )
                 result.evaluated += 1
 

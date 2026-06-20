@@ -758,3 +758,36 @@ def query_equity_curve(store, points: int = 200, for_date: str | None = None) ->
     if len(series) > points:  # keep the most recent N
         series = series[-points:]
     return {"equity": series, "baseline": baseline if baseline else (series[0] if series else None)}
+
+
+def query_catalyst_advisory(store, lookback_hours: int = 8) -> dict:
+    """Local-LLM news/catalyst read for the dashboard advisory column.
+
+    {ticker: {catalyst_type, sentiment, conviction, is_dilutive, rationale,
+    headline}} for tickers enriched within the window (latest per symbol). Reads
+    the news_catalyst_cache table directly (same Postgres datastore) — never
+    raises, returns {} on any fault so the dashboard degrades cleanly."""
+    from datetime import datetime, timedelta
+    cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours))
+    try:
+        rows = store.con.execute(
+            "SELECT symbol, catalyst_type, sentiment, conviction, is_dilutive, "
+            "rationale, headline FROM news_catalyst_cache "
+            "WHERE symbol <> '' AND enriched_at >= ? ORDER BY enriched_at DESC",
+            [cutoff],
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — table may not exist / Ollama never ran
+        return {}
+    out: dict[str, dict] = {}
+    for sym, ctype, sentiment, conviction, is_dilutive, rationale, headline in rows:
+        key = (sym or "").upper()
+        if key and key not in out:  # newest first -> first seen is latest
+            out[key] = {
+                "catalyst_type": ctype,
+                "sentiment": round(float(sentiment), 3) if sentiment is not None else None,
+                "conviction": round(float(conviction), 3) if conviction is not None else None,
+                "is_dilutive": bool(is_dilutive),
+                "rationale": rationale,
+                "headline": headline,
+            }
+    return out
