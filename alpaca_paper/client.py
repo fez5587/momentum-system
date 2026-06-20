@@ -337,6 +337,28 @@ class AlpacaPaperClient:
         )
         return payload.get("most_actives") or []
 
+    def get_news(
+        self,
+        symbols: list[str] | None = None,
+        limit: int = 50,
+        start_iso: str | None = None,
+        sort: str = "desc",
+    ) -> list[dict]:
+        """Latest market news (Benzinga). Each item carries a stable ``id`` and an
+        authoritative ``symbols`` list, so no regex ticker-scraping is needed.
+        Optional symbol filter (capped at 50 symbols/req); Alpaca caps ``limit`` at 50."""
+        params: dict = {
+            "limit": max(1, min(int(limit), 50)),
+            "sort": sort,
+            "exclude_contentless": "true",
+        }
+        if symbols:
+            params["symbols"] = ",".join(symbols[:50])
+        if start_iso:
+            params["start"] = start_iso
+        payload = self._data("GET", "/v1beta1/news", params=params)
+        return payload.get("news") or []
+
     def get_daily_bars(
         self, symbols: list[str], start_iso: str, end_iso: str | None = None
     ) -> dict[str, list[dict]]:

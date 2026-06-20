@@ -49,6 +49,7 @@ from research.ingestion.market_data import (
 from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
+from research.ingestion.alpaca_news import ingest_alpaca_news
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
 from runtime.halt_guard import is_halt_gap
@@ -767,7 +768,25 @@ def main(argv: list[str] | None = None) -> int:
         return (f"EOD FLATTEN closed [{closed}]"
                 + (f" errors={res['errors']} (will retry)" if res["errors"] else ""))
 
+    def step_news():
+        """Land latest Alpaca/Benzinga news for the tracked universe into
+        raw_news_items (feeds recent_news_map catalyst prioritisation + the Ollama
+        enrichment). Off the hot path; never blocks trading."""
+        if not client:
+            return "skipped (no keys)"
+        res = ingest_alpaca_news(
+            rt["research_con"], client, symbols=symbols,
+            limit=int(os.environ.get("ALPACA_NEWS_LIMIT", "50")),
+        )
+        if res.error:
+            return f"ERROR {res.error}"
+        if res.new_items:
+            return f"+{len(res.new_items)} new / {res.item_count} fetched"
+        return None
+
     scheduler = Scheduler()
+    scheduler.add("news", step_news, float(os.environ.get("ALPACA_NEWS_INTERVAL_SECONDS", "120")),
+                  enabled=_flag("ALPACA_NEWS_ENABLED", "1"))
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
                   enabled=_flag("DISCOVER_ENABLED", "1"))
