@@ -205,19 +205,29 @@ def build_runtime(args: argparse.Namespace) -> dict:
     # service (one cache). catalyst_score_provider maps the advisory -> a 0..1 score
     # OUTSIDE the pure evaluator, and is only handed to the watcher when the score
     # blend is explicitly enabled (so Phase 1 advisory never changes scoring).
-    _catalyst_cache: dict = {"map": {}, "at": 0.0}
+    _catalyst_cache: dict = {"map": {}, "at": 0.0, "con": None}
+    _catalyst_lock = threading.Lock()
     _CATALYST_TTL = 30.0
 
     def catalyst_provider(symbol: str):
         import time as _time
         from research.ingestion.news_enrichment import catalyst_map
         now = _time.monotonic()
+        # Called from the TRIGGER thread (submit_breakout_now veto), the scheduler
+        # thread (approvals), AND the watcher — so it must NOT touch the shared
+        # research_con. Refresh under a lock using a DEDICATED connection (opened
+        # lazily, only inside the lock => single-threaded use); the 30s TTL keeps
+        # DB hits rare, and the read below is a lock-free atomic dict get.
         if (now - _catalyst_cache["at"]) >= _CATALYST_TTL:
-            try:
-                _catalyst_cache["map"] = catalyst_map(research_con)
-            except Exception:  # noqa: BLE001
-                _catalyst_cache["map"] = {}
-            _catalyst_cache["at"] = now
+            with _catalyst_lock:
+                if (_time.monotonic() - _catalyst_cache["at"]) >= _CATALYST_TTL:
+                    try:
+                        if _catalyst_cache["con"] is None:
+                            _catalyst_cache["con"] = open_research_db("market")
+                        _catalyst_cache["map"] = catalyst_map(_catalyst_cache["con"])
+                    except Exception:  # noqa: BLE001
+                        _catalyst_cache["map"] = {}
+                    _catalyst_cache["at"] = _time.monotonic()
         return _catalyst_cache["map"].get((symbol or "").upper())
 
     def catalyst_score_provider(symbol: str):
