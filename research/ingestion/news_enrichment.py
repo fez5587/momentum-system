@@ -43,11 +43,24 @@ CATALYST_TYPES = {
 
 # Cheap stdlib floor for the dilution veto so it still works when Ollama is down.
 # The LLM CONFIRMS dilution; this regex is the safety net, not the primary signal.
+# "offering" is matched ONLY as a securities offering — a qualifier in front of it
+# (public/underwritten/stock/...) or "offering of ... shares/stock/units". A bare
+# "offering" no longer trips it, so an ETF "offering exposure" or a product
+# "offering" is not flagged as dilution (the recurring false positive).
 _DILUTIVE_RE = re.compile(
-    r"\b(offering|registered\s+direct|at[-\s]the[-\s]market|atm\s+(?:facility|offering)|"
-    r"warrant|dilut\w*|shelf\s+(?:registration|offering)|priced\s+(?:public\s+)?offering|"
-    r"pricing\s+of\s+.{0,30}offering)\b|\bform\s+s-?3\b",
-    re.IGNORECASE,
+    r"""
+      \bregistered\s+direct\b
+    | \bat[-\s]the[-\s]market\b | \batm\s+(?:facility|offering|program|sales)\b
+    | \b(?:public|underwritten|secondary|registered|equity|stock|share|securities
+         |common\s+stock|proposed|overnight)\s+offering\b
+    | \boffering\s+of\s+[^.]{0,40}?\b(?:shares|common\s+stock|units|securities)\b
+    | \bpric\w+\s+(?:of\s+)?(?:its\s+)?[^.]{0,40}?\boffering\b
+    | \bprivate\s+placement\b
+    | \bdilut\w+\b
+    | \bshelf\s+(?:registration|offering|takedown)\b | \bform\s+s-?3\b
+    | \bwarrants?\s+(?:to\s+(?:purchase|buy)|exercisable|and\s+(?:common\s+)?(?:stock|shares))\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
 
 
@@ -110,8 +123,12 @@ def build_prompt(headline: str, snippet: str = "", tickers: str = "") -> str:
         '  "catalyst_type": one of [' + types + "]\n"
         '  "sentiment": number from -1.0 (very bearish) to 1.0 (very bullish) for the stock\n'
         '  "conviction": number from 0.0 to 1.0 — how confident this is a real, tradeable catalyst\n'
-        '  "is_dilutive": true ONLY for confirmed share dilution (offering, ATM, '
-        "registered direct, warrant, shelf takedown), else false\n"
+        '  "is_dilutive": true ONLY when THIS company is issuing/selling its OWN '
+        "new shares — a securities offering (registered direct, public/underwritten "
+        "offering, ATM, private placement, warrants, shelf/S-3 takedown). FALSE for "
+        'everything else, including an ETF/fund "offering exposure", a product or '
+        "service offering, an IPO of a different company, a buyback, or a reverse "
+        "split\n"
         '  "rationale": one short sentence (max ~200 chars)\n\n'
         f"<news>\n{news}\n</news>"
     )
