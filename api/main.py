@@ -72,6 +72,36 @@ def _available_dates(store) -> list[str]:
         return []
 
 
+def _catalyst_engine(store, catalyst: dict) -> dict:
+    """Catalyst-engine status for the dashboard: config (read from the same .env)
+    plus live activity (advisory + dilution counts, and how many entries the
+    dilution veto has blocked today)."""
+    try:
+        from config import OllamaConfig
+        cfg = OllamaConfig.from_env()
+        on = bool(cfg.enabled and cfg.enrichment_enabled)
+        model = cfg.model
+        score_blend = bool(cfg.catalyst_score_enabled)
+        veto = bool(cfg.dilution_veto_enabled)
+    except Exception:  # noqa: BLE001
+        on, model, score_blend, veto = False, "", False, False
+    adv = catalyst or {}
+    dilutive = sum(1 for a in adv.values() if isinstance(a, dict) and a.get("is_dilutive"))
+    vetoes = 0
+    try:
+        row = store.con.execute(
+            "SELECT count(*) FROM events WHERE event_type='risk_rule_triggered' "
+            "AND timestamp::date = CURRENT_DATE "
+            "AND payload_json LIKE '%catalyst_dilution_veto%'"
+        ).fetchone()
+        vetoes = int(row[0]) if row and row[0] else 0
+    except Exception:  # noqa: BLE001
+        vetoes = 0
+    return {"enabled": on, "model": model, "score_blend": score_blend,
+            "dilution_veto": veto, "advisories": len(adv),
+            "dilutive": dilutive, "vetoes_today": vetoes}
+
+
 class DashboardState:
     """Shared state: event store path + optional live execution service."""
 
@@ -120,6 +150,7 @@ class DashboardState:
                     "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
                     "equity_curve": query_equity_curve(store, for_date=for_date),
                     "catalyst": catalyst,
+                    "catalyst_engine": _catalyst_engine(store, catalyst) if is_live else {},
                     "approval_queue": approval_queue,
                     "ready_signals": query_ready_signals_snapshot(store) if is_live else [],
                     # watch_states is a LIVE concept (and the heaviest projection
