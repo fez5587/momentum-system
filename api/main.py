@@ -36,6 +36,7 @@ from storage.projections import (
     query_account_summary_snapshot,
     query_approval_queue,
     query_catalyst_advisory,
+    query_catalyst_feed,
     query_fills_feed,
     query_armed_triggers,
     query_equity_curve,
@@ -151,6 +152,9 @@ class DashboardState:
                     "equity_curve": query_equity_curve(store, for_date=for_date),
                     "catalyst": catalyst,
                     "catalyst_engine": _catalyst_engine(store, catalyst) if is_live else {},
+                    # The raw stream of what the LLM read + decided (newest first)
+                    # so the operator can see the WHY, not just the engine totals.
+                    "catalyst_feed": query_catalyst_feed(store) if is_live else [],
                     "approval_queue": approval_queue,
                     "ready_signals": query_ready_signals_snapshot(store) if is_live else [],
                     # watch_states is a LIVE concept (and the heaviest projection

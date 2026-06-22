@@ -555,7 +555,21 @@ def query_session_pnl(store, session_id: str | None = None,
         for position in snapshots[-1].get("positions") or []:
             open_positions += 1
             try:
-                unrealized += float(position.get("unrealized_pl") or 0.0)
+                # The positions snapshot stores this as `unrealized_pnl` (see
+                # alpaca_paper/sync.py); reading `unrealized_pl` here silently
+                # returned 0, so the whole broker day-delta was mislabelled as
+                # realized (a +$330 realized / -$67 unrealized day read as
+                # "$263 realized, $0 unrealized"). Prefer the stored key, accept
+                # the alpaca-native alias, else derive from qty*(price-cost).
+                upl = position.get("unrealized_pnl")
+                if upl is None:
+                    upl = position.get("unrealized_pl")
+                if upl is None:
+                    qty = float(position.get("quantity") or 0.0)
+                    cur = float(position.get("current_price") or 0.0)
+                    avg = float(position.get("avg_entry_price") or 0.0)
+                    upl = qty * (cur - avg)
+                unrealized += float(upl or 0.0)
             except (TypeError, ValueError):
                 pass
 
@@ -790,4 +804,46 @@ def query_catalyst_advisory(store, lookback_hours: int = 8) -> dict:
                 "rationale": rationale,
                 "headline": headline,
             }
+    return out
+
+
+def query_catalyst_feed(store, limit: int = 40, lookback_hours: int = 24) -> list[dict]:
+    """The raw stream of what the local LLM actually read and decided — newest
+    first — so the operator can see *what* headlines drove each call and *why*
+    (the model's rationale), not just the per-symbol summary the advisory gives.
+
+    Each row: {symbol, catalyst_type, sentiment, conviction, is_dilutive,
+    vetoed, rationale, headline, source, model, enriched_at}. ``vetoed`` marks
+    the reads the dilution veto would actually block (is_dilutive AND conviction
+    at/above the live floor). Never raises — returns [] on any fault so the
+    dashboard degrades cleanly when Ollama has never run."""
+    from datetime import datetime, timedelta
+    cutoff = (datetime.utcnow() - timedelta(hours=lookback_hours))
+    try:
+        rows = store.con.execute(
+            "SELECT symbol, catalyst_type, sentiment, conviction, is_dilutive, "
+            "rationale, headline, source, model, enriched_at "
+            "FROM news_catalyst_cache WHERE enriched_at >= ? "
+            "ORDER BY enriched_at DESC LIMIT ?",
+            [cutoff, int(limit)],
+        ).fetchall()
+    except Exception:  # noqa: BLE001 — table may not exist / Ollama never ran
+        return []
+    out: list[dict] = []
+    for sym, ctype, sentiment, conv, is_dil, rationale, headline, source, model, ts in rows:
+        conv_f = float(conv) if conv is not None else None
+        is_dil_b = bool(is_dil)
+        out.append({
+            "symbol": (sym or "").upper(),
+            "catalyst_type": ctype,
+            "sentiment": round(float(sentiment), 3) if sentiment is not None else None,
+            "conviction": round(conv_f, 3) if conv_f is not None else None,
+            "is_dilutive": is_dil_b,
+            "vetoed": bool(is_dil_b and conv_f is not None and conv_f >= 0.6),
+            "rationale": rationale,
+            "headline": headline,
+            "source": source,
+            "model": model,
+            "enriched_at": str(ts) if ts is not None else None,
+        })
     return out

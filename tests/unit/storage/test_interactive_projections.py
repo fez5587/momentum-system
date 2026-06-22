@@ -6,6 +6,7 @@ import pytest
 
 from storage.event_schema import (
     AccountPositionsUpdatedEvent,
+    AccountSummaryUpdatedEvent,
     CriteriaEvaluatedEvent,
     EventMode,
     OrderFilledEvent,
@@ -106,12 +107,13 @@ def test_session_pnl_realized_and_unrealized(store):
             realized_pnl=-60.0,
         )
     )
-    # one open position with unrealized gain
+    # one open position with unrealized gain — keyed `unrealized_pnl`, exactly as
+    # the live AlpacaPaperSync emits it (NOT `unrealized_pl`).
     store.emit(
         AccountPositionsUpdatedEvent(
             timestamp=T0 + timedelta(minutes=6), mode=EventMode.PAPER, message="pos",
             broker_name="alpaca_paper", account_id="paper",
-            positions=[{"symbol": "CCC", "quantity": 10, "unrealized_pl": 40.0}],
+            positions=[{"symbol": "CCC", "quantity": 10, "unrealized_pnl": 40.0}],
         )
     )
     pnl = query_session_pnl(store)
@@ -123,6 +125,57 @@ def test_session_pnl_realized_and_unrealized(store):
     assert pnl["win_rate"] == 0.5
     assert pnl["open_positions"] == 1
     assert pnl["closed_trades"] == 2
+
+
+def test_session_pnl_broker_delta_attributes_unrealized(store):
+    """Regression for the field-name bug that mislabelled a whole +$330/-$67 day
+    as '$263 realized, $0 unrealized'. The positions snapshot stores the gain
+    under `unrealized_pnl`; reading `unrealized_pl` returned 0 so the entire
+    broker equity-delta fell into the realized bucket. With a broker summary
+    present, realized must be (day_delta - unrealized), not the whole delta."""
+    # broker day P&L = 92_007.78 - 91_744.94 = +262.84 (no position_closed events)
+    store.emit(
+        AccountSummaryUpdatedEvent(
+            timestamp=T0, mode=EventMode.PAPER, message="acct",
+            broker_name="alpaca_paper", account_id="paper", account_desc="Alpaca Paper",
+            total_equity=92_007.78, cash_balance=67_101.12, buying_power=305_348.0,
+            net_liquidating_value=92_007.78, last_equity=91_744.94,
+        )
+    )
+    # 3 open positions net -66.85 unrealized (the live shape, `unrealized_pnl` key)
+    store.emit(
+        AccountPositionsUpdatedEvent(
+            timestamp=T0 + timedelta(minutes=1), mode=EventMode.PAPER, message="pos",
+            broker_name="alpaca_paper", account_id="paper",
+            positions=[
+                {"symbol": "ATPC", "quantity": 910, "unrealized_pnl": 59.09},
+                {"symbol": "NOWL", "quantity": 3662, "unrealized_pnl": -73.24},
+                {"symbol": "WPRT", "quantity": 2731, "unrealized_pnl": -52.70},
+            ],
+        )
+    )
+    pnl = query_session_pnl(store)
+    assert pnl["pnl_source"] == "broker"
+    assert pnl["total_pnl"] == 262.84           # broker equity delta
+    assert pnl["unrealized_pnl"] == -66.85      # attributed to the open positions
+    assert pnl["realized_pnl"] == 329.69        # delta - unrealized, NOT the whole delta
+    assert pnl["open_positions"] == 3
+
+
+def test_session_pnl_unrealized_derived_when_pnl_missing(store):
+    """If a snapshot lacks unrealized_pnl entirely, derive it from
+    quantity*(current_price-avg_entry_price) rather than silently reading 0."""
+    store.emit(
+        AccountPositionsUpdatedEvent(
+            timestamp=T0, mode=EventMode.PAPER, message="pos",
+            broker_name="alpaca_paper", account_id="paper",
+            positions=[{"symbol": "DDD", "quantity": 100,
+                        "avg_entry_price": 2.00, "current_price": 2.25}],
+        )
+    )
+    pnl = query_session_pnl(store)
+    assert pnl["unrealized_pnl"] == 25.0
+    assert pnl["open_positions"] == 1
 
 
 def test_session_pnl_empty(store):
