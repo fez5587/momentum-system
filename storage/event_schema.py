@@ -218,6 +218,13 @@ class PositionClosedEvent(BaseEvent):
     exit_price: float = Field(description="Exit price")
     exit_reason: str = Field(description="Reason for position close")
     realized_pnl: float = Field(description="Realized profit/loss")
+    # entry context for the trade journal's R-multiple (query_session_pnl reads
+    # these from the payload; optional so older/other emitters stay valid).
+    entry_price: float = Field(default=0.0, description="Average entry price")
+    stop_loss_price: float | None = Field(
+        default=None, description="Protective stop level at entry (R baseline)")
+    side: str = Field(default="buy", description="Entry side: buy=long, sell=short")
+    quantity: float = Field(default=0.0, description="Shares closed")
 
 
 class AccountSummaryUpdatedEvent(BaseEvent):

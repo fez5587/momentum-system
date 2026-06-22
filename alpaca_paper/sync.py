@@ -9,6 +9,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime
 
+import json
+
 from alpaca_paper.client import AlpacaPaperClient
 from storage.event_schema import (
     AccountOrdersUpdatedEvent,
@@ -16,8 +18,15 @@ from storage.event_schema import (
     AccountSummaryUpdatedEvent,
     BrokerHealthChangedEvent,
     EventMode,
+    PositionClosedEvent,
 )
 from storage.event_store import EventStore
+
+# Alpaca order type -> trade-journal exit reason
+_EXIT_REASON = {
+    "stop": "stop_loss", "stop_limit": "stop_loss", "trailing_stop": "trailing_stop",
+    "limit": "take_profit", "market": "market_exit",
+}
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +45,10 @@ class AlpacaPaperSync:
         self.client = client or AlpacaPaperClient()
         self.session_id = session_id
         self.mode = mode
+        # last seen open positions, to detect closes by diffing snapshots. None
+        # until the first sync, when it's seeded from the last PERSISTED snapshot
+        # so a close that happened while the loop was down is still journaled.
+        self._prev_positions: list[dict] | None = None
 
     def _emit_health(self, reason: str) -> None:
         """Make a broker sync failure VISIBLE (else stale snapshots look current)."""
@@ -161,9 +174,105 @@ class AlpacaPaperSync:
         )
         return orders
 
+    def _load_last_persisted_positions(self) -> list[dict]:
+        """The most recent persisted positions snapshot (prior session/run), so
+        the first reconcile after a restart can still catch a close that happened
+        while we were down. [] if none / on any fault."""
+        try:
+            rows = self.store.con.execute(
+                "SELECT payload_json FROM events "
+                "WHERE event_type = 'account_positions_updated' "
+                "ORDER BY timestamp DESC, created_at DESC LIMIT 1"
+            ).fetchall()
+            if rows:
+                return json.loads(rows[0][0] or "{}").get("positions") or []
+        except Exception:  # noqa: BLE001
+            pass
+        return []
+
+    def _find_exit(self, symbol: str, is_short: bool, orders: list[dict]):
+        """(exit_price, exit_reason, stop_level, exit_order_id) for a now-closed
+        symbol, read from the filled exit leg in the orders snapshot. The exit of
+        a long is a filled SELL (a short, a filled BUY). Also surfaces the bracket
+        stop level (filled or not) for the R-multiple. Any None -> caller falls
+        back to the last mark."""
+        exit_side = "buy" if is_short else "sell"
+        stop_level = None
+        fills = []
+        for o in orders:
+            if o.get("symbol") != symbol:
+                continue
+            otype = str(o.get("type") or "")
+            if otype in ("stop", "stop_limit") and o.get("stop_price") not in (None, ""):
+                try:
+                    stop_level = float(o.get("stop_price"))
+                except (TypeError, ValueError):
+                    pass
+            if (str(o.get("side") or "").lower() == exit_side
+                    and str(o.get("status") or "").lower() == "filled"
+                    and o.get("filled_avg_price") not in (None, "")):
+                fills.append(o)
+        if not fills:
+            return None, None, stop_level, None
+        fills.sort(key=lambda o: str(o.get("submitted_at") or ""), reverse=True)
+        f = fills[0]
+        try:
+            px = float(f.get("filled_avg_price"))
+        except (TypeError, ValueError):
+            px = None
+        reason = _EXIT_REASON.get(str(f.get("type") or ""), "closed")
+        return px, reason, stop_level, f.get("broker_order_id")
+
+    def reconcile_closed(self, prev_positions, new_positions, orders) -> int:
+        """Emit a position_closed event for every symbol that was open in the
+        previous snapshot and is gone (or flat) in the new one. This is the ONLY
+        place the trade journal learns about exits — bracket stops/targets fill
+        broker-side and EOD flatten closes via market orders, so a snapshot diff
+        is the one signal that catches them all. Realized $ stays broker-
+        authoritative in the P&L strip; these events feed wins/losses/avg-R/the
+        trade list. Returns the number emitted."""
+        new_open = {p.get("symbol") for p in (new_positions or [])
+                    if abs(float(p.get("quantity") or 0)) > 0}
+        emitted = 0
+        for prev in prev_positions or []:
+            sym = prev.get("symbol")
+            qty = abs(float(prev.get("quantity") or 0))
+            if not sym or qty <= 0 or sym in new_open:
+                continue
+            entry = float(prev.get("avg_entry_price") or 0)
+            is_short = str(prev.get("side") or "long").lower() == "short"
+            exit_price, reason, stop_level, oid = self._find_exit(sym, is_short, orders or [])
+            if exit_price is None:                       # no fill seen yet -> last mark
+                cp = prev.get("current_price")
+                exit_price = float(cp) if cp not in (None, "") else entry
+            reason = reason or "closed"
+            realized = (entry - exit_price) * qty if is_short else (exit_price - entry) * qty
+            ts = datetime.now()
+            self.store.emit(PositionClosedEvent(
+                timestamp=ts, mode=self.mode, correlation_id=self.session_id,
+                message=f"{sym} closed @ {exit_price:.4f} ({reason}) pnl={realized:+.2f}",
+                position_id=str(oid or f"{sym}-{ts.isoformat()}"),
+                symbol=sym, exit_price=round(exit_price, 4), exit_reason=reason,
+                realized_pnl=round(realized, 2), entry_price=round(entry, 4),
+                stop_loss_price=round(stop_level, 4) if stop_level else None,
+                side=("sell" if is_short else "buy"), quantity=qty,
+            ))
+            emitted += 1
+        return emitted
+
     def sync_all(self) -> dict:
-        return {
-            "account": self.sync_account(),
-            "positions": self.sync_positions(),
-            "orders": self.sync_orders(),
-        }
+        # seed the close-detection baseline from the last persisted snapshot
+        # BEFORE this cycle emits a fresh one (else prev == current => no diff).
+        if self._prev_positions is None:
+            self._prev_positions = self._load_last_persisted_positions()
+        account = self.sync_account()
+        positions = self.sync_positions()
+        orders = self.sync_orders()
+        # only reconcile on a good positions read; keep the last baseline otherwise
+        if positions is not None:
+            try:
+                self.reconcile_closed(self._prev_positions, positions, orders or [])
+            except Exception as exc:  # noqa: BLE001 — never let journaling break sync
+                logger.warning("position-close reconcile failed: %s", exc)
+            self._prev_positions = positions
+        return {"account": account, "positions": positions, "orders": orders}

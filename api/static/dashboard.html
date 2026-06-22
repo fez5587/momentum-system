@@ -535,7 +535,6 @@ async function post(path, body) {
 }
 const approve = (id) => post("/api/trading/approvals/approve", {order_id: id, approved_by: "dashboard"});
 const reject  = (id) => post("/api/trading/approvals/reject",  {order_id: id, reason: "dashboard_reject"});
-const exitPos = (sym) => { if (confirm("Submit market exit for " + sym + "?")) post("/api/trading/exit-order", {symbol: sym}); };
 
 function drawSpark(canvas, bars, entry, stop) {
   const dpr = window.devicePixelRatio || 1;
@@ -970,11 +969,10 @@ function render(d) {
       '<td class="num">' + fmt(entry) + '</td>' +
       '<td class="num">' + fmt(cur) + '</td>' +
       '<td>' + rBar(entry, cur, stop) + '</td>' +
-      '<td>' + unrealCell(upnl, pct) + '</td>' +
-      '<td><button class="btn-exit" onclick="exitPos(\'' + esc(pos.symbol) + '\')">Exit</button></td></tr>');
+      '<td>' + unrealCell(upnl, pct) + '</td></tr>');
   }));
   $("pos-count").textContent = posRows.length;
-  fill("positions", table(["Symbol", "Chart", "Side", "Qty", "Avg", "Last", "R / risk", "P/L", ""], posRows), "No open positions.");
+  fill("positions", table(["Symbol", "Chart", "Side", "Qty", "Avg", "Last", "R / risk", "P/L"], posRows), "No open positions.");
 
   renderWatch(d.watch_states || []);
 
