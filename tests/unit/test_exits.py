@@ -10,6 +10,7 @@ from strategy.exits import (
     ExitConfig,
     TRAIL_PCT,
     TRAIL_PRIOR_LOW,
+    catastrophe_triggered,
     manage_live,
     parse_profit_tiers,
     simulate_exit,
@@ -19,6 +20,28 @@ from strategy.exits import (
 def test_parse_profit_tiers():
     assert parse_profit_tiers("8:3,15:9") == [(0.08, 0.03), (0.15, 0.09)]
     assert parse_profit_tiers("") == []
+
+
+def test_catastrophe_pct_arm():
+    # 10% pct floor, no known stop -> the only thing protecting a naked position
+    assert catastrophe_triggered(1.00, 0.89, None, 0.10, 1.5) is True   # -11%, fires
+    assert catastrophe_triggered(1.00, 0.92, None, 0.10, 1.5) is False  # -8%, safe
+    # NIVF: entry 0.9936 ran to 0.76 (-23.4%) with NO stop -> would have fired
+    assert catastrophe_triggered(0.9936, 0.7608, None, 0.10, 1.5) is True
+
+
+def test_catastrophe_risk_arm_fires_before_pct():
+    # tight 5% stop: -1.5R = -7.5% < the 10% pct floor, so the risk arm catches it sooner
+    assert catastrophe_triggered(1.00, 0.92, 0.95, 0.10, 1.5) is True    # past -1.5R (-1.6R)
+    assert catastrophe_triggered(1.00, 0.93, 0.95, 0.10, 1.5) is False   # -1.4R, not yet
+    # a stop at/above entry is not a usable risk reference -> only the pct arm applies
+    assert catastrophe_triggered(1.00, 0.94, 1.00, 0.10, 1.5) is False
+
+
+def test_catastrophe_off_and_in_profit():
+    assert catastrophe_triggered(1.00, 0.50, None, 0.0, 1.5) is False    # pct arm disabled, no stop
+    assert catastrophe_triggered(1.00, 1.20, 0.95, 0.10, 1.5) is False   # in profit
+    assert catastrophe_triggered(1.00, 0.0, None, 0.10, 1.5) is False    # bad price -> no-op
 
 
 def test_profit_lock_keeps_minimum_gain():

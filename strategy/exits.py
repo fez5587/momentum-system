@@ -70,6 +70,13 @@ class ExitConfig:
     # trade has been up gain%, the stop never sits below entry*(1+lock%) — so a
     # winner can only give back down to a locked-in minimum gain.
     profit_lock_tiers: list = field(default_factory=list)
+    # CATASTROPHE STOP — a hard market-exit backstop that does NOT depend on the
+    # broker bracket stop being live. Fires when price is >= catastrophe_pct below
+    # entry, OR (when a stop is known) >= catastrophe_risk_mult x the intended 1R
+    # underwater. Catches a missing/failed protective stop (NIVF ran to -23% naked,
+    # = the entire net loss). 0 = off.
+    catastrophe_pct: float = 0.10
+    catastrophe_risk_mult: float = 1.5
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExitConfig":
@@ -97,6 +104,8 @@ class ExitConfig:
             scale_out_pct=f("TRADING_EXIT_SCALE_OUT_PCT", "0.5"),
             first_red_exit=b("TRADING_EXIT_FIRST_RED", "0"),
             profit_lock_tiers=parse_profit_tiers(v.get("TRADING_EXIT_PROFIT_TIERS", "")),
+            catastrophe_pct=f("TRADING_CATASTROPHE_STOP_PCT", "0.10"),
+            catastrophe_risk_mult=f("TRADING_CATASTROPHE_RISK_MULT", "1.5"),
         )
 
     def describe(self) -> str:
@@ -115,7 +124,28 @@ class ExitConfig:
         if self.profit_lock_tiers:
             parts.append("lock " + "/".join(
                 f"+{g * 100:g}%->{lk * 100:g}%" for g, lk in self.profit_lock_tiers))
+        if self.catastrophe_pct:
+            parts.append(f"catastrophe@-{self.catastrophe_pct:.0%}/{self.catastrophe_risk_mult:g}xR")
         return ", ".join(parts)
+
+
+def catastrophe_triggered(entry: float, current: float, stop: float | None,
+                          pct: float, risk_mult: float) -> bool:
+    """True if a LONG position is catastrophically underwater and must be
+    market-exited NOW regardless of the broker bracket — the hard backstop for a
+    missing or non-firing protective stop. Fires when price is >= ``pct`` below
+    entry, OR (when a real stop is known) >= ``risk_mult`` x the intended 1R
+    risk underwater. ``pct`` <= 0 disables the percentage arm."""
+    if not entry or not current or current <= 0 or entry <= 0:
+        return False
+    loss_frac = (entry - current) / entry           # >0 = underwater (long)
+    if pct and pct > 0 and loss_frac >= pct:
+        return True
+    if stop is not None and stop < entry and risk_mult and risk_mult > 0:
+        risk = entry - stop
+        if risk > 0 and current <= entry - risk_mult * risk:
+            return True
+    return False
 
 
 @dataclass

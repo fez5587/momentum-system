@@ -20,7 +20,7 @@ import pandas as pd
 
 from runtime.flatten import cancel_protective_and_close
 from storage.event_schema import EventMode, RiskRuleTriggeredEvent
-from strategy.exits import ExitConfig, TRAIL_NONE, manage_live
+from strategy.exits import ExitConfig, TRAIL_NONE, catastrophe_triggered, manage_live
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +38,7 @@ def _is_active(cfg: ExitConfig) -> bool:
     return bool(cfg and (cfg.breakeven_at_r or cfg.breakeven_at_pct
                          or cfg.trail_mode != TRAIL_NONE
                          or cfg.scale_out_r or cfg.first_red_exit
-                         or cfg.profit_lock_tiers))
+                         or cfg.profit_lock_tiers or cfg.catastrophe_pct))
 
 
 class LiveExitManager:
@@ -146,13 +146,36 @@ class LiveExitManager:
 
         actions: list[str] = []
         for sym, p in held.items():
+            entry = float(p.get("avg_entry_price") or 0.0)
+            cur = float(p.get("current_price") or 0.0)
+            # CATASTROPHE STOP — the hard backstop, FIRST and unconditional. Runs on
+            # EVERY held position, before the bars fetch and before the no-stop skip
+            # below that otherwise leaves a NAKED position (no working bracket) with
+            # zero exit management — the exact NIVF case that ran to -23% and was
+            # ~the entire net loss. Doesn't depend on bars or a live stop.
+            if (self.cfg.catastrophe_pct and entry > 0 and cur > 0
+                    and str(p.get("side") or "long").lower() != "short"):
+                _leg0, cata_stop = self._stop_leg(sym, orders)
+                if catastrophe_triggered(entry, cur, cata_stop,
+                                         self.cfg.catastrophe_pct,
+                                         self.cfg.catastrophe_risk_mult):
+                    loss_pct = (entry - cur) / entry * 100
+                    try:
+                        self._flatten(sym, orders)
+                        self._tracked.pop(sym, None)
+                        self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
+                                   f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
+                                   {"price": cur, "entry": entry, "stop": cata_stop})
+                        actions.append(f"{sym} CATASTROPHE-exit @{cur:.2f} (-{loss_pct:.0f}%)")
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("catastrophe exit failed %s: %s", sym, exc)
+                    continue
             try:
                 bars = self.bars_fn(sym)
             except Exception:  # noqa: BLE001
                 continue
             if bars is None or len(bars) == 0:
                 continue
-            entry = float(p.get("avg_entry_price") or 0.0)
             if entry <= 0:
                 continue
             if sym not in self._tracked:
