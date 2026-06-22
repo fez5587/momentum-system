@@ -26,6 +26,30 @@
     --mono: "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
+  /* first-paint loading overlay — the snapshot does real Postgres work, so a
+     blank page reads as broken; this shows it's actively fetching. */
+  .loader {
+    position: fixed; inset: 0; z-index: 9999; display: flex;
+    align-items: center; justify-content: center;
+    background:
+      radial-gradient(1100px 560px at 82% -12%, rgba(30,58,110,.30), transparent 60%),
+      radial-gradient(820px 480px at -5% -5%, rgba(60,40,120,.18), transparent 55%),
+      #080a10;
+    transition: opacity .45s ease; }
+  .loader.hide { opacity: 0; pointer-events: none; }
+  .loader-card { text-align: center; }
+  .loader-title { font: 700 18px/1 var(--mono); letter-spacing: 1.5px;
+    color: var(--text); text-transform: uppercase; }
+  .loader-title span { color: var(--accent); font-weight: 600; }
+  .loader-spin { width: 34px; height: 34px; margin: 22px auto 18px;
+    border: 3px solid var(--border); border-top-color: var(--accent);
+    border-radius: 50%; animation: loader-spin .8s linear infinite; }
+  .loader.err .loader-spin { border-top-color: var(--red); animation-play-state: paused; }
+  @keyframes loader-spin { to { transform: rotate(360deg); } }
+  .loader-msg { font: 600 12px/1.4 var(--mono); color: var(--text); letter-spacing: .3px; }
+  .loader.err .loader-msg { color: var(--red); }
+  .loader-sub { margin-top: 6px; font: 500 11px/1.4 var(--mono); color: var(--muted); }
+  @media (prefers-reduced-motion: reduce) { .loader-spin { animation: none; } }
   body {
     background:
       radial-gradient(1100px 560px at 82% -12%, rgba(30,58,110,.28), transparent 60%),
@@ -323,6 +347,14 @@
 </style>
 </head>
 <body>
+<div id="loader" class="loader">
+  <div class="loader-card">
+    <div class="loader-title">MOMENTUM <span>/ control room</span></div>
+    <div class="loader-spin"></div>
+    <div id="loader-msg" class="loader-msg">connecting to the control room…</div>
+    <div id="loader-sub" class="loader-sub">pulling the live snapshot — P&amp;L, triggers, catalysts</div>
+  </div>
+</div>
 <header>
   <h1>MOMENTUM <span>/ control room</span></h1>
   <span id="mode-badge" class="badge paper">PAPER</span>
@@ -955,13 +987,39 @@ async function loadHistorical() {
     const r = await fetch("/api/snapshots?date=" + encodeURIComponent(viewDate));
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
+    hideLoader();
     setConn(true, "VIEWING " + viewDate + " (historical)");
-  } catch (e) { setConn(false, "load failed — " + e.message); }
+  } catch (e) { loaderError(e.message); setConn(false, "load failed — " + e.message); }
 }
 function setConn(ok, msg) {
   $("conn-dot").className = "dot " + (ok ? "live" : "err");
   $("stamp").textContent = msg;
 }
+// First-paint loading overlay control. Dismissed the moment real data renders;
+// shows an error (and stops the spinner) if the first fetch fails so it never
+// hangs silently.
+let loaderDone = false;
+function hideLoader() {
+  if (loaderDone) return;
+  loaderDone = true;
+  const el = $("loader"); if (!el) return;
+  el.classList.add("hide");
+  setTimeout(() => { el.style.display = "none"; }, 500);
+}
+function loaderError(msg) {
+  if (loaderDone) return;            // already showing live data — ignore
+  const el = $("loader"); if (!el) return;
+  el.classList.add("err");
+  const m = $("loader-msg"), s = $("loader-sub");
+  if (m) m.textContent = "couldn't reach the control room";
+  if (s) s.textContent = (msg || "connection failed") + " — retrying…";
+}
+// watchdog: if the first snapshot is slow, reassure rather than look frozen
+setTimeout(() => {
+  if (loaderDone) return;
+  const s = $("loader-sub");
+  if (s && !$("loader").classList.contains("err")) s.textContent = "taking a moment — still fetching the snapshot…";
+}, 5000);
 function startStream() {
   // Render immediately from a plain fetch (the same reliable path the date
   // selector uses) so LIVE shows data even if EventSource never connects in
@@ -971,7 +1029,7 @@ function startStream() {
   try {
     es = new EventSource("/api/stream");
     es.addEventListener("snapshot", (ev) => {
-      try { render(JSON.parse(ev.data)); setConn(true, "live · " + new Date().toLocaleTimeString()); }
+      try { render(JSON.parse(ev.data)); hideLoader(); setConn(true, "live · " + new Date().toLocaleTimeString()); }
       catch (e) { console.error("render failed:", e); setConn(false, "render error (see console)"); }
     });
     es.onerror = () => { setConn(false, "stream lost — polling"); if (es) es.close(); es = null; startPolling(); };
@@ -982,8 +1040,9 @@ async function pollOnce() {
     const r = await fetch("/api/snapshots");
     if (!r.ok) throw new Error("HTTP " + r.status);
     render(await r.json());
+    hideLoader();
     setConn(true, "polling · " + new Date().toLocaleTimeString());
-  } catch (e) { setConn(false, "disconnected — " + e.message); }
+  } catch (e) { loaderError(e.message); setConn(false, "disconnected — " + e.message); }
 }
 function startPolling() {
   if (pollTimer) return;
