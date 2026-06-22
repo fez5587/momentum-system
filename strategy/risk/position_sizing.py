@@ -22,6 +22,18 @@ class PositionSizeResult(BaseModel):
     risk_amount: float = Field(description="Dollar risk amount")
 
 
+def rank_risk_factor(rank: int, top_n: int) -> float:
+    """Risk scale for concentrate-by-rank: trade fewer, better names with more
+    size on the best one instead of spraying equal size across the board.
+    rank-1 -> 1.0 (full budget), ranks 2..top_n -> 0.5, beyond top_n -> 0.0 (skip).
+    top_n <= 0 (or rank <= 0) disables concentration -> 1.0."""
+    if top_n <= 0 or rank <= 0:
+        return 1.0
+    if rank > top_n:
+        return 0.0
+    return 1.0 if rank == 1 else 0.5
+
+
 def calculate_position_size(
     entry_price: float,
     stop_loss_price: float,

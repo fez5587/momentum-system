@@ -43,6 +43,7 @@ from storage.projections import (
 from strategy.risk.position_sizing import (
     PositionSizingConfig,
     calculate_position_size,
+    rank_risk_factor,
 )
 from trading_mode import TradingModeSettings
 
@@ -73,6 +74,12 @@ class ExecutionSettings:
     max_concurrent_positions: int = 3
     risk_per_trade_pct: float = 0.01
     default_equity: float = 100_000.0
+    # CONCENTRATE-BY-RANK (stop spraying equal size across mediocre gappers — the
+    # human's edge is concentration). Only the top-N armed names by rank may enter,
+    # and risk is scaled DOWN by rank (rank-1 full, rank-2 half). 0 = off (every
+    # armed name sizes equally as before). Plus a hard per-DAY fresh-entry cap.
+    concentrate_top_n: int = 0
+    max_fresh_entries_per_day: int = 0   # 0 = no daily cap
     max_daily_loss_pct: float = 0.03
     # on a daily-loss breach, also flatten open positions + cancel unfilled entries
     flatten_on_breach: bool = True
@@ -209,6 +216,8 @@ class ExecutionSettings:
             entry_grace_seconds=float(values.get("TRADING_ENTRY_GRACE_SECONDS", "5")),
             max_position_pct=float(values.get("TRADING_MAX_POSITION_PCT", "0.33")),
             max_risk_dollars=float(values.get("TRADING_MAX_RISK_DOLLARS", "0.0")),
+            concentrate_top_n=int(values.get("TRADING_CONCENTRATE_TOP_N", "0")),
+            max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
@@ -293,6 +302,7 @@ class TradingExecutionService:
         # don't buy back a name that just stopped out. _prev_held is the last
         # fresh broker snapshot used to spot departures.
         self._exited_today: set[str] = set()
+        self._fresh_entries: dict = {"date": None, "n": 0}  # per-day fresh-entry cap
         self._prev_held: set[str] = set()
         # last-seen unrealized return (fraction) per held symbol — used to decide,
         # when a name leaves the book, whether it exited at a real loss (bench) or
@@ -750,6 +760,7 @@ class TradingExecutionService:
         cum_volume: float = 0.0,
         halted: bool = False,
         day_open: float | None = None,
+        rank: int = 0,
     ) -> dict:
         """Fire a breakout entry immediately on a LIVE price cross.
 
@@ -767,6 +778,22 @@ class TradingExecutionService:
             return {"ok": False, "skipped": "halted"}
         if self._open_position_count() >= self.settings.max_concurrent_positions:
             return {"ok": False, "skipped": "max_positions"}
+
+        # CONCENTRATE-BY-RANK: only the top-N armed names may enter, and risk is
+        # scaled down by rank. Stops the equal-size spray across mediocre gappers
+        # (the human's edge is concentration). rank_factor 0 => outside the top-N.
+        rank_factor = rank_risk_factor(rank, self.settings.concentrate_top_n)
+        if rank_factor <= 0.0:
+            return {"ok": False, "skipped": "rank_concentration"}
+        # hard per-DAY fresh-entry cap (a day-trader takes a few good shots, not 12)
+        cap = self.settings.max_fresh_entries_per_day
+        if cap > 0:
+            today = self._now().date().isoformat() if hasattr(self._now(), "date") else None
+            if today is not None:
+                if self._fresh_entries.get("date") != today:
+                    self._fresh_entries = {"date": today, "n": 0}
+                if self._fresh_entries["n"] >= cap:
+                    return {"ok": False, "skipped": "daily_entry_cap"}
 
         # per-symbol dedup shared with the slow path: never double-enter a name
         # that's already held, pending approval, or requested this session.
@@ -824,17 +851,19 @@ class TradingExecutionService:
                       self._remaining_gross_budget(eq))
         if pos_cap <= 0:
             return {"ok": False, "skipped": "gross_notional_cap"}
+        # scale the dollar risk by rank (rank-1 full, rank-2+ half) — both the %
+        # budget and the hard $ cap scale together so the result scales by the factor
         sizing = calculate_position_size(
             entry_ref,
             stop_f,
             equity=eq,
             config=PositionSizingConfig(
-                risk_per_trade_pct=self.settings.risk_per_trade_pct,
+                risk_per_trade_pct=self.settings.risk_per_trade_pct * rank_factor,
                 default_equity=self.settings.default_equity,
             ),
             max_position_value=pos_cap,
             max_shares=max_shares,
-            max_risk_dollars=self.settings.max_risk_dollars,
+            max_risk_dollars=self.settings.max_risk_dollars * rank_factor,
         )
         if sizing.position_size <= 0:
             return {"ok": False, "skipped": "zero_size"}
@@ -901,9 +930,12 @@ class TradingExecutionService:
                 "armed_at": self._now(),
                 "checks": 0,
             }
+        if result.ok and self.settings.max_fresh_entries_per_day > 0:
+            if isinstance(self._fresh_entries.get("n"), int):
+                self._fresh_entries["n"] += 1   # count toward the per-day cap
         logger.info(
-            "live ORB break %s qty=%s -> ok=%s status=%s",
-            symbol, request.quantity, result.ok, result.status,
+            "live ORB break %s qty=%s -> ok=%s status=%s rank=%s",
+            symbol, request.quantity, result.ok, result.status, rank,
         )
         return {
             "ok": result.ok,

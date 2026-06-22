@@ -749,7 +749,7 @@ def main(argv: list[str] | None = None) -> int:
                 res = rt["execution"].submit_breakout_now(
                     t.symbol, t.trigger, t.stop, last_price=t.price,
                     cum_volume=t.cum_volume, halted=_recently_halted(t.symbol),
-                    day_open=t.day_open,
+                    day_open=t.day_open, rank=t.rank,
                 )
                 if res.get("ok"):
                     book.mark_fired(t.symbol)

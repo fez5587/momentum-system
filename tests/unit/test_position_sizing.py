@@ -4,7 +4,11 @@ Critical for a small REAL account ($300) — sizing must come off real equity an
 no single position can exceed buying power.
 """
 
-from strategy.risk.position_sizing import PositionSizingConfig, calculate_position_size
+from strategy.risk.position_sizing import (
+    PositionSizingConfig,
+    calculate_position_size,
+    rank_risk_factor,
+)
 
 CFG = PositionSizingConfig(risk_per_trade_pct=0.01)
 
@@ -55,3 +59,12 @@ def test_risk_amount_reports_actual_not_budget():
     r = calculate_position_size(4.0, 3.98, equity=300, config=CFG, max_position_value=120)
     assert r.position_size == 30
     assert abs(r.risk_amount - 30 * 0.02) < 1e-6          # ~$0.60 actual, not the $3 budget
+
+
+def test_rank_risk_factor_concentrates():
+    assert rank_risk_factor(1, 0) == 1.0     # concentration OFF -> full
+    assert rank_risk_factor(5, 0) == 1.0
+    assert rank_risk_factor(1, 2) == 1.0     # rank-1 full budget
+    assert rank_risk_factor(2, 2) == 0.5     # rank-2 half
+    assert rank_risk_factor(3, 2) == 0.0     # outside top-2 -> skip
+    assert rank_risk_factor(0, 2) == 1.0     # unranked -> not concentrated
