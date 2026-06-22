@@ -21,8 +21,45 @@ from __future__ import annotations
 
 import logging
 import time
+from datetime import date, datetime, timezone
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
+
+_ET = ZoneInfo("America/New_York")
+
+
+def _fill_et_date(iso) -> date | None:
+    """ET calendar date of a broker fill timestamp (stored UTC), or None."""
+    try:
+        dt = datetime.fromisoformat(str(iso).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(_ET).date()
+    except (TypeError, ValueError):
+        return None
+
+
+def find_overnight_carries(open_symbols, buy_fills, today_et: date) -> list[str]:
+    """Open positions whose lot was NOT entered today (ET) — i.e. carried across
+    a prior session. A day-trading book should be flat by the open, so anything
+    still held that wasn't bought today survived overnight (the EOD flatten was
+    missed/failed) and should be caught up at the open before it bleeds for days
+    (the ATPC-over-Juneteenth case).
+
+    Args:
+        open_symbols: iterable of currently-open position symbols.
+        buy_fills: iterable of {"symbol", "filled_at"} for FILLED BUY orders.
+        today_et: today's ET date.
+    Returns sorted symbols open today with no buy filled today.
+    """
+    bought_today: set[str] = set()
+    for f in buy_fills or []:
+        if _fill_et_date(f.get("filled_at")) == today_et:
+            sym = f.get("symbol")
+            if sym:
+                bought_today.add(sym)
+    return sorted(s for s in (open_symbols or ()) if s and s not in bought_today)
 
 # Order states in which a sell order still RESERVES position quantity. While an
 # order is in one of these states, that many shares show as ``held_for_orders``

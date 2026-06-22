@@ -59,7 +59,6 @@ from runtime.market_calendar import (
     days_to_next_session,
     eod_flatten_status,
     is_regular_hours,
-    session_close_hm,
 )
 from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
@@ -859,6 +858,36 @@ def main(argv: list[str] | None = None) -> int:
             return f"{sev}{tag} closed [{closed}] errors={res['errors']} (will retry)"
         return f"{tag} closed [{closed}]"
 
+    # --- open catch-up flatten: a day-trading book should be FLAT by the open;
+    # close anything carried from a prior session (a missed/failed EOD flatten)
+    # before it bleeds for days — the ATPC-over-Juneteenth backstop. Does NOT
+    # halt the session; today's fresh names are left to trade normally.
+    catchup_enabled = _flag("TRADING_OPEN_CATCHUP_FLATTEN_ENABLED", "1")
+    _catchup_done = {"v": False}
+
+    def step_open_catchup_flatten():
+        if not catchup_enabled or _catchup_done["v"] or rt["execution"] is None:
+            return None
+        try:
+            from zoneinfo import ZoneInfo
+            now_et = datetime.now(ZoneInfo("America/New_York"))
+        except Exception:  # noqa: BLE001
+            return None
+        if not is_regular_hours(now_et):       # only act while the market is open
+            return None
+        res = rt["execution"].flatten_overnight_carries(now_et.date(), "open_catchup")
+        if res["errors"]:
+            print(f"[{datetime.now():%H:%M:%S}] ‼ OPEN CATCH-UP could not flatten carry: "
+                  f"{res['errors']}", flush=True)
+            return f"OPEN CATCH-UP carries={res['carries']} closed={res['closed']} errors={res['errors']} (will retry)"
+        # clean (no carries) or all carries closed -> done for the session
+        _catchup_done["v"] = True
+        if res["carries"]:
+            print(f"[{datetime.now():%H:%M:%S}] OPEN CATCH-UP flattened stale carries: "
+                  f"{res['closed']}", flush=True)
+            return f"OPEN CATCH-UP flattened overnight carries {res['closed']}"
+        return None
+
     def step_news():
         """Land latest Alpaca/Benzinga news for the tracked universe into
         raw_news_items (feeds recent_news_map catalyst prioritisation + the Ollama
@@ -915,13 +944,16 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
     scheduler.add("eod", step_eod_flatten, float(os.environ.get("TRADING_EOD_INTERVAL_SECONDS", "30")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
+    scheduler.add("catchup", step_open_catchup_flatten,
+                  float(os.environ.get("TRADING_OPEN_CATCHUP_INTERVAL_SECONDS", "30")),
+                  enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
 
     def run_pass():
         # force every task due, in pipeline order
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits", "eod"):
+        for name in ("discover", "ingest", "watch", "arm", "sync", "execute", "exits", "eod", "catchup"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

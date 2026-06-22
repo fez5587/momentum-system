@@ -22,7 +22,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from runtime.flatten import cancel_protective_and_close
+from runtime.flatten import cancel_protective_and_close, find_overnight_carries
 from alpaca_paper.execution import (
     AlpacaPaperExecutor,
     ExecutionRequest,
@@ -1021,6 +1021,64 @@ class TradingExecutionService:
                 current_state=result, action_taken="closed_session",
             )
         )
+        return result
+
+    def flatten_overnight_carries(self, today_et, reason: str = "open_catchup") -> dict:
+        """Catch-up flatten: close positions CARRIED from a prior session.
+
+        A day-trading book should never hold overnight, but a missed/failed EOD
+        flatten (loop down, or the held-qty 403 before that was fixed) can leave a
+        stale carry bleeding for days (ATPC over the 4-day Juneteenth gap). On
+        each session this closes any position not entered today — WITHOUT halting
+        the session (unlike ``close_session``); today's fresh names are untouched.
+        Best-effort: errors are collected, not raised. Returns
+        {carries, closed, errors}.
+        """
+        result: dict = {"carries": [], "closed": [], "errors": []}
+        client = getattr(self.executor, "client", None)
+        if client is None or not hasattr(client, "close_position"):
+            return result
+        try:
+            positions = client.get_positions()
+            open_syms = {p.get("symbol") for p in positions
+                         if abs(float(p.get("qty") or 0)) > 0}
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"positions: {exc}")
+            return result
+        if not open_syms:
+            return result
+        try:
+            orders = client.get_orders(status="all", limit=500, nested=True,
+                                       symbols=sorted(open_syms))
+        except Exception as exc:  # noqa: BLE001
+            result["errors"].append(f"orders: {exc}")
+            return result
+        buy_fills = []
+        for o in orders or []:
+            for x in [o, *(o.get("legs") or [])]:
+                if (str(x.get("side")) == "buy" and x.get("status") == "filled"
+                        and x.get("filled_at")):
+                    buy_fills.append({"symbol": x.get("symbol") or o.get("symbol"),
+                                      "filled_at": x.get("filled_at")})
+        carries = find_overnight_carries(open_syms, buy_fills, today_et)
+        result["carries"] = carries
+        for symbol in carries:
+            try:
+                self._release_and_close(client, symbol)
+                result["closed"].append(symbol)
+            except Exception as exc:  # noqa: BLE001
+                result["errors"].append(f"close {symbol}: {exc}")
+        if carries:
+            self.store.emit(
+                RiskRuleTriggeredEvent(
+                    timestamp=datetime.now(), mode=self.mode, correlation_id=self.session_id,
+                    message=(f"Open catch-up flatten ({reason}): carried {carries}; "
+                             f"closed {result['closed']}"
+                             + (f"; ERRORS {result['errors']}" if result['errors'] else "")),
+                    rule_type="open_catchup_flatten", rule_value=0.0,
+                    current_state=result, action_taken="flatten_carries",
+                )
+            )
         return result
 
     def _filled_order_ids(self) -> set[str]:
