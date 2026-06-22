@@ -38,6 +38,7 @@ from storage.projections import (
     query_approval_queue,
     query_catalyst_advisory,
     query_catalyst_feed,
+    query_daily_performance,
     query_fills_feed,
     query_armed_triggers,
     query_equity_curve,
@@ -150,6 +151,8 @@ class DashboardState:
                     "pnl": query_session_pnl(store, for_date=for_date),
                     # all-time scorecard (every closed round-trip, not date-scoped)
                     "alltime": query_alltime_score(store),
+                    # one point per market day for the day-over-day comparison curve
+                    "daily": query_daily_performance(store),
                     "risk": query_risk_state(store, for_date=for_date),
                     "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
                     "equity_curve": query_equity_curve(store, for_date=for_date),

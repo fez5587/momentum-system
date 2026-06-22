@@ -577,6 +577,82 @@ def query_alltime_score(store) -> dict:
     }
 
 
+def query_daily_performance(store, max_days: int = 30) -> list[dict]:
+    """One row per market day for the day-over-day comparison curve:
+    {date, day_pnl (broker equity delta), cum_pnl (running), realized (closed
+    round-trips that day), trades, win_rate, equity (EOD)}. Built from the
+    account summaries (EOD equity per day) joined to the closed-trade journal.
+    Flat non-trading days (|day_pnl|<$1 and no trades) are dropped so the curve
+    is trading days only. Most-recent ``max_days``."""
+    # EOD equity + baseline per day (events are timestamp-ASC, so last wins)
+    by_day: dict[str, dict] = {}
+    for e in store.query_events(event_type="account_summary_updated", limit=None):
+        day = str(e.get("timestamp") or "")[:10]
+        if not day:
+            continue
+        p = json.loads(e.get("payload_json", "{}"))
+        try:
+            eq = float(p.get("total_equity") or 0.0)
+            le = float(p.get("last_equity") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if eq:
+            d = by_day.setdefault(day, {"eq": None, "le": None})
+            d["eq"] = eq
+            if le:
+                d["le"] = le
+
+    # closed-trade stats per day
+    trades_by_day: dict[str, dict] = {}
+    for e in store.query_events(event_type="position_closed", limit=None):
+        day = str(e.get("timestamp") or "")[:10]
+        p = json.loads(e.get("payload_json", "{}"))
+        pnl = p.get("realized_pnl")
+        if not day or pnl is None:
+            continue
+        pnl = float(pnl)
+        t = trades_by_day.setdefault(day, {"n": 0, "w": 0, "realized": 0.0})
+        t["n"] += 1
+        t["w"] += 1 if pnl > 0 else 0
+        t["realized"] += pnl
+
+    # restrict to NYSE trading days so weekend/holiday mark-drift on held
+    # positions doesn't masquerade as a performance day (degrade gracefully)
+    from datetime import date as _date
+    try:
+        from runtime.market_calendar import is_trading_day
+    except Exception:  # noqa: BLE001
+        is_trading_day = None
+
+    out: list[dict] = []
+    cum = 0.0
+    for day in sorted(set(by_day) | set(trades_by_day)):
+        bd = by_day.get(day)
+        t = trades_by_day.get(day, {"n": 0, "w": 0, "realized": 0.0})
+        day_pnl = (bd["eq"] - bd["le"]) if (bd and bd["eq"] and bd["le"]) else None
+        if day_pnl is None:
+            day_pnl = t["realized"] if t["n"] else 0.0
+        if t["n"] == 0 and is_trading_day is not None:
+            try:
+                if not is_trading_day(_date.fromisoformat(day)):
+                    continue                      # non-trading day, no trades -> drop
+            except (TypeError, ValueError):
+                pass
+        if abs(day_pnl) < 1.0 and t["n"] == 0:   # flat non-trading day -> skip
+            continue
+        cum += day_pnl
+        out.append({
+            "date": day,
+            "day_pnl": round(day_pnl, 2),
+            "cum_pnl": round(cum, 2),
+            "realized": round(t["realized"], 2),
+            "trades": t["n"],
+            "win_rate": round(t["w"] / t["n"], 3) if t["n"] else None,
+            "equity": round(bd["eq"], 2) if (bd and bd["eq"]) else None,
+        })
+    return out[-max_days:]
+
+
 def query_session_pnl(store, session_id: str | None = None,
                       for_date: str | None = None) -> dict:
     """Day P&L + trade stats. Realized comes from the broker equity delta (the

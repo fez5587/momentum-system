@@ -285,6 +285,14 @@
   .exit-tag.ex-tp { color: #5fd39a; background: rgba(52,209,126,.12); }
   .exit-tag.ex-mkt { color: var(--muted); background: rgba(120,132,162,.12); }
   #trades-net b.pos { color: var(--green); } #trades-net b.neg { color: var(--red); }
+  /* daily performance waterfall / equity curve */
+  .daily-svg { display: block; max-width: 100%; }
+  .daily-col { cursor: pointer; }
+  .daily-hit { fill: transparent; }
+  .daily-col:hover .daily-hit { fill: rgba(91,163,255,.07); }
+  .daily-col.daily-sel .daily-hit { fill: rgba(91,163,255,.12); }
+  .daily-lbl { fill: var(--muted); font: 500 9px var(--mono); text-anchor: middle; }
+  .daily-lbl.daily-sel { fill: var(--accent); font-weight: 700; }
   .st-armed   .trig-state { color: #58a6ff; } .st-armed   .trig-fill { background: linear-gradient(90deg,#1f6feb,#58a6ff); }
   .st-fired   .trig-state { color: #2ecc71; } .st-fired   .trig-fill { background: #2ecc71; }
   .st-filled  .trig-state { color: #2ecc71; } .st-filled  .trig-fill { background: linear-gradient(90deg,#1f8f4e,#2ecc71); }
@@ -440,6 +448,11 @@
   <section class="panel full">
     <h2>All-Time Score <span class="hint">cumulative across every closed round-trip — bot's record to date</span></h2>
     <div id="alltime" class="acct-row"><span class="empty">No closed trades recorded yet.</span></div>
+  </section>
+
+  <section class="panel full">
+    <h2>Daily Performance <span id="daily-count" class="count">0</span><span class="hint">per-day P&amp;L bars + cumulative equity curve &middot; click a day to open it</span></h2>
+    <div id="daily-curve"><span class="empty">No trading days recorded yet.</span></div>
   </section>
 
   <section class="panel">
@@ -890,6 +903,47 @@ function renderAllTime(a) {
     m('Worst Day', day(a.worst_day), 'neg');
 }
 
+// Day-over-day equity curve: a waterfall — the blue line is cumulative P&L
+// (the equity curve), each bar is that day's step (green up / red down). One
+// shared scale; click a day to open it. Highlights the currently-viewed day.
+function renderDaily(days) {
+  const host = $("daily-curve"); const cnt = $("daily-count");
+  if (cnt) cnt.textContent = (days || []).length;
+  if (!days || !days.length) { host.innerHTML = '<span class="empty">No trading days recorded yet.</span>'; return; }
+  const n = days.length;
+  const W = Math.max(host.clientWidth || 680, n * 48);
+  const H = 184, padT = 16, padB = 30, padX = 12, plotH = H - padT - padB;
+  const cums = days.map(d => +d.cum_pnl || 0);
+  const lo = Math.min(0, ...cums), hi = Math.max(0, ...cums), rng = (hi - lo) || 1;
+  const Y = v => padT + plotH * (1 - (v - lo) / rng);
+  const slot = (W - 2 * padX) / n, cx = i => padX + slot * (i + 0.5);
+  const barW = Math.min(slot * 0.5, 34);
+  const z = Y(0).toFixed(1);
+  let bars = '', labels = '', dots = '', prev = 0;
+  days.forEach((d, i) => {
+    const cur = cums[i], up = (+d.day_pnl || 0) >= 0, col = up ? '#34d17e' : '#ff5a60';
+    const y1 = Y(prev), y2 = Y(cur), top = Math.min(y1, y2), h = Math.max(1, Math.abs(y1 - y2));
+    const x = (cx(i) - barW / 2).toFixed(1);
+    const sel = viewDate === d.date ? ' daily-sel' : '';
+    const wr = d.win_rate != null ? (d.win_rate * 100).toFixed(0) + '% win' : 'no trades';
+    const tip = d.date + '  ·  day ' + (d.day_pnl >= 0 ? '+' : '') + d.day_pnl
+      + '  ·  ' + d.trades + ' trades · ' + wr + '  ·  cum ' + cur.toFixed(0);
+    bars += '<g class="daily-col' + sel + '" onclick="setView(\'' + d.date + '\')"><title>' + esc(tip) + '</title>'
+      + '<rect class="daily-hit" x="' + (padX + slot * i).toFixed(1) + '" y="' + padT + '" width="' + slot.toFixed(1) + '" height="' + plotH + '"/>'
+      + '<rect x="' + x + '" y="' + top.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + h.toFixed(1) + '" rx="2" fill="' + col + '" opacity=".5"/>'
+      + '</g>';
+    labels += '<text class="daily-lbl' + sel + '" x="' + cx(i).toFixed(1) + '" y="' + (H - 10) + '">' + d.date.slice(5) + '</text>';
+    dots += '<circle cx="' + cx(i).toFixed(1) + '" cy="' + y2.toFixed(1) + '" r="2.8" fill="#5ba3ff"/>';
+    prev = cur;
+  });
+  const line = days.map((d, i) => cx(i).toFixed(1) + ',' + Y(cums[i]).toFixed(1)).join(' ');
+  host.innerHTML = '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" class="daily-svg">'
+    + '<line x1="' + padX + '" y1="' + z + '" x2="' + (W - padX) + '" y2="' + z + '" stroke="#30363d" stroke-width="1" stroke-dasharray="3 3"/>'
+    + bars
+    + '<polyline points="' + line + '" fill="none" stroke="#5ba3ff" stroke-width="1.6"/>'
+    + dots + labels + '</svg>';
+}
+
 // Per-day Trades — the individual round-trips that closed on the viewed day
 function renderTrades(pnl) {
   const trades = (pnl && pnl.trades) || [];
@@ -965,6 +1019,7 @@ function render(d) {
   renderCatalystEngine(d.catalyst_engine);
   renderCatalystFeed(d.catalyst_feed);
   renderAllTime(d.alltime);
+  renderDaily(d.daily);
   renderTrades(d.pnl);
   renderEquity(d.equity_curve);
 

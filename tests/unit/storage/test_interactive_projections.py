@@ -244,3 +244,41 @@ def test_alltime_score_aggregates_all_days(store):
     assert a["trading_days"] == 2
     assert a["best_day"] == {"date": "2026-06-17", "pnl": 100.0}
     assert a["worst_day"] == {"date": "2026-06-18", "pnl": -150.0}
+
+
+def _acct(store, ts, eq, le):
+    store.emit(AccountSummaryUpdatedEvent(
+        timestamp=ts, mode=EventMode.PAPER, message="acct",
+        broker_name="alpaca_paper", account_id="paper", account_desc="Alpaca Paper",
+        total_equity=eq, cash_balance=0.0, buying_power=0.0,
+        net_liquidating_value=eq, last_equity=le))
+
+
+def test_daily_performance_curve_trading_days_only():
+    from storage.projections import query_daily_performance
+    store = EventStore(":memory:")
+    # Wed 6/17: +100 day, 1 win
+    _acct(store, datetime(2026, 6, 17, 16, 0), 10_100.0, 10_000.0)
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 17, 10, 0), mode=EventMode.PAPER, message="w",
+        position_id="a", symbol="AAA", exit_price=11.0, exit_reason="take_profit",
+        realized_pnl=100.0, entry_price=10.0, side="buy"))
+    # Thu 6/18: -200 day, 1W 1L
+    _acct(store, datetime(2026, 6, 18, 16, 0), 9_900.0, 10_100.0)
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 18, 10, 0), mode=EventMode.PAPER, message="w",
+        position_id="b", symbol="BBB", exit_price=6.0, exit_reason="market_exit",
+        realized_pnl=50.0, entry_price=5.0, side="buy"))
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 18, 11, 0), mode=EventMode.PAPER, message="l",
+        position_id="c", symbol="CCC", exit_price=9.0, exit_reason="stop_loss",
+        realized_pnl=-150.0, entry_price=10.0, side="buy"))
+    # Sat 6/20: flat, no trades -> must be dropped (not a trading day)
+    _acct(store, datetime(2026, 6, 20, 16, 0), 9_900.0, 9_900.0)
+
+    days = query_daily_performance(store)
+    assert [d["date"] for d in days] == ["2026-06-17", "2026-06-18"]
+    assert days[0]["day_pnl"] == 100.0 and days[0]["cum_pnl"] == 100.0 and days[0]["win_rate"] == 1.0
+    assert days[1]["day_pnl"] == -200.0 and days[1]["cum_pnl"] == -100.0
+    assert days[1]["trades"] == 2 and days[1]["win_rate"] == 0.5
+    store.close()
