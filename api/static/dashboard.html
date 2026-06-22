@@ -261,6 +261,21 @@
   .cf-head { color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .cf-why { color: var(--muted); font-style: italic; font-size: 10px; overflow: hidden;
     text-overflow: ellipsis; white-space: nowrap; }
+  /* clickable engine chip + its filter indicator */
+  .cat-engine.clickable { cursor: pointer; }
+  .cat-engine.clickable:hover { color: var(--text); }
+  .cat-filter { color: var(--accent); font-weight: 700; }
+  /* ready-signals catalyst cell */
+  .rs-cat { font: 600 10px var(--mono); color: #c9d3e6; max-width: 190px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .rs-cat .muted { color: var(--muted); }
+  /* open-positions unrealized P&L cell: $ + % + colored magnitude bar */
+  .pl-cell { min-width: 96px; }
+  .pl-top { font: 600 12px var(--mono); white-space: nowrap; }
+  .pl-cell.pos .pl-top { color: var(--green); } .pl-cell.neg .pl-top { color: var(--red); }
+  .pl-pct { font-size: 10px; opacity: .8; }
+  .pl-bar { margin-top: 3px; height: 4px; background: #0d1117; border-radius: 2px; overflow: hidden; }
+  .pl-bar-fill { height: 100%; transition: width .35s ease; }
   .st-armed   .trig-state { color: #58a6ff; } .st-armed   .trig-fill { background: linear-gradient(90deg,#1f6feb,#58a6ff); }
   .st-fired   .trig-state { color: #2ecc71; } .st-fired   .trig-fill { background: #2ecc71; }
   .st-filled  .trig-state { color: #2ecc71; } .st-filled  .trig-fill { background: linear-gradient(90deg,#1f8f4e,#2ecc71); }
@@ -343,6 +358,19 @@
     .acct-row { gap: 12px 16px; }
     .feed-time { min-width: 54px; }
     .toast { left: 14px; right: 14px; bottom: 14px; max-width: none; }
+
+    /* catalyst feed: let the headline+why wrap instead of truncating; drop the
+       narrow conviction column to save width */
+    .cf-row { flex-wrap: wrap; gap: 4px 8px; }
+    .cf-read { width: auto; flex: 1 1 auto; min-width: 0; }
+    .cf-nums { display: none; }
+    .cf-text { flex: 1 1 100%; }
+    .cf-head, .cf-why { white-space: normal; }
+    .cat-engine { display: block; margin: 4px 0 0; width: 100%; }
+
+    /* fat-finger-friendly tap targets */
+    button, .btn-exit, .btn-approve, .btn-reject, .inject button { min-height: 38px; padding: 8px 14px; }
+    .hdr-sel, #date-select { min-height: 36px; }
   }
 </style>
 </head>
@@ -463,6 +491,9 @@ const signed = (el, v) => {
 let latest = null;
 let soundOn = false;
 let lastSignalKey = "";
+let catVetoOnly = false;   // engine-chip filter: show only dilutive/veto reads
+let latestFeed = [];       // cached so the filter toggles without a refetch
+let latestEngine = null;
 const expanded = new Set();
 const barsCache = {};
 
@@ -699,7 +730,9 @@ function renderTriggers(tw, catMap) {
 
 // catalyst engine status chip (shows the LLM news engine is live + its activity)
 function renderCatalystEngine(e) {
+  latestEngine = e;
   const el = $("cat-engine"); if (!el) return;
+  el.onclick = null; el.classList.remove("clickable");
   if (!e || !e.enabled) {
     el.innerHTML = '<span class="cat-off">🧠 catalyst engine off</span>';
     el.title = 'Local-LLM news enrichment disabled (OLLAMA_ENABLED / NEWS_ENRICH_ENABLED)';
@@ -710,11 +743,15 @@ function renderCatalystEngine(e) {
   el.innerHTML = '🧠 <b>' + esc(e.model || 'llm') + '</b> · ' + (e.advisories || 0) + ' read'
     + (e.dilutive ? ' · <span class="neg">' + e.dilutive + ' dilutive</span>' : '')
     + ' · ' + veto + score
-    + (e.vetoes_today ? ' · <span class="neg">⚠ ' + e.vetoes_today + ' vetoed</span>' : '');
-  el.title = 'Catalyst engine LIVE — ' + (e.advisories || 0) + ' headlines classified by '
+    + (e.vetoes_today ? ' · <span class="neg">⚠ ' + e.vetoes_today + ' vetoed</span>' : '')
+    + (catVetoOnly ? ' · <span class="cat-filter">▼ dilutive only ✕</span>' : '');
+  el.title = (catVetoOnly ? 'Showing DILUTIVE reads only — click to show all. '
+    : 'Click to filter the feed to dilutive/veto reads. ')
+    + 'Catalyst engine LIVE — ' + (e.advisories || 0) + ' headlines classified by '
     + (e.model || 'the LLM') + ', ' + (e.dilutive || 0) + ' flagged dilutive, '
-    + (e.vetoes_today || 0) + ' entries vetoed today. Score blend: '
-    + (e.score_blend ? 'on' : 'off') + ', dilution veto: ' + (e.dilution_veto ? 'on' : 'off') + '.';
+    + (e.vetoes_today || 0) + ' entries vetoed today.';
+  el.classList.add("clickable");
+  el.onclick = () => { catVetoOnly = !catVetoOnly; renderCatalystEngine(latestEngine); renderCatalystFeed(latestFeed); };
 }
 
 // enrichment timestamps are stored UTC; show them in ET like the rest of the board
@@ -729,11 +766,15 @@ function fmtET(s) {
 // Catalyst Engine feed — the raw stream of what the LLM read and how it ruled,
 // with the model's own rationale, so the operator can judge the determinations.
 function renderCatalystFeed(feed) {
-  const arr = feed || [];
+  latestFeed = feed || latestFeed || [];
+  const all = latestFeed;
+  const arr = catVetoOnly ? all.filter(r => r.is_dilutive) : all;
   const host = $("catalyst-feed");
-  const cnt = $("cat-feed-count"); if (cnt) cnt.textContent = arr.length;
+  const cnt = $("cat-feed-count"); if (cnt) cnt.textContent = catVetoOnly ? (arr.length + " / " + all.length) : all.length;
   if (!arr.length) {
-    host.innerHTML = '<span class="empty">No catalyst reads yet — the news enrichment loop hasn\'t classified any headlines.</span>';
+    host.innerHTML = '<span class="empty">' + (catVetoOnly
+      ? 'No dilutive/veto reads in the window — click the chip again to show all.'
+      : 'No catalyst reads yet — the news enrichment loop hasn\'t classified any headlines.') + '</span>';
     return;
   }
   host.innerHTML = arr.map(r => {
@@ -803,6 +844,18 @@ function rBar(entry, cur, stop) {
     : ((cur - entry) / entry >= 0 ? '+' : '') + ((cur - entry) / entry * 100).toFixed(1) + '%';
   const sgn = (r != null ? r : (cur - entry)) >= 0 ? 'pos' : 'neg';
   return '<div class="rbar">' + inner + '</div><span class="rtxt ' + sgn + '">' + txt + '</span>';
+}
+
+// unrealized P&L as $ + % with a colored magnitude bar (bar maxes out at ±10%)
+function unrealCell(upnl, pct) {
+  const v = +upnl;
+  const cls = isNaN(v) ? "" : v >= 0 ? "pos" : "neg";
+  const hasPct = pct != null && !isNaN(+pct);
+  const pctTxt = hasPct ? '<span class="pl-pct">' + (+pct >= 0 ? '+' : '') + (+pct * 100).toFixed(1) + '%</span>' : '';
+  const w = hasPct ? Math.min(100, Math.abs(+pct) * 1000) : 0;   // 10% -> full bar
+  const col = v >= 0 ? 'var(--green)' : 'var(--red)';
+  const bar = '<div class="pl-bar"><div class="pl-bar-fill" style="width:' + w.toFixed(0) + '%;background:' + col + '"></div></div>';
+  return '<div class="pl-cell ' + cls + '"><div class="pl-top">' + money(upnl) + ' ' + pctTxt + '</div>' + bar + '</div>';
 }
 
 function render(d) {
@@ -881,12 +934,14 @@ function render(d) {
   ), "No pending approvals.");
 
   const rs = d.ready_signals || [];
+  const catMap = d.catalyst || {};
   $("rs-count").textContent = rs.length;
   fill("ready-signals", table(
-    ["Symbol", "Chart", "Setup", "Entry", "Stop", "Qual", "Time"],
+    ["Symbol", "Chart", "Setup", "Catalyst", "Entry", "Stop", "Qual", "Time"],
     rs.map(s => '<tr><td class="sym">' + esc(s.symbol) + '</td>' +
       '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(s.symbol) + '" data-entry="' + (s.entry_price != null ? s.entry_price : "") + '" data-stop="' + (s.stop_loss_price != null ? s.stop_loss_price : "") + '"></canvas></td>' +
       '<td>' + esc(s.signal_type || "—") + '</td>' +
+      '<td class="rs-cat">' + (trigCatalyst(catMap[(s.symbol || "").toUpperCase()] || catMap[s.symbol], null) || '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmt(s.entry_price) + '</td>' +
       '<td class="num">' + fmt(s.stop_loss_price) + '</td>' +
       '<td class="num">' + fmt(s.quality_score) + '</td>' +
@@ -906,6 +961,8 @@ function render(d) {
     const cur = pos.current_price != null ? +pos.current_price : (pos.market_price != null ? +pos.market_price : null);
     const stop = stopBy[pos.symbol] != null ? stopBy[pos.symbol] : null;
     const upnl = (entry != null && cur != null) ? (cur - entry) * Math.abs(qty) : (pos.unrealized_pl || pos.unrealized_pnl);
+    const pct = pos.unrealized_pnl_pct != null ? +pos.unrealized_pnl_pct
+              : (entry && cur != null ? (cur - entry) / entry : null);
     posRows.push('<tr><td class="sym">' + esc(pos.symbol) + (stop == null ? ' <span class="rtxt neg" title="no protective stop">⚠</span>' : '') + '</td>' +
       '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(pos.symbol) + '" data-entry="' + (entry != null ? entry : "") + '" data-stop="' + (stop != null ? stop : "") + '"></canvas></td>' +
       '<td><span class="pill ' + (qty < 0 ? "short" : "long") + '">' + (qty < 0 ? "short" : "long") + '</span></td>' +
@@ -913,7 +970,7 @@ function render(d) {
       '<td class="num">' + fmt(entry) + '</td>' +
       '<td class="num">' + fmt(cur) + '</td>' +
       '<td>' + rBar(entry, cur, stop) + '</td>' +
-      '<td class="num ' + (+(upnl || 0) >= 0 ? "pos" : "neg") + '">' + money(upnl) + '</td>' +
+      '<td>' + unrealCell(upnl, pct) + '</td>' +
       '<td><button class="btn-exit" onclick="exitPos(\'' + esc(pos.symbol) + '\')">Exit</button></td></tr>');
   }));
   $("pos-count").textContent = posRows.length;
