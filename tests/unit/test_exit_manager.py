@@ -93,6 +93,44 @@ def test_flatten_cancels_protective_orders_then_closes():
     assert broker.closed == ["AAA"]                    # then liquidated
 
 
+def test_naked_position_flattened_after_grace():
+    """A held position with NO live protective stop (bracket leg never attached
+    or got stripped) is the NIVF case — flatten it after the grace passes."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "10.1", "qty": "100"}]
+
+    class _NakedBroker(_FakeBroker):
+        def get_orders(self, status="open", limit=200, nested=True, symbols=None):
+            return []   # no protective stop leg at all -> naked
+
+    broker = _NakedBroker(pos, None)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(10.2, 10.0, 10.1)]),
+        cfg=ExitConfig(enforce_stop_grace_passes=2, catastrophe_pct=0.10),
+        session_id="t",
+    )
+    mgr.manage()                         # pass 1: naked but within grace
+    assert broker.closed == []
+    mgr.manage()                         # pass 2: grace reached -> flatten
+    assert broker.closed == [("AAA", None)]
+
+
+def test_position_with_stop_not_flattened_as_naked():
+    """A position WITH a live stop must never be naked-flattened."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "10.1", "qty": "100"}]
+    leg = {"id": "stop1", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "9.5", "status": "held"}
+    broker = _FakeBroker(pos, leg)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(10.2, 10.0, 10.1)]),
+        cfg=ExitConfig(enforce_stop_grace_passes=2, catastrophe_pct=0.10),
+        session_id="t",
+    )
+    mgr.manage(); mgr.manage(); mgr.manage()
+    assert broker.closed == []           # has a stop -> never naked-flattened
+
+
 def test_manager_noop_for_static_bracket():
     # no active rules -> the broker OCO handles everything; manager does nothing
     broker = _FakeBroker([{"symbol": "AAA", "avg_entry_price": "10", "qty": "100"}],

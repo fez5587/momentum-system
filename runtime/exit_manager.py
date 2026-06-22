@@ -38,7 +38,8 @@ def _is_active(cfg: ExitConfig) -> bool:
     return bool(cfg and (cfg.breakeven_at_r or cfg.breakeven_at_pct
                          or cfg.trail_mode != TRAIL_NONE
                          or cfg.scale_out_r or cfg.first_red_exit
-                         or cfg.profit_lock_tiers or cfg.catastrophe_pct))
+                         or cfg.profit_lock_tiers or cfg.catastrophe_pct
+                         or cfg.enforce_stop_grace_passes))
 
 
 class LiveExitManager:
@@ -51,6 +52,7 @@ class LiveExitManager:
         self.session_id = session_id
         self.mode = mode
         self._tracked: dict[str, _Tracked] = {}
+        self._naked_passes: dict[str, int] = {}   # consecutive passes a held position had no live stop
 
     # -- broker helpers ----------------------------------------------------
 
@@ -148,40 +150,62 @@ class LiveExitManager:
         for sym, p in held.items():
             entry = float(p.get("avg_entry_price") or 0.0)
             cur = float(p.get("current_price") or 0.0)
+            is_long = str(p.get("side") or "long").lower() != "short"
+            leg_id, cur_stop = self._stop_leg(sym, orders)  # live protective sell-stop
+
             # CATASTROPHE STOP — the hard backstop, FIRST and unconditional. Runs on
             # EVERY held position, before the bars fetch and before the no-stop skip
-            # below that otherwise leaves a NAKED position (no working bracket) with
-            # zero exit management — the exact NIVF case that ran to -23% and was
-            # ~the entire net loss. Doesn't depend on bars or a live stop.
-            if (self.cfg.catastrophe_pct and entry > 0 and cur > 0
-                    and str(p.get("side") or "long").lower() != "short"):
-                _leg0, cata_stop = self._stop_leg(sym, orders)
-                if catastrophe_triggered(entry, cur, cata_stop,
-                                         self.cfg.catastrophe_pct,
-                                         self.cfg.catastrophe_risk_mult):
-                    loss_pct = (entry - cur) / entry * 100
+            # below — the exact NIVF case (ran to -23% with no live stop = ~the
+            # entire net loss). Doesn't depend on bars.
+            if (self.cfg.catastrophe_pct and entry > 0 and cur > 0 and is_long
+                    and catastrophe_triggered(entry, cur, cur_stop,
+                                              self.cfg.catastrophe_pct,
+                                              self.cfg.catastrophe_risk_mult)):
+                loss_pct = (entry - cur) / entry * 100
+                try:
+                    self._flatten(sym, orders)
+                    self._tracked.pop(sym, None)
+                    self._naked_passes.pop(sym, None)
+                    self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
+                               f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
+                               {"price": cur, "entry": entry, "stop": cur_stop})
+                    actions.append(f"{sym} CATASTROPHE-exit @{cur:.2f} (-{loss_pct:.0f}%)")
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("catastrophe exit failed %s: %s", sym, exc)
+                continue
+
+            # STOP ENFORCEMENT — a held position MUST have a live protective stop.
+            # If the bracket's stop leg never attached or was stripped (NAKED), the
+            # old code SILENTLY SKIPPED management and let it run to EOD (NIVF).
+            # Flatten after a short grace (consecutive passes) so a just-filled
+            # bracket's legs can attach first.
+            grace = self.cfg.enforce_stop_grace_passes
+            if grace and entry > 0 and leg_id is None:
+                n = self._naked_passes.get(sym, 0) + 1
+                self._naked_passes[sym] = n
+                if n >= grace:
                     try:
                         self._flatten(sym, orders)
                         self._tracked.pop(sym, None)
-                        self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
-                                   f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
-                                   {"price": cur, "entry": entry, "stop": cata_stop})
-                        actions.append(f"{sym} CATASTROPHE-exit @{cur:.2f} (-{loss_pct:.0f}%)")
+                        self._emit(sym, f"naked-stop enforced exit {sym} "
+                                   f"(no live stop, {n} passes)", "exit_naked_stop",
+                                   {"passes": n, "price": cur, "entry": entry})
+                        actions.append(f"{sym} naked-stop exit (no live stop)")
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("catastrophe exit failed %s: %s", sym, exc)
-                    continue
+                        logger.warning("naked-stop exit failed %s: %s", sym, exc)
+                    self._naked_passes.pop(sym, None)
+                continue  # don't run trail logic on a naked position
+            self._naked_passes.pop(sym, None)  # has a live stop
+
             try:
                 bars = self.bars_fn(sym)
             except Exception:  # noqa: BLE001
                 continue
             if bars is None or len(bars) == 0:
                 continue
-            if entry <= 0:
-                continue
             if sym not in self._tracked:
-                _leg, cur_stop = self._stop_leg(sym, orders)
                 if cur_stop is None or cur_stop >= entry:
-                    continue  # no usable protective stop yet (or above entry)
+                    continue  # protected at breakeven+; broker stop handles it (no trail-from-init)
                 # trail from the ACTUAL entry fill time (so high-water/R reflect
                 # the move since entry, not since we first noticed the position)
                 entry_ts = self._entry_time(sym, orders) or _last_ts(bars)

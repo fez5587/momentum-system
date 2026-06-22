@@ -77,6 +77,12 @@ class ExitConfig:
     # = the entire net loss). 0 = off.
     catastrophe_pct: float = 0.10
     catastrophe_risk_mult: float = 1.5
+    # STOP ENFORCEMENT: a held position MUST have a live protective stop. If a
+    # bracket's stop leg never attached or was stripped (the position is naked),
+    # flatten it after this many consecutive naked passes (a grace so a just-
+    # filled bracket's legs can attach first). 0 = off. The preventive complement
+    # to the catastrophe stop (which is the -X% backstop).
+    enforce_stop_grace_passes: int = 2
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExitConfig":
@@ -106,6 +112,7 @@ class ExitConfig:
             profit_lock_tiers=parse_profit_tiers(v.get("TRADING_EXIT_PROFIT_TIERS", "")),
             catastrophe_pct=f("TRADING_CATASTROPHE_STOP_PCT", "0.10"),
             catastrophe_risk_mult=f("TRADING_CATASTROPHE_RISK_MULT", "1.5"),
+            enforce_stop_grace_passes=int(f("TRADING_ENFORCE_STOP_GRACE_PASSES", "2")),
         )
 
     def describe(self) -> str:
@@ -126,6 +133,8 @@ class ExitConfig:
                 f"+{g * 100:g}%->{lk * 100:g}%" for g, lk in self.profit_lock_tiers))
         if self.catastrophe_pct:
             parts.append(f"catastrophe@-{self.catastrophe_pct:.0%}/{self.catastrophe_risk_mult:g}xR")
+        if self.enforce_stop_grace_passes:
+            parts.append(f"enforce-stop({self.enforce_stop_grace_passes}p)")
         return ", ".join(parts)
 
 
