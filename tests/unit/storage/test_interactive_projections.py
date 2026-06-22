@@ -154,12 +154,46 @@ def test_session_pnl_broker_delta_attributes_unrealized(store):
             ],
         )
     )
-    pnl = query_session_pnl(store)
+    # scope to T0's day so there's no prior-session carry (start-of-day baseline = 0)
+    pnl = query_session_pnl(store, for_date="2026-06-11")
     assert pnl["pnl_source"] == "broker"
     assert pnl["total_pnl"] == 262.84           # broker equity delta
     assert pnl["unrealized_pnl"] == -66.85      # attributed to the open positions
     assert pnl["realized_pnl"] == 329.69        # delta - unrealized, NOT the whole delta
     assert pnl["open_positions"] == 3
+
+
+def test_session_pnl_nets_out_overnight_carry(store):
+    """Regression for 'past days don't reflect that day's P&L'. A position held
+    overnight carried its full mark-vs-entry into the day; realized = broker_day
+    - unrealized then fabricated P&L (a $0 holiday read as +$330/-$330). The
+    day's realized must net out the START-OF-DAY unrealized, so only the day's
+    own open-position move counts."""
+    prev = datetime(2026, 6, 10, 15, 0)   # prior session
+    day = datetime(2026, 6, 11, 15, 0)    # the day under review
+    # prior session ends with the position -100 underwater
+    store.emit(AccountPositionsUpdatedEvent(
+        timestamp=prev, mode=EventMode.PAPER, message="pos",
+        broker_name="alpaca_paper", account_id="paper",
+        positions=[{"symbol": "HOLD", "quantity": 100, "unrealized_pnl": -100.0}]))
+    # the review day: equity +50 vs prior close; same position recovers to -40
+    store.emit(AccountSummaryUpdatedEvent(
+        timestamp=day, mode=EventMode.PAPER, message="acct",
+        broker_name="alpaca_paper", account_id="paper", account_desc="Alpaca Paper",
+        total_equity=100_050.0, cash_balance=0.0, buying_power=0.0,
+        net_liquidating_value=100_050.0, last_equity=100_000.0))
+    store.emit(AccountPositionsUpdatedEvent(
+        timestamp=day, mode=EventMode.PAPER, message="pos",
+        broker_name="alpaca_paper", account_id="paper",
+        positions=[{"symbol": "HOLD", "quantity": 100, "unrealized_pnl": -40.0}]))
+
+    pnl = query_session_pnl(store, for_date="2026-06-11")
+    assert pnl["total_pnl"] == 50.0             # broker day delta (unchanged)
+    assert pnl["unrealized_pnl"] == 60.0        # the day's move: -40 - (-100)
+    assert pnl["realized_pnl"] == -10.0         # 50 - 60, NOT 50 - (-40) = 90
+    assert pnl["open_unrealized_pnl"] == -40.0  # full open mark still exposed
+    # identity holds
+    assert pnl["realized_pnl"] + pnl["unrealized_pnl"] == pnl["total_pnl"]
 
 
 def test_session_pnl_unrealized_derived_when_pnl_missing(store):

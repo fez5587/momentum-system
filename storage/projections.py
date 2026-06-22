@@ -503,6 +503,29 @@ def _r_multiple(entry, stop, exit_price, side: str) -> float | None:
     return round((exit_price - entry) * direction / risk, 2)
 
 
+def _sum_position_unrealized(positions) -> tuple[float, int]:
+    """(sum of unrealized P&L, position count) for a positions-snapshot list.
+    Live sync stores the key as `unrealized_pnl`; accept the alpaca-native
+    `unrealized_pl` alias, else derive from qty*(price-cost)."""
+    total = 0.0
+    count = 0
+    for position in positions or []:
+        count += 1
+        try:
+            upl = position.get("unrealized_pnl")
+            if upl is None:
+                upl = position.get("unrealized_pl")
+            if upl is None:
+                qty = float(position.get("quantity") or 0.0)
+                cur = float(position.get("current_price") or 0.0)
+                avg = float(position.get("avg_entry_price") or 0.0)
+                upl = qty * (cur - avg)
+            total += float(upl or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return total, count
+
+
 def query_session_pnl(store, session_id: str | None = None,
                       for_date: str | None = None) -> dict:
     """Day P&L + trade stats. Realized comes from the broker equity delta (the
@@ -547,31 +570,32 @@ def query_session_pnl(store, session_id: str | None = None,
             }
         )
 
-    # unrealized from the latest positions snapshot (any broker)
-    unrealized = 0.0
-    open_positions = 0
+    # End-of-window open-position unrealized (the latest snapshot in scope).
     snapshots = query_account_positions_snapshot(store, for_date=for_date)
-    if snapshots:
-        for position in snapshots[-1].get("positions") or []:
-            open_positions += 1
-            try:
-                # The positions snapshot stores this as `unrealized_pnl` (see
-                # alpaca_paper/sync.py); reading `unrealized_pl` here silently
-                # returned 0, so the whole broker day-delta was mislabelled as
-                # realized (a +$330 realized / -$67 unrealized day read as
-                # "$263 realized, $0 unrealized"). Prefer the stored key, accept
-                # the alpaca-native alias, else derive from qty*(price-cost).
-                upl = position.get("unrealized_pnl")
-                if upl is None:
-                    upl = position.get("unrealized_pl")
-                if upl is None:
-                    qty = float(position.get("quantity") or 0.0)
-                    cur = float(position.get("current_price") or 0.0)
-                    avg = float(position.get("avg_entry_price") or 0.0)
-                    upl = qty * (cur - avg)
-                unrealized += float(upl or 0.0)
-            except (TypeError, ValueError):
-                pass
+    unrealized, open_positions = _sum_position_unrealized(
+        snapshots[-1].get("positions") if snapshots else [])
+
+    # START-OF-DAY baseline: the unrealized carried INTO this day on positions
+    # held overnight. Without it, realized = broker_day - unrealized fabricated
+    # P&L on past/closed days — a position opened days ago still showed its full
+    # mark-vs-entry, so a $0 holiday read as "+$330 realized / -$330 unrealized"
+    # every day. The day's P&L decomposes as broker_day = realized + (U_eod -
+    # U_sod), so we subtract the carry. Live (for_date None) baselines at today's
+    # midnight; after the EOD flatten there are no overnight positions so U_sod=0
+    # and this is a no-op — it only bites on genuine overnight holds / past days.
+    from datetime import datetime
+    since, _until = _hist_window(for_date)
+    if since is None:
+        now = datetime.now()
+        day_start = datetime(now.year, now.month, now.day).isoformat()
+    else:
+        day_start = since
+    sod_row = _latest_event_payload(store, "account_positions_updated", day_start)
+    unrealized_sod = 0.0
+    if sod_row:
+        unrealized_sod, _ = _sum_position_unrealized(
+            json.loads(sod_row[0] or "{}").get("positions") or [])
+    unrealized_day = unrealized - unrealized_sod   # this day's open-position move
 
     closed_count = wins + losses
     win_rate = round(wins / closed_count, 3) if closed_count else None
@@ -581,7 +605,7 @@ def query_session_pnl(store, session_id: str | None = None,
     # whenever position_closed events aren't emitted (they currently aren't), so
     # the strip read $0 on a real -$2,322 day — the operator flew blind. Prefer
     # the broker equity delta: day P&L = latest equity - prior-session close
-    # (last_equity); matched (realized) = day P&L - current unrealized.
+    # (last_equity); matched (realized) = day P&L - this day's unrealized move.
     broker_day = None
     _ar = _latest_event_payload(store, "account_summary_updated", _state_until(for_date))
     if _ar:
@@ -595,19 +619,24 @@ def query_session_pnl(store, session_id: str | None = None,
             pass
 
     if broker_day is not None:
-        realized_out = round(broker_day - unrealized, 2)   # broker-authoritative matched
+        # total = realized + unrealized holds by construction (broker day P&L
+        # split into booked vs the day's open-position move).
+        realized_out = round(broker_day - unrealized_day, 2)
+        unrealized_out = round(unrealized_day, 2)
         total_out = round(broker_day, 2)
         pnl_source = "broker"
     else:
         realized_out = round(realized, 2)
+        unrealized_out = round(unrealized, 2)
         total_out = round(realized + unrealized, 2)
         pnl_source = "closed_events"
 
     return {
         "realized_pnl": realized_out,
-        "unrealized_pnl": round(unrealized, 2),
+        "unrealized_pnl": unrealized_out,
         "total_pnl": total_out,
         "broker_day_pnl": round(broker_day, 2) if broker_day is not None else None,
+        "open_unrealized_pnl": round(unrealized, 2),  # full open mark (vs entry)
         "pnl_source": pnl_source,
         "wins": wins,
         "losses": losses,
