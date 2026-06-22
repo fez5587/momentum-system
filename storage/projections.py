@@ -526,12 +526,71 @@ def _sum_position_unrealized(positions) -> tuple[float, int]:
     return total, count
 
 
+def query_alltime_score(store) -> dict:
+    """Cumulative scorecard across EVERY closed round-trip (all market days).
+    Feeds the dashboard's all-time panel: total trades, win rate, total realized,
+    avg R / expectancy, the distinct trading days covered, and the best/worst
+    single day by realized P&L. Reads position_closed events (live reconcile +
+    backfill); {zeros} until any exist."""
+    closed = store.query_events(event_type="position_closed", since=None,
+                                until=None, limit=None)
+    wins = losses = 0
+    total_realized = 0.0
+    r_multiples: list[float] = []
+    by_day: dict[str, float] = {}
+    for event in closed:
+        payload = json.loads(event.get("payload_json", "{}"))
+        pnl = payload.get("realized_pnl")
+        if pnl is None:
+            continue
+        pnl = float(pnl)
+        total_realized += pnl
+        if pnl > 0:
+            wins += 1
+        elif pnl < 0:
+            losses += 1
+        r = _r_multiple(payload.get("entry_price"), payload.get("stop_loss_price"),
+                        payload.get("exit_price"), payload.get("side") or "buy")
+        if r is not None:
+            r_multiples.append(r)
+        day = str(event.get("timestamp") or "")[:10]
+        if day:
+            by_day[day] = by_day.get(day, 0.0) + pnl
+
+    trades = wins + losses
+    best_day = worst_day = None
+    if by_day:
+        bd = max(by_day.items(), key=lambda kv: kv[1])
+        wd = min(by_day.items(), key=lambda kv: kv[1])
+        best_day = {"date": bd[0], "pnl": round(bd[1], 2)}
+        worst_day = {"date": wd[0], "pnl": round(wd[1], 2)}
+    return {
+        "trades": trades,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round(wins / trades, 3) if trades else None,
+        "total_realized": round(total_realized, 2),
+        "avg_r_multiple": round(sum(r_multiples) / len(r_multiples), 2) if r_multiples else None,
+        "trading_days": len(by_day),
+        "best_day": best_day,
+        "worst_day": worst_day,
+    }
+
+
 def query_session_pnl(store, session_id: str | None = None,
                       for_date: str | None = None) -> dict:
     """Day P&L + trade stats. Realized comes from the broker equity delta (the
     closed-event reconstruction reads $0); unrealized from the latest positions
     snapshot. ``for_date`` scopes it to a past session for the date picker."""
     since, until = _hist_window(for_date)
+    if since is None and until is None:
+        # LIVE: scope the journal to TODAY's session. Before any closes existed
+        # this was unbounded (harmless); now that the journal is populated,
+        # unbounded would make "live" show the all-time trade list — which is the
+        # separate All-Time panel. Today only, so live = this market day.
+        from datetime import datetime
+        _now = datetime.now()
+        since = datetime(_now.year, _now.month, _now.day).isoformat()
     closed = store.query_events(event_type="position_closed",
                                 since=since, until=until, limit=None)
 

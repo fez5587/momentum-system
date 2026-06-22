@@ -34,6 +34,7 @@ from storage.projections import (
     query_account_orders_snapshot,
     query_account_positions_snapshot,
     query_account_summary_snapshot,
+    query_alltime_score,
     query_approval_queue,
     query_catalyst_advisory,
     query_catalyst_feed,
@@ -147,6 +148,8 @@ class DashboardState:
                     "view_date": None if is_live else for_date,
                     "available_dates": _available_dates(store),
                     "pnl": query_session_pnl(store, for_date=for_date),
+                    # all-time scorecard (every closed round-trip, not date-scoped)
+                    "alltime": query_alltime_score(store),
                     "risk": query_risk_state(store, for_date=for_date),
                     "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
                     "equity_curve": query_equity_curve(store, for_date=for_date),

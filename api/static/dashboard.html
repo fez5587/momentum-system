@@ -276,6 +276,15 @@
   .pl-pct { font-size: 10px; opacity: .8; }
   .pl-bar { margin-top: 3px; height: 4px; background: #0d1117; border-radius: 2px; overflow: hidden; }
   .pl-bar-fill { height: 100%; transition: width .35s ease; }
+  /* all-time scorecard + per-day trades */
+  .metric .value.pos { color: var(--green); } .metric .value.neg { color: var(--red); }
+  .metric .value .sub { font: 500 10px var(--mono); color: var(--muted); margin-left: 2px; }
+  .exit-tag { font: 600 9px var(--mono); text-transform: uppercase; letter-spacing: .4px;
+    padding: 2px 6px; border-radius: 3px; white-space: nowrap; }
+  .exit-tag.ex-stop { color: #ff8d8f; background: rgba(248,81,73,.12); }
+  .exit-tag.ex-tp { color: #5fd39a; background: rgba(52,209,126,.12); }
+  .exit-tag.ex-mkt { color: var(--muted); background: rgba(120,132,162,.12); }
+  #trades-net b.pos { color: var(--green); } #trades-net b.neg { color: var(--red); }
   .st-armed   .trig-state { color: #58a6ff; } .st-armed   .trig-fill { background: linear-gradient(90deg,#1f6feb,#58a6ff); }
   .st-fired   .trig-state { color: #2ecc71; } .st-fired   .trig-fill { background: #2ecc71; }
   .st-filled  .trig-state { color: #2ecc71; } .st-filled  .trig-fill { background: linear-gradient(90deg,#1f8f4e,#2ecc71); }
@@ -426,6 +435,16 @@
   <section class="panel full">
     <h2>Account <span id="acct-count" class="count">0</span></h2>
     <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
+  </section>
+
+  <section class="panel full">
+    <h2>All-Time Score <span class="hint">cumulative across every closed round-trip — bot's record to date</span></h2>
+    <div id="alltime" class="acct-row"><span class="empty">No closed trades recorded yet.</span></div>
+  </section>
+
+  <section class="panel">
+    <h2>Trades <span id="trades-count" class="count">0</span><span id="trades-net" class="hint"></span></h2>
+    <div id="trades"></div>
   </section>
 
   <section class="panel">
@@ -845,6 +864,52 @@ function rBar(entry, cur, stop) {
   return '<div class="rbar">' + inner + '</div><span class="rtxt ' + sgn + '">' + txt + '</span>';
 }
 
+function exitCls(reason) {
+  reason = String(reason || "");
+  if (reason.includes("stop")) return "ex-stop";
+  if (reason.includes("profit") || reason.includes("target")) return "ex-tp";
+  return "ex-mkt";
+}
+
+// All-Time scorecard — the bot's cumulative record across every closed round-trip
+function renderAllTime(a) {
+  const host = $("alltime"); if (!host) return;
+  if (!a || !a.trades) { host.innerHTML = '<span class="empty">No closed trades recorded yet.</span>'; return; }
+  const m = (label, val, cls) => '<div class="metric"><div class="label">' + label
+    + '</div><div class="value ' + (cls || "") + '">' + val + '</div></div>';
+  const wr = a.win_rate != null ? (a.win_rate * 100).toFixed(0) + '%' : '—';
+  const avgr = a.avg_r_multiple != null ? (a.avg_r_multiple >= 0 ? '+' : '') + a.avg_r_multiple + 'R' : '—';
+  const day = d => d ? d.date.slice(5) + ' ' + money(d.pnl) : '—';
+  host.innerHTML =
+    m('Total Realized', money(a.total_realized), a.total_realized >= 0 ? 'pos' : 'neg') +
+    m('Win Rate', wr + ' <span class="sub">' + a.wins + 'W / ' + a.losses + 'L</span>') +
+    m('Trades', a.trades) +
+    m('Avg R', avgr, a.avg_r_multiple == null ? '' : (a.avg_r_multiple >= 0 ? 'pos' : 'neg')) +
+    m('Trading Days', a.trading_days) +
+    m('Best Day', day(a.best_day), a.best_day && a.best_day.pnl >= 0 ? 'pos' : 'neg') +
+    m('Worst Day', day(a.worst_day), 'neg');
+}
+
+// Per-day Trades — the individual round-trips that closed on the viewed day
+function renderTrades(pnl) {
+  const trades = (pnl && pnl.trades) || [];
+  $("trades-count").textContent = trades.length;
+  const net = trades.reduce((s, t) => s + (+t.realized_pnl || 0), 0);
+  const wins = trades.filter(t => +t.realized_pnl > 0).length;
+  const netEl = $("trades-net");
+  if (netEl) netEl.innerHTML = trades.length
+    ? 'net <b class="' + (net >= 0 ? 'pos' : 'neg') + '">' + money(net) + '</b> · ' + wins + '/' + trades.length + ' win'
+    : '';
+  fill("trades", table(
+    ["Symbol", "Exit", "R", "P/L", "Time"],
+    trades.map(t => '<tr><td class="sym">' + esc(t.symbol) + '</td>' +
+      '<td><span class="exit-tag ' + exitCls(t.exit_reason) + '">' + esc(String(t.exit_reason || "").replace(/_/g, " ")) + '</span></td>' +
+      '<td class="num ' + (t.r_multiple == null ? '' : (t.r_multiple >= 0 ? 'pos' : 'neg')) + '">' + (t.r_multiple == null ? '—' : (t.r_multiple >= 0 ? '+' : '') + t.r_multiple + 'R') + '</td>' +
+      '<td class="num ' + (+t.realized_pnl >= 0 ? 'pos' : 'neg') + '">' + money(t.realized_pnl) + '</td>' +
+      '<td class="num">' + timeOf(t.timestamp) + '</td></tr>')
+  ), "No closed trades on this day.");
+}
+
 // unrealized P&L as $ + % with a colored magnitude bar (bar maxes out at ±10%)
 function unrealCell(upnl, pct) {
   const v = +upnl;
@@ -899,6 +964,8 @@ function render(d) {
   renderTriggers(d.triggers, d.catalyst);
   renderCatalystEngine(d.catalyst_engine);
   renderCatalystFeed(d.catalyst_feed);
+  renderAllTime(d.alltime);
+  renderTrades(d.pnl);
   renderEquity(d.equity_curve);
 
   const accts = d.accounts || [];

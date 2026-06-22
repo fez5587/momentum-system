@@ -116,7 +116,7 @@ def test_session_pnl_realized_and_unrealized(store):
             positions=[{"symbol": "CCC", "quantity": 10, "unrealized_pnl": 40.0}],
         )
     )
-    pnl = query_session_pnl(store)
+    pnl = query_session_pnl(store, for_date="2026-06-11")   # the day these events fall on
     assert pnl["realized_pnl"] == 90.0
     assert pnl["unrealized_pnl"] == 40.0
     assert pnl["total_pnl"] == 130.0
@@ -218,3 +218,29 @@ def test_session_pnl_empty(store):
     assert pnl["total_pnl"] == 0.0
     assert pnl["win_rate"] is None
     assert pnl["trades"] == []
+
+
+def test_alltime_score_aggregates_all_days(store):
+    from storage.projections import query_alltime_score
+    assert query_alltime_score(store)["trades"] == 0      # empty -> zeros
+    # day 1: one win
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 17, 10, 0), mode=EventMode.PAPER, message="w",
+        position_id="a", symbol="AAA", exit_price=11.0, exit_reason="take_profit",
+        realized_pnl=100.0, entry_price=10.0, stop_loss_price=9.5, side="buy"))
+    # day 2: one win + one loss
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 18, 10, 0), mode=EventMode.PAPER, message="w",
+        position_id="b", symbol="BBB", exit_price=6.0, exit_reason="market_exit",
+        realized_pnl=50.0, entry_price=5.0, side="buy"))
+    store.emit(PositionClosedEvent(
+        timestamp=datetime(2026, 6, 18, 11, 0), mode=EventMode.PAPER, message="l",
+        position_id="c", symbol="CCC", exit_price=9.0, exit_reason="stop_loss",
+        realized_pnl=-200.0, entry_price=10.0, stop_loss_price=9.0, side="buy"))
+    a = query_alltime_score(store)
+    assert a["trades"] == 3 and a["wins"] == 2 and a["losses"] == 1
+    assert a["win_rate"] == 0.667
+    assert a["total_realized"] == -50.0
+    assert a["trading_days"] == 2
+    assert a["best_day"] == {"date": "2026-06-17", "pnl": 100.0}
+    assert a["worst_day"] == {"date": "2026-06-18", "pnl": -150.0}
