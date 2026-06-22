@@ -33,3 +33,25 @@ def test_default_equity_when_unset():
     # no equity passed -> falls back to config default (not zero)
     r = calculate_position_size(4.0, 3.80, config=PositionSizingConfig(default_equity=100000))
     assert r.position_size > 0
+
+
+def test_max_risk_dollars_caps_wide_stop():
+    # $90k, 1% = $900 budget; entry 2.00 stop 1.69 (0.31/sh wide stop)
+    uncapped = calculate_position_size(2.00, 1.69, equity=90000, config=CFG)
+    assert abs(uncapped.risk_amount - 900) < 2            # risks the full % budget
+    capped = calculate_position_size(2.00, 1.69, equity=90000, config=CFG, max_risk_dollars=500)
+    assert capped.position_size < uncapped.position_size  # sized down
+    assert 490 < capped.risk_amount <= 500.5              # hard $ cap honored (~$500)
+
+
+def test_max_risk_dollars_noop_when_budget_smaller():
+    # small account: 1% of $300 = $3 budget << the $500 cap -> cap doesn't bind
+    r = calculate_position_size(4.0, 3.80, equity=300, config=CFG, max_risk_dollars=500)
+    assert r.position_size == 14                          # unchanged from the % budget
+
+
+def test_risk_amount_reports_actual_not_budget():
+    # after a binding value cap, risk_amount = the SIZED position's risk, not the budget
+    r = calculate_position_size(4.0, 3.98, equity=300, config=CFG, max_position_value=120)
+    assert r.position_size == 30
+    assert abs(r.risk_amount - 30 * 0.02) < 1e-6          # ~$0.60 actual, not the $3 budget

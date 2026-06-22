@@ -108,6 +108,11 @@ class ExecutionSettings:
     # liquidity cap: shares <= this fraction of the symbol's day volume so at
     # SIZE you don't move the market. 0 = off (irrelevant at small size).
     liquidity_max_volume_pct: float = 0.0
+    # HARD dollar-risk ceiling per trade (fixed-fractional with a cap): dollar
+    # risk = min(equity*risk_per_trade_pct, max_risk_dollars). Without it the %
+    # budget alone let wide-stop names risk ~3x the median (the ~-$1k losers in
+    # the loss diagnosis). 0 = off (the % budget governs, e.g. a small account).
+    max_risk_dollars: float = 0.0
     # PORTFOLIO gross-notional cap: total $ across ALL open+pending positions must
     # stay under this fraction of equity. Without it, max_concurrent (6) x
     # max_position_pct (0.16) = ~96% gross in correlated small-cap gappers — one
@@ -203,6 +208,7 @@ class ExecutionSettings:
             ),
             entry_grace_seconds=float(values.get("TRADING_ENTRY_GRACE_SECONDS", "5")),
             max_position_pct=float(values.get("TRADING_MAX_POSITION_PCT", "0.33")),
+            max_risk_dollars=float(values.get("TRADING_MAX_RISK_DOLLARS", "0.0")),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
@@ -642,6 +648,7 @@ class TradingExecutionService:
                     default_equity=self.settings.default_equity,
                 ),
                 max_position_value=pos_cap,
+                max_risk_dollars=self.settings.max_risk_dollars,
             )
             if sizing.position_size <= 0:
                 continue
@@ -827,6 +834,7 @@ class TradingExecutionService:
             ),
             max_position_value=pos_cap,
             max_shares=max_shares,
+            max_risk_dollars=self.settings.max_risk_dollars,
         )
         if sizing.position_size <= 0:
             return {"ok": False, "skipped": "zero_size"}

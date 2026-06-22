@@ -29,11 +29,17 @@ def calculate_position_size(
     config: PositionSizingConfig = PositionSizingConfig(),
     max_position_value: float | None = None,
     max_shares: int | None = None,
+    max_risk_dollars: float | None = None,
 ) -> PositionSizeResult:
     """Shares to risk ``risk_per_trade_pct`` of equity, capped by buying power
     and liquidity.
 
     - risk-based: shares = (equity * risk%) / (entry - stop)
+    - ``max_risk_dollars``: HARD cap on the trade's dollar risk regardless of
+      equity/stop width — fixed-fractional with a ceiling. Without it the
+      percentage budget alone let wide-stop names risk ~3x the median (the
+      BTBT/WKSP/LNKS ~-$1k losers); this makes every trade risk
+      min(equity*risk%, max_risk_dollars).
     - ``max_position_value``: cap the position's DOLLAR value (buying-power aware
       — essential for a small account so one trade can't exceed available cash)
     - ``max_shares``: cap shares for LIQUIDITY (e.g. a % of the symbol's recent
@@ -41,10 +47,14 @@ def calculate_position_size(
     """
     account_equity = equity or config.default_equity
     risk_amount = account_equity * config.risk_per_trade_pct
+    # fixed-fractional with a hard ceiling: the dollar risk used to SIZE is the
+    # smaller of the % budget and the absolute cap.
+    if max_risk_dollars is not None and max_risk_dollars > 0:
+        risk_amount = min(risk_amount, max_risk_dollars)
     risk_per_share = abs(entry_price - stop_loss_price)
 
     if risk_per_share <= 0 or entry_price <= 0:
-        return PositionSizeResult(position_size=0, dollar_amount=0.0, risk_amount=risk_amount)
+        return PositionSizeResult(position_size=0, dollar_amount=0.0, risk_amount=0.0)
 
     position_size = int(risk_amount / risk_per_share)
     if max_position_value is not None and max_position_value > 0:
@@ -56,5 +66,7 @@ def calculate_position_size(
     return PositionSizeResult(
         position_size=position_size,
         dollar_amount=position_size * entry_price,
-        risk_amount=risk_amount,
+        # the ACTUAL dollar risk of the sized position (after every cap), so the
+        # caller/audit sees what's truly at stake, not just the budget.
+        risk_amount=round(position_size * risk_per_share, 2),
     )
