@@ -14,7 +14,7 @@ rules and should be re-confirmed when the year is current. Update annually.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 _ET = ZoneInfo("America/New_York")
@@ -69,3 +69,43 @@ def is_regular_hours(now_et: datetime | None = None) -> bool:
     if close is None:
         return False
     return (9, 30) <= (n.hour, n.minute) < close
+
+
+def next_trading_day(d: date) -> date:
+    """The first trading day strictly after ``d`` (skips weekends + holidays)."""
+    nd = d + timedelta(days=1)
+    while not is_trading_day(nd):
+        nd += timedelta(days=1)
+    return nd
+
+
+def days_to_next_session(d: date) -> int:
+    """Calendar days from ``d`` to the next session. 1 on a normal weeknight; 3
+    over a weekend; 4+ before a holiday-extended weekend. >1 == a MULTI-DAY
+    closure follows, i.e. carrying overnight means carrying across a gap."""
+    return (next_trading_day(d) - d).days
+
+
+def eod_flatten_status(
+    now_et: datetime,
+    normal_lead_min: int = 5,
+    pre_closure_lead_min: int = 20,
+) -> tuple[bool, bool]:
+    """(should_fire, is_pre_closure) for the end-of-day flatten.
+
+    The window is ``[close - lead, close)`` and is computed RELATIVE TO THE
+    ACTUAL CLOSE — so it fires on early-close (1pm) half-days too, which a fixed
+    "15:55" never did (15:55 > 13:00 left half-day positions naked into the
+    holiday they precede). Before a MULTI-DAY closure (weekend/holiday) the lead
+    widens to ``pre_closure_lead_min`` so the book is flat with margin to spare
+    and a transient hiccup still has a wide retry window — never carry 3-4 days
+    naked. Returns (False, _) outside the window or on a non-trading day."""
+    close = session_close_hm(now_et.date())
+    if close is None:
+        return (False, False)
+    close_min = close[0] * 60 + close[1]
+    pre_closure = days_to_next_session(now_et.date()) > 1
+    lead = max(normal_lead_min, pre_closure_lead_min) if pre_closure else normal_lead_min
+    start_min = close_min - lead
+    cur_min = now_et.hour * 60 + now_et.minute
+    return (start_min <= cur_min < close_min, pre_closure)

@@ -55,7 +55,12 @@ from config import OllamaConfig
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
 from runtime.halt_guard import is_halt_gap
-from runtime.market_calendar import is_regular_hours, session_close_hm
+from runtime.market_calendar import (
+    days_to_next_session,
+    eod_flatten_status,
+    is_regular_hours,
+    session_close_hm,
+)
 from runtime.triggers import ArmedTriggerBook
 from runtime.watcher import Watcher, WatcherConfig
 from strategy.exits import ExitConfig
@@ -807,11 +812,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # --- end-of-day auto-flatten (a day-trading book shouldn't gap overnight) --
     eod_enabled = _flag("TRADING_EOD_FLATTEN_ENABLED", "1")
+    # Legacy absolute time (15:55) is kept ONLY to derive the normal lead minutes
+    # (16:00 - 15:55 = 5) — the window itself is now relative to the ACTUAL close
+    # so it fires on early-close half-days too. Before a multi-day closure the
+    # lead widens so the book is flat with margin (the ATPC naked-holiday case).
     try:
         eod_h, eod_m = (int(x) for x in
                         os.environ.get("TRADING_EOD_FLATTEN_TIME", "15:55").split(":"))
     except Exception:  # noqa: BLE001
         eod_h, eod_m = 15, 55
+    _normal_lead = max(1, 16 * 60 - (eod_h * 60 + eod_m))            # 15:55 -> 5
+    _pre_lead = int(os.environ.get("TRADING_PRE_CLOSURE_FLATTEN_LEAD_MIN", "20"))
     _eod_done = {"v": False}
 
     def step_eod_flatten():
@@ -822,23 +833,31 @@ def main(argv: list[str] | None = None) -> int:
             now_et = datetime.now(ZoneInfo("America/New_York"))
         except Exception:  # noqa: BLE001
             return None
-        cur = (now_et.hour, now_et.minute)
-        # only inside [flatten_time, close): after the close a market order just
-        # queues uselessly, so don't fire then (e.g. on a post-close restart).
-        # Skip entirely on weekends/holidays — flattening into a closed market
-        # cancels the protective bracket legs but can't fill the sell, which is
-        # how positions went naked over the Juneteenth-style holiday weekend.
-        close_hm = session_close_hm(now_et.date())
-        if close_hm is None or not ((eod_h, eod_m) <= cur < close_hm):
+        # Fire inside [close - lead, close): after the close a market order just
+        # queues uselessly. The lead WIDENS before a multi-day closure so a thin
+        # name has time to fill and a transient failure still has a wide retry
+        # window. Skips weekends/holidays (session_close_hm -> None) — flattening
+        # into a closed market can't fill the sell.
+        due, pre_closure = eod_flatten_status(now_et, _normal_lead, _pre_lead)
+        if not due:
             return None
-        res = rt["execution"].close_session("eod_flatten")
+        reason = "eod_flatten_preclose" if pre_closure else "eod_flatten"
+        res = rt["execution"].close_session(reason)
         # only mark done if it actually succeeded — otherwise RETRY on the next
         # pass within the window (a flatten that errored once left positions naked
         # overnight). close_session re-blocks entries each call, so retrying is safe.
-        _eod_done["v"] = not res["errors"]
+        ok = not res["errors"]
+        _eod_done["v"] = ok
         closed = ", ".join(res["closed_positions"]) or "none"
-        return (f"EOD FLATTEN closed [{closed}]"
-                + (f" errors={res['errors']} (will retry)" if res["errors"] else ""))
+        tag = "PRE-HOLIDAY EOD FLATTEN" if pre_closure else "EOD FLATTEN"
+        if res["errors"]:
+            # A failed flatten before a MULTI-DAY gap = naked carry across the
+            # closure (the silent 6/18 Juneteenth failure). Scream about it.
+            gap = days_to_next_session(now_et.date())
+            sev = f"‼ NAKED-CARRY RISK ({gap}-day gap ahead): " if pre_closure else ""
+            print(f"[{datetime.now():%H:%M:%S}] {sev}{tag} could not flatten: {res['errors']}", flush=True)
+            return f"{sev}{tag} closed [{closed}] errors={res['errors']} (will retry)"
+        return f"{tag} closed [{closed}]"
 
     def step_news():
         """Land latest Alpaca/Benzinga news for the tracked universe into
