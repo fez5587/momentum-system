@@ -227,6 +227,8 @@ def query_ready_signals_snapshot(store, session_id: str | None = None) -> list[d
             "entry_price": signal_data.get("entry_price"),
             "stop_loss_price": signal_data.get("stop_loss_price"),
             "quality_score": signal_data.get("quality_score"),
+            "vwap": signal_data.get("vwap"),
+            "above_vwap": signal_data.get("above_vwap"),
             "timestamp": event.get("timestamp"),
         }
     return sorted(

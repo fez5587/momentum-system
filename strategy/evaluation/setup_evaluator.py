@@ -157,6 +157,10 @@ def evaluate_setup(
                 "quality_score": quality.score,
                 "quality_grade": quality.grade,
                 "confidence": round(score_pct / 100.0, 4),
+                # surfaced for the live VWAP entry gate + observability
+                "vwap": (round(float(levels.vwap), 4)
+                         if levels.vwap is not None else None),
+                "above_vwap": bool(above_vwap),
             }
         )
 

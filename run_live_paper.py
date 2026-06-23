@@ -802,6 +802,17 @@ def main(argv: list[str] | None = None) -> int:
         if client else None
     )
     print(f"[boot] exit management: {exit_cfg.describe()}")
+    print(
+        f"[boot] entry gates: VWAP {'ENFORCED' if exec_settings.require_above_vwap else 'shadow-only'}"
+        f", daily-cap {exec_settings.max_fresh_entries_per_day or 'off'}"
+        f", risk-cap ${exec_settings.max_risk_dollars:.0f}"
+    )
+    if exec_settings.concentrate_top_n > 0:
+        print(
+            "[boot] WARNING: TRADING_CONCENTRATE_TOP_N>0, but rank-concentration is "
+            "enforced ONLY on the dead fast-trigger path, NOT the live auto-approval "
+            "path — it will not affect live entries (see entry-path-fast-vs-auto)."
+        )
 
     def step_manage_exits():
         if exit_mgr is None:

@@ -66,7 +66,17 @@ class Clock:
         self.t += timedelta(minutes=minutes)
 
 
-def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45):
+def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
+                above_vwap=None, vwap=None):
+    signal_data = {
+        "entry_price": entry,
+        "stop_loss_price": stop,
+        "quality_score": 0.7,
+    }
+    if above_vwap is not None:
+        signal_data["above_vwap"] = above_vwap
+        signal_data["vwap"] = vwap if vwap is not None else (
+            round(entry - 1.0, 2) if above_vwap else round(entry + 1.0, 2))
     store.emit(
         SignalReadyEvent(
             timestamp=T0,
@@ -76,11 +86,7 @@ def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45):
             symbol=symbol,
             signal_type="bull_flag",
             confidence=0.9,
-            signal_data={
-                "entry_price": entry,
-                "stop_loss_price": stop,
-                "quality_score": 0.7,
-            },
+            signal_data=signal_data,
         )
     )
 
@@ -207,6 +213,43 @@ def test_daily_cap_never_blocks_manual_approval(store):
     for oid in ids:
         assert service.approve_order(oid, approved_by="dashboard")["ok"]
     assert len(executor.executed) == 2                   # cap ignored for manual override
+
+
+def test_vwap_gate_skips_below_vwap_when_enforced(store):
+    emit_signal(store, symbol="LOWV", entry=14.0, stop=13.45, above_vwap=False, vwap=15.0)
+    service = make_service(store, require_above_vwap=True)
+    created = service.request_approvals_for_ready_signals()
+    assert created == []                                  # entry skipped
+    assert query_approval_queue(store) == []
+    vb = [json.loads(e["payload_json"]) for e in store.query_events(event_type="risk_rule_triggered")
+          if json.loads(e["payload_json"])["rule_type"] == "vwap_below"]
+    assert len(vb) == 1 and vb[0]["action_taken"] == "skipped_entry"
+
+
+def test_vwap_gate_shadow_logs_but_allows_when_off(store):
+    emit_signal(store, symbol="LOWV", entry=14.0, stop=13.45, above_vwap=False, vwap=15.0)
+    service = make_service(store, require_above_vwap=False)
+    created = service.request_approvals_for_ready_signals()
+    assert len(created) == 1                              # still entered (shadow mode)
+    vb = [json.loads(e["payload_json"]) for e in store.query_events(event_type="risk_rule_triggered")
+          if json.loads(e["payload_json"])["rule_type"] == "vwap_below"]
+    assert len(vb) == 1 and vb[0]["action_taken"] == "shadow_logged"
+
+
+def test_vwap_gate_allows_above_vwap(store):
+    emit_signal(store, symbol="HIV", entry=14.0, stop=13.45, above_vwap=True, vwap=13.0)
+    service = make_service(store, require_above_vwap=True)
+    created = service.request_approvals_for_ready_signals()
+    assert len(created) == 1
+    assert not [e for e in store.query_events(event_type="risk_rule_triggered")
+                if json.loads(e["payload_json"])["rule_type"] == "vwap_below"]
+
+
+def test_vwap_gate_fail_open_on_missing_field(store):
+    # signals lacking the above_vwap field (old signals) must NEVER be blocked
+    emit_signal(store, symbol="OLDV", entry=14.0, stop=13.45)  # no above_vwap
+    service = make_service(store, require_above_vwap=True)
+    assert len(service.request_approvals_for_ready_signals()) == 1
 
 
 def test_no_duplicate_requests_for_same_symbol(store):

@@ -80,6 +80,12 @@ class ExecutionSettings:
     # armed name sizes equally as before). Plus a hard per-DAY fresh-entry cap.
     concentrate_top_n: int = 0
     max_fresh_entries_per_day: int = 0   # 0 = no daily cap
+    # VWAP SELECTION GATE — the one validated entry-quality signal (above-VWAP
+    # breakouts reach +1R ~1.5x as often, n=3,110 from the labeler lift report).
+    # Every below-VWAP ready signal is shadow-logged (rule_type=vwap_below) for
+    # measurement; entries are only SKIPPED when this is True. Fail-open: a signal
+    # with above_vwap=None (missing the field) is never blocked.
+    require_above_vwap: bool = False
     max_daily_loss_pct: float = 0.03
     # on a daily-loss breach, also flatten open positions + cancel unfilled entries
     flatten_on_breach: bool = True
@@ -218,6 +224,7 @@ class ExecutionSettings:
             max_risk_dollars=float(values.get("TRADING_MAX_RISK_DOLLARS", "0.0")),
             concentrate_top_n=int(values.get("TRADING_CONCENTRATE_TOP_N", "0")),
             max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
+            require_above_vwap=flag("TRADING_REQUIRE_ABOVE_VWAP", "1"),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
@@ -643,6 +650,34 @@ class TradingExecutionService:
             stop = signal.get("stop_loss_price")
             if not entry or not stop or stop >= entry:
                 continue
+
+            # VWAP selection gate — the one validated entry-quality signal (above-
+            # VWAP breakouts reach +1R ~1.5x as often, n=3,110). Every below-VWAP
+            # ready signal is shadow-logged for measurement; the entry is only
+            # SKIPPED when require_above_vwap is on. above_vwap is None on signals
+            # lacking the field -> fail-open, never block on missing data.
+            if signal.get("above_vwap") is False:
+                enforced = self.settings.require_above_vwap
+                self.store.emit(
+                    RiskRuleTriggeredEvent(
+                        timestamp=datetime.now(),
+                        mode=self.mode,
+                        correlation_id=self.session_id,
+                        message=(
+                            f"{symbol} ready BELOW session VWAP "
+                            f"(vwap={signal.get('vwap')}, entry={entry}) — "
+                            f"{'skipped' if enforced else 'shadow-logged'}"
+                        ),
+                        rule_type="vwap_below",
+                        rule_value=float(signal.get("vwap") or 0.0),
+                        current_state={"symbol": symbol, "entry": float(entry),
+                                       "enforced": enforced},
+                        action_taken="skipped_entry" if enforced else "shadow_logged",
+                    )
+                )
+                if enforced:
+                    self._requested_symbols.add(symbol)  # don't re-evaluate every tick
+                    continue
 
             eq = self._current_equity()
             # cap this entry to BOTH the per-position limit AND the portfolio's
