@@ -802,17 +802,19 @@ def main(argv: list[str] | None = None) -> int:
         if client else None
     )
     print(f"[boot] exit management: {exit_cfg.describe()}")
-    print(
-        f"[boot] entry gates: VWAP {'ENFORCED' if exec_settings.require_above_vwap else 'shadow-only'}"
-        f", daily-cap {exec_settings.max_fresh_entries_per_day or 'off'}"
-        f", risk-cap ${exec_settings.max_risk_dollars:.0f}"
-    )
-    if exec_settings.concentrate_top_n > 0:
+    _es = rt["execution"].settings if rt["execution"] is not None else None
+    if _es is not None:
         print(
-            "[boot] WARNING: TRADING_CONCENTRATE_TOP_N>0, but rank-concentration is "
-            "enforced ONLY on the dead fast-trigger path, NOT the live auto-approval "
-            "path — it will not affect live entries (see entry-path-fast-vs-auto)."
+            f"[boot] entry gates: VWAP {'ENFORCED' if _es.require_above_vwap else 'shadow-only'}"
+            f", daily-cap {_es.max_fresh_entries_per_day or 'off'}"
+            f", risk-cap ${_es.max_risk_dollars:.0f}"
         )
+        if _es.concentrate_top_n > 0:
+            print(
+                "[boot] WARNING: TRADING_CONCENTRATE_TOP_N>0, but rank-concentration is "
+                "enforced ONLY on the dead fast-trigger path, NOT the live auto-approval "
+                "path — it will not affect live entries (see entry-path-fast-vs-auto)."
+            )
 
     # Telegram push alerts — gated, decoupled (polls the event store), and
     # fire-and-forget so it can never impede trading.
