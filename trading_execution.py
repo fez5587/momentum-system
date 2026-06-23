@@ -710,6 +710,20 @@ class TradingExecutionService:
         if entry is None:
             return {"ok": False, "error": f"order {order_id} not pending"}
         request = ExecutionRequest.from_payload(entry["execution_request"])
+        # Per-day fresh-entry cap. Live entries flow through THIS auto-approval
+        # path, so the cap must be enforced here (the fast submit_breakout_now
+        # path shares the same self._fresh_entries counter). Manual dashboard
+        # approvals are a human override and are never capped. Reject (not skip)
+        # so a capped order leaves the pending queue instead of re-skipping every
+        # tick.
+        if approved_by == "auto" and self.settings.max_fresh_entries_per_day > 0:
+            today = self._now().date().isoformat()
+            if self._fresh_entries.get("date") != today:
+                self._fresh_entries = {"date": today, "n": 0}
+            if self._fresh_entries["n"] >= self.settings.max_fresh_entries_per_day:
+                return self.reject_order(
+                    order_id, rejected_by="auto", reason="daily_entry_cap"
+                )
         self.store.emit(
             OrderApprovedEvent(
                 timestamp=datetime.now(),
@@ -741,6 +755,13 @@ class TradingExecutionService:
                 "armed_at": self._now(),
                 "checks": 0,
             }
+        if (
+            approved_by == "auto"
+            and result.ok
+            and self.settings.max_fresh_entries_per_day > 0
+            and isinstance(self._fresh_entries.get("n"), int)
+        ):
+            self._fresh_entries["n"] += 1   # count toward the per-day cap
         return {
             "ok": result.ok,
             "order_id": order_id,

@@ -1,5 +1,6 @@
 """Trading execution service tests: signal -> approval -> order -> exit."""
 
+import json
 from datetime import datetime, timedelta
 
 import pytest
@@ -172,6 +173,40 @@ def test_auto_approve_tick_executes(store):
     assert len(out["approvals_requested"]) == 1
     assert len(out["auto_executed"]) == 1
     assert executor.executed[0].symbol == "GOOD"
+
+
+def test_daily_entry_cap_enforced_on_auto_path(store):
+    # Regression: live entries flow through the AUTO approval path, not the fast
+    # submit_breakout_now path, so the per-day cap must bind HERE. cap=2 over 3
+    # distinct signals => exactly 2 execute; the 3rd is rejected (not left pending).
+    for sym, e, s in [("AAA", 14.0, 13.45), ("BBB", 8.0, 7.60), ("CCC", 5.0, 4.70)]:
+        emit_signal(store, symbol=sym, entry=e, stop=s)
+    executor = FakeExecutor()
+    service = make_service(store, executor, auto_approve=True,
+                           max_fresh_entries_per_day=2,
+                           max_concurrent_positions=10, max_orders_per_tick=10)
+    service.request_approvals_for_ready_signals()
+    ids = [q["order_id"] for q in query_approval_queue(store)]
+    [service.approve_order(oid, approved_by="auto") for oid in ids]
+    assert len(executor.executed) == 2                   # cap binds at 2
+    assert query_approval_queue(store) == []             # capped order rejected, not left pending
+    rejects = store.query_events(event_type="order_rejected")
+    assert len(rejects) == 1                              # exactly the 3rd
+    assert json.loads(rejects[0]["payload_json"])["rejection_reason"] == "daily_entry_cap"
+
+
+def test_daily_cap_never_blocks_manual_approval(store):
+    # A human override (approved_by="dashboard") is never capped.
+    for sym, e, s in [("AAA", 14.0, 13.45), ("BBB", 8.0, 7.60)]:
+        emit_signal(store, symbol=sym, entry=e, stop=s)
+    executor = FakeExecutor()
+    service = make_service(store, executor, max_fresh_entries_per_day=1,
+                           max_concurrent_positions=10, max_orders_per_tick=10)
+    service.request_approvals_for_ready_signals()
+    ids = [q["order_id"] for q in query_approval_queue(store)]
+    for oid in ids:
+        assert service.approve_order(oid, approved_by="dashboard")["ok"]
+    assert len(executor.executed) == 2                   # cap ignored for manual override
 
 
 def test_no_duplicate_requests_for_same_symbol(store):
