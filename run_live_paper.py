@@ -806,6 +806,7 @@ def main(argv: list[str] | None = None) -> int:
     if _es is not None:
         print(
             f"[boot] entry gates: VWAP {'ENFORCED' if _es.require_above_vwap else 'shadow-only'}"
+            f", anti-chase {'ON (auto path)' if _es.unified_entry else 'fast-path only'}"
             f", daily-cap {_es.max_fresh_entries_per_day or 'off'}"
             f", risk-cap ${_es.max_risk_dollars:.0f}"
         )

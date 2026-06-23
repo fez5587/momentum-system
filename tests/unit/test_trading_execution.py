@@ -67,7 +67,7 @@ class Clock:
 
 
 def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
-                above_vwap=None, vwap=None):
+                above_vwap=None, vwap=None, day_open=None):
     signal_data = {
         "entry_price": entry,
         "stop_loss_price": stop,
@@ -77,6 +77,8 @@ def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
         signal_data["above_vwap"] = above_vwap
         signal_data["vwap"] = vwap if vwap is not None else (
             round(entry - 1.0, 2) if above_vwap else round(entry + 1.0, 2))
+    if day_open is not None:
+        signal_data["day_open"] = day_open
     store.emit(
         SignalReadyEvent(
             timestamp=T0,
@@ -250,6 +252,41 @@ def test_vwap_gate_fail_open_on_missing_field(store):
     emit_signal(store, symbol="OLDV", entry=14.0, stop=13.45)  # no above_vwap
     service = make_service(store, require_above_vwap=True)
     assert len(service.request_approvals_for_ready_signals()) == 1
+
+
+def test_anti_chase_skip_logic(store):
+    svc = make_service(store)   # defaults: ext 0.15, day-ext 0.30, halt-guard on
+    assert svc._anti_chase_skip(12.0, 10.0, None, False) == "over_extended"        # +20% > 15%
+    assert svc._anti_chase_skip(14.0, 14.0, 10.0, False) == "over_extended_day"    # +40% > 30%
+    assert svc._anti_chase_skip(10.0, 10.0, 10.0, True) == "halted_symbol"
+    assert svc._anti_chase_skip(10.0, 10.0, 9.0, False) is None                    # clean
+    assert svc._anti_chase_skip(14.0, 14.0, None, False) is None                   # fail-open day_open
+
+
+def test_unified_entry_blocks_parabolic_day_on_auto_path(store):
+    # entry 14 is +40% above the day open 10 -> day-extension gate blocks it
+    emit_signal(store, symbol="PARA", entry=14.0, stop=13.45, above_vwap=True, day_open=10.0)
+    created = make_service(store, unified_entry=True).request_approvals_for_ready_signals()
+    assert created == []
+    rr = [json.loads(e["payload_json"]) for e in store.query_events(event_type="risk_rule_triggered")
+          if json.loads(e["payload_json"])["rule_type"] == "over_extended_day"]
+    assert len(rr) == 1 and rr[0]["action_taken"] == "skipped_entry"
+
+
+def test_unified_entry_off_allows_parabolic_day(store):
+    emit_signal(store, symbol="PARA", entry=14.0, stop=13.45, above_vwap=True, day_open=10.0)
+    assert len(make_service(store, unified_entry=False).request_approvals_for_ready_signals()) == 1
+
+
+def test_unified_entry_fail_open_missing_day_open(store):
+    emit_signal(store, symbol="NODO", entry=14.0, stop=13.45, above_vwap=True)  # no day_open
+    assert len(make_service(store, unified_entry=True).request_approvals_for_ready_signals()) == 1
+
+
+def test_unified_entry_allows_normal_day(store):
+    # entry 14 is +7.7% above day open 13 -> under the 30% ceiling -> allowed
+    emit_signal(store, symbol="OKDAY", entry=14.0, stop=13.45, above_vwap=True, day_open=13.0)
+    assert len(make_service(store, unified_entry=True).request_approvals_for_ready_signals()) == 1
 
 
 def test_no_duplicate_requests_for_same_symbol(store):

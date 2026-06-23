@@ -157,10 +157,11 @@ def evaluate_setup(
                 "quality_score": quality.score,
                 "quality_grade": quality.grade,
                 "confidence": round(score_pct / 100.0, 4),
-                # surfaced for the live VWAP entry gate + observability
+                # surfaced for the live VWAP + anti-chase entry gates + observability
                 "vwap": (round(float(levels.vwap), 4)
                          if levels.vwap is not None else None),
                 "above_vwap": bool(above_vwap),
+                "day_open": round(float(open_price), 4) if open_price > 0 else None,
             }
         )
 

@@ -86,6 +86,11 @@ class ExecutionSettings:
     # measurement; entries are only SKIPPED when this is True. Fail-open: a signal
     # with above_vwap=None (missing the field) is never blocked.
     require_above_vwap: bool = False
+    # UNIFIED ENTRY: run the fast path's shared anti-chase gates (over_extended,
+    # day-extension, halt) on the LIVE auto path too. These previously ran ONLY on
+    # the fast trigger path, leaving live auto entries unprotected (see the
+    # consolidation plan). Fail-open on missing data. False = pre-unification.
+    unified_entry: bool = False
     max_daily_loss_pct: float = 0.03
     # on a daily-loss breach, also flatten open positions + cancel unfilled entries
     flatten_on_breach: bool = True
@@ -225,6 +230,7 @@ class ExecutionSettings:
             concentrate_top_n=int(values.get("TRADING_CONCENTRATE_TOP_N", "0")),
             max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
             require_above_vwap=flag("TRADING_REQUIRE_ABOVE_VWAP", "1"),
+            unified_entry=flag("TRADING_UNIFIED_ENTRY", "1"),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
@@ -679,6 +685,35 @@ class TradingExecutionService:
                     self._requested_symbols.add(symbol)  # don't re-evaluate every tick
                     continue
 
+            # Anti-chase / halt gates on the LIVE auto path (the entry-path
+            # unification — these ran ONLY on the fast trigger path before). The
+            # auto path rests a limit AT the trigger, so it can't chase above it
+            # (over_extended is a no-op here); the gate that bites is day-extension:
+            # don't enter a name whose breakout level is already parabolic vs the
+            # session open. halted=False (a resting limit won't fill mid-halt).
+            # Fail-open: a missing day_open skips only the day-extension check.
+            if self.settings.unified_entry:
+                entry_f0 = float(entry)
+                skip = self._anti_chase_skip(entry_f0, entry_f0,
+                                             signal.get("day_open"), False)
+                if skip is not None:
+                    self.store.emit(
+                        RiskRuleTriggeredEvent(
+                            timestamp=datetime.now(),
+                            mode=self.mode,
+                            correlation_id=self.session_id,
+                            message=(f"{symbol} entry blocked: {skip} "
+                                     f"(entry={entry}, day_open={signal.get('day_open')})"),
+                            rule_type=skip,
+                            rule_value=float(signal.get("day_open") or 0.0),
+                            current_state={"symbol": symbol, "entry": entry_f0,
+                                           "day_open": signal.get("day_open")},
+                            action_taken="skipped_entry",
+                        )
+                    )
+                    self._requested_symbols.add(symbol)  # don't re-evaluate every tick
+                    continue
+
             eq = self._current_equity()
             # cap this entry to BOTH the per-position limit AND the portfolio's
             # remaining gross-notional budget (so the book can't pile into ~100%).
@@ -805,6 +840,30 @@ class TradingExecutionService:
             "error": result.error,
         }
 
+    def _anti_chase_skip(self, entry_ref: float, trigger: float,
+                         day_open: float | None, halted: bool) -> str | None:
+        """Shared anti-chase / halt entry gates, used by BOTH the fast trigger path
+        and (behind TRADING_UNIFIED_ENTRY) the slow auto path. Returns a skip reason
+        or None. Fail-open: a missing/zero day_open skips only the day-extension
+        check. For a resting-limit fill (slow path) entry_ref==trigger so
+        over_extended is a no-op — day_extension + halt are the gates that bite."""
+        ext_max = self.settings.extension_max_pct
+        if (ext_max > 0 and trigger and float(trigger) > 0
+                and entry_ref > float(trigger) * (1.0 + ext_max)):
+            return "over_extended"
+        # Day-extension ceiling: the stock is already parabolic on the DAY (far
+        # above the session open) — chasing that is the "+100% then halts down"
+        # trap even when the trigger break itself looks clean.
+        day_max = self.settings.day_extension_max_pct
+        if (day_max > 0 and day_open is not None and float(day_open) > 0
+                and entry_ref > float(day_open) * (1.0 + day_max)):
+            return "over_extended_day"
+        # Halt guard: you can't exit during a trading halt and it gaps through the
+        # stop on resume — don't enter a name flagged as halted.
+        if halted and self.settings.halt_guard_enabled:
+            return "halted_symbol"
+        return None
+
     @_locked
     def submit_breakout_now(
         self,
@@ -884,20 +943,9 @@ class TradingExecutionService:
         # the top tick that reverses/halts down. (Overnight +100% gappers are
         # already excluded upstream by the trigger book's gap_max; this catches
         # the intraday chase / gap-through that gap_max can't see.)
-        ext_max = self.settings.extension_max_pct
-        if ext_max > 0 and entry_ref > trigger_f * (1.0 + ext_max):
-            return {"ok": False, "skipped": "over_extended"}
-        # Day-extension ceiling: the stock is already parabolic on the DAY (far
-        # above the session open) — chasing that is the "+100% then halts down"
-        # trap even when the trigger break itself looks clean.
-        day_max = self.settings.day_extension_max_pct
-        if (day_max > 0 and day_open is not None and float(day_open) > 0
-                and entry_ref > float(day_open) * (1.0 + day_max)):
-            return {"ok": False, "skipped": "over_extended_day"}
-        # Halt guard: you can't exit during a trading halt and it gaps through the
-        # stop on resume — don't enter a name the caller flagged as halted.
-        if halted and self.settings.halt_guard_enabled:
-            return {"ok": False, "skipped": "halted_symbol"}
+        skip = self._anti_chase_skip(entry_ref, trigger_f, day_open, halted)
+        if skip is not None:
+            return {"ok": False, "skipped": skip}
 
         eq = self._current_equity()
         liq = self.settings.liquidity_max_volume_pct
