@@ -295,17 +295,86 @@ def report(con):
         print(f"  ran >=+100% : {r100}/{tot} = {r100/tot*100:.1f}%  (NXTS-class)")
 
 
+def lift(con):
+    """For each signal, does it SEPARATE runners/winners from the rest? Reports the
+    label rate in the most-favorable bucket vs the base rate (the LIFT). n shown so
+    you can tell signal from small-sample noise. NOT day-validated — the days are
+    autocorrelated (one regime), so treat lift as direction-of-edge, not a win-rate."""
+    rows = con.execute(
+        "SELECT f.gap_pct, f.premarket_gap_pct, f.relative_volume, "
+        "f.time_of_day_adjusted_relative_volume, f.distance_from_vwap, f.catalyst_type, "
+        "f.metadata_json, se.above_vwap_flag, se.entry_reference_price, "
+        "l.reached_1r_before_minus_1r, l.trend_day_flag "
+        "FROM engineered_features f "
+        "JOIN setup_events se ON se.setup_id = f.id AND se.setup_version=? "
+        "JOIN outcome_labels l ON l.setup_id = f.id AND l.label_version=? "
+        "WHERE f.feature_version=?", [SETUP_VERSION, LABEL_VERSION, FEATURE_VERSION]).fetchall()
+    if not rows:
+        print("No labeled rows — run `build` first."); return
+    cols = ["gap", "pm_gap", "rvol", "tod_rvol", "dist_vwap", "cat_type", "meta",
+            "above_vwap", "price", "won_1r", "runner"]
+    df = pd.DataFrame(rows, columns=cols)
+    df["dq"] = df["meta"].apply(lambda m: (json.loads(m).get("dq_score") if m else None))
+    df["has_catalyst"] = df["cat_type"].notna()
+    for c in ("won_1r", "runner", "above_vwap"):
+        df[c] = df[c].astype(bool)
+    n = len(df)
+    NUM = [("gap", "gap%"), ("pm_gap", "premkt-gap%"), ("rvol", "rvol"),
+           ("tod_rvol", "tod-rvol"), ("dist_vwap", "dist-vwap"), ("dq", "data-qual"),
+           ("price", "price-$")]
+    for label, lname in [("won_1r", "reached +1R"), ("runner", "+20% RUNNER")]:
+        base = df[label].mean()
+        pos = int(df[label].sum())
+        print(f"\n=== LIFT vs label '{lname}'  (base {base*100:.1f}%, {pos} positives / {n}) ===")
+        print(f"{'signal':14}{'favorable bucket':>22}{'rate':>7}{'n':>6}{'lift':>7}")
+        results = []
+        for feat, name in NUM:
+            s = df[[feat, label]].dropna()
+            if len(s) < 100:
+                continue
+            try:
+                s = s.assign(b=pd.qcut(s[feat].rank(method="first"), 3, labels=["lo", "mid", "hi"]))
+            except Exception:  # noqa: BLE001
+                continue
+            g = s.groupby("b", observed=True)[label].agg(["mean", "count"])
+            if "hi" not in g.index or "lo" not in g.index:
+                continue
+            # the favorable end = whichever tercile (hi/lo) has the higher rate
+            fav = "hi" if g.loc["hi", "mean"] >= g.loc["lo", "mean"] else "lo"
+            rate, cnt = g.loc[fav, "mean"], int(g.loc[fav, "count"])
+            results.append((f"{name} {fav}-tercile", rate, cnt, rate / base if base else 0))
+        for feat, name in [("above_vwap", "above-VWAP=T"), ("has_catalyst", "has-catalyst=T")]:
+            g = df.groupby(feat, observed=True)[label].agg(["mean", "count"])
+            if True in g.index:
+                results.append((name, g.loc[True, "mean"], int(g.loc[True, "count"]),
+                                g.loc[True, "mean"] / base if base else 0))
+        for nm, rate, cnt, lf in sorted(results, key=lambda x: -x[3]):
+            flag = "  <- thin n" if cnt < 30 or (rate * cnt) < 8 else ""
+            print(f"{'':14}{nm:>22}{rate*100:6.1f}%{cnt:>6}{lf:>6.2f}x{flag}")
+        # catalyst type breakdown
+        ct = df[df["cat_type"].notna()].groupby("cat_type", observed=True)[label].agg(["mean", "count"])
+        ct = ct[ct["count"] >= 15].sort_values("mean", ascending=False)
+        if len(ct):
+            print(f"  catalyst_type (n>=15): " + " | ".join(
+                f"{t}:{r['mean']*100:.0f}%/{int(r['count'])}({r['mean']/base:.1f}x)" for t, r in ct.iterrows()))
+    print("\nCAVEAT: ~17-19 autocorrelated days, +20% runners are sparse — a lift is a HYPOTHESIS to")
+    print("shadow-confirm forward, not a validated win-rate. Anything 'thin n' is noise until more data.")
+
+
 def main():
     ap = argparse.ArgumentParser(description="offline labeler / feature store")
     sub = ap.add_subparsers(dest="cmd", required=True)
     b = sub.add_parser("build"); b.add_argument("--limit", type=int); b.add_argument("--rebuild", action="store_true")
     sub.add_parser("report")
+    sub.add_parser("lift")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
         build(con, limit=args.limit, rebuild=args.rebuild)
     elif args.cmd == "report":
         report(con)
+    elif args.cmd == "lift":
+        lift(con)
 
 
 if __name__ == "__main__":
