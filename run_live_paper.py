@@ -814,6 +814,20 @@ def main(argv: list[str] | None = None) -> int:
             "path — it will not affect live entries (see entry-path-fast-vs-auto)."
         )
 
+    # Telegram push alerts — gated, decoupled (polls the event store), and
+    # fire-and-forget so it can never impede trading.
+    from runtime.notifier import TelegramNotifier, send_telegram
+    notifier = TelegramNotifier(rt["store"])
+    if notifier.enabled:
+        print("[boot] telegram alerts: ON")
+        send_telegram("\U0001F916 Momentum loop started — push alerts armed.")
+    else:
+        print("[boot] telegram alerts: off (TELEGRAM_BOT_TOKEN/CHAT_ID unset)")
+
+    def step_notify():
+        n = notifier.poll()
+        return f"telegram: {n} alert(s)" if n else None
+
     def step_manage_exits():
         if exit_mgr is None:
             return None
@@ -866,7 +880,15 @@ def main(argv: list[str] | None = None) -> int:
             gap = days_to_next_session(now_et.date())
             sev = f"‼ NAKED-CARRY RISK ({gap}-day gap ahead): " if pre_closure else ""
             print(f"[{datetime.now():%H:%M:%S}] {sev}{tag} could not flatten: {res['errors']}", flush=True)
+            send_telegram(f"⚠️ {tag} FAILED to flatten: {res['errors']} — {sev or 'will retry'}")
             return f"{sev}{tag} closed [{closed}] errors={res['errors']} (will retry)"
+        # success — push the once-per-day EOD P&L summary
+        try:
+            from storage.projections import query_session_pnl
+            notifier.send_eod_summary(now_et.date().isoformat(),
+                                      query_session_pnl(rt["store"]))
+        except Exception:  # noqa: BLE001
+            pass
         return f"{tag} closed [{closed}]"
 
     # --- open catch-up flatten: a day-trading book should be FLAT by the open;
@@ -955,6 +977,8 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
     scheduler.add("eod", step_eod_flatten, float(os.environ.get("TRADING_EOD_INTERVAL_SECONDS", "30")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
+    scheduler.add("notify", step_notify, float(os.environ.get("TELEGRAM_NOTIFY_INTERVAL_SECONDS", "45")),
+                  enabled=notifier.enabled)
     scheduler.add("catchup", step_open_catchup_flatten,
                   float(os.environ.get("TRADING_OPEN_CATCHUP_INTERVAL_SECONDS", "30")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
