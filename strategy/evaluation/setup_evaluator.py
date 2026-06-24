@@ -162,6 +162,7 @@ def evaluate_setup(
                          if levels.vwap is not None else None),
                 "above_vwap": bool(above_vwap),
                 "day_open": round(float(open_price), 4) if open_price > 0 else None,
+                "cum_volume": float(bars["volume"].sum()),
             }
         )
 

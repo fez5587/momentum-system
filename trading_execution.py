@@ -719,6 +719,15 @@ class TradingExecutionService:
             # remaining gross-notional budget (so the book can't pile into ~100%).
             pos_cap = min(eq * self.settings.max_position_pct,
                           self._remaining_gross_budget(eq))
+            # Liquidity cap (unification): on the auto path too, cap shares to a
+            # fraction of the name's cumulative volume so a thin cheap name can't be
+            # oversized into heavy slippage (the VTAK-style stop that filled far past
+            # its level). Fail-open: no cum_volume in the signal -> no cap.
+            liq = self.settings.liquidity_max_volume_pct
+            cum_vol = signal.get("cum_volume") or 0.0
+            max_shares = (int(liq * float(cum_vol))
+                          if (self.settings.unified_entry and liq > 0 and cum_vol > 0)
+                          else None)
             sizing = calculate_position_size(
                 float(entry),
                 float(stop),
@@ -728,6 +737,7 @@ class TradingExecutionService:
                     default_equity=self.settings.default_equity,
                 ),
                 max_position_value=pos_cap,
+                max_shares=max_shares,
                 max_risk_dollars=self.settings.max_risk_dollars,
             )
             if sizing.position_size <= 0:

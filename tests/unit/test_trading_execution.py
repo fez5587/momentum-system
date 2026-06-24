@@ -67,7 +67,7 @@ class Clock:
 
 
 def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
-                above_vwap=None, vwap=None, day_open=None):
+                above_vwap=None, vwap=None, day_open=None, cum_volume=None):
     signal_data = {
         "entry_price": entry,
         "stop_loss_price": stop,
@@ -79,6 +79,8 @@ def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
             round(entry - 1.0, 2) if above_vwap else round(entry + 1.0, 2))
     if day_open is not None:
         signal_data["day_open"] = day_open
+    if cum_volume is not None:
+        signal_data["cum_volume"] = cum_volume
     store.emit(
         SignalReadyEvent(
             timestamp=T0,
@@ -287,6 +289,27 @@ def test_unified_entry_allows_normal_day(store):
     # entry 14 is +7.7% above day open 13 -> under the 30% ceiling -> allowed
     emit_signal(store, symbol="OKDAY", entry=14.0, stop=13.45, above_vwap=True, day_open=13.0)
     assert len(make_service(store, unified_entry=True).request_approvals_for_ready_signals()) == 1
+
+
+def test_liquidity_cap_sizes_down_thin_name_on_auto_path(store):
+    # thin name (cum_volume 10k) -> shares capped to liq*cum_volume, not risk-sized
+    emit_signal(store, symbol="THIN", entry=2.0, stop=1.9, above_vwap=True,
+                day_open=1.95, cum_volume=10_000)
+    svc = make_service(store, unified_entry=True, liquidity_max_volume_pct=0.01,
+                       max_concurrent_positions=10)
+    svc.request_approvals_for_ready_signals()
+    q = query_approval_queue(store)[0]["execution_request"]["quantity"]
+    assert q <= int(0.01 * 10_000)            # liquidity-capped at 100 shares
+
+
+def test_liquidity_cap_off_when_unified_disabled(store):
+    emit_signal(store, symbol="THIN", entry=2.0, stop=1.9, above_vwap=True,
+                day_open=1.95, cum_volume=10_000)
+    svc = make_service(store, unified_entry=False, liquidity_max_volume_pct=0.01,
+                       max_concurrent_positions=10)
+    svc.request_approvals_for_ready_signals()
+    q = query_approval_queue(store)[0]["execution_request"]["quantity"]
+    assert q > int(0.01 * 10_000)             # not capped -> risk-based size is larger
 
 
 def test_no_duplicate_requests_for_same_symbol(store):
