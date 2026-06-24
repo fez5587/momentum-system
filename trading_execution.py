@@ -22,7 +22,8 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
-from runtime.flatten import cancel_protective_and_close, find_overnight_carries
+from runtime.flatten import (buy_fills_from_orders, cancel_protective_and_close,
+                             find_overnight_carries)
 from alpaca_paper.execution import (
     AlpacaPaperExecutor,
     ExecutionRequest,
@@ -1226,13 +1227,7 @@ class TradingExecutionService:
         except Exception as exc:  # noqa: BLE001
             result["errors"].append(f"orders: {exc}")
             return result
-        buy_fills = []
-        for o in orders or []:
-            for x in [o, *(o.get("legs") or [])]:
-                if (str(x.get("side")) == "buy" and x.get("status") == "filled"
-                        and x.get("filled_at")):
-                    buy_fills.append({"symbol": x.get("symbol") or o.get("symbol"),
-                                      "filled_at": x.get("filled_at")})
+        buy_fills = buy_fills_from_orders(orders)
         carries = find_overnight_carries(open_syms, buy_fills, today_et)
         result["carries"] = carries
         for symbol in carries:

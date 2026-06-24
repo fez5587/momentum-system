@@ -61,6 +61,29 @@ def find_overnight_carries(open_symbols, buy_fills, today_et: date) -> list[str]
                 bought_today.add(sym)
     return sorted(s for s in (open_symbols or ()) if s and s not in bought_today)
 
+
+def buy_fills_from_orders(orders) -> list[dict]:
+    """Extract {symbol, filled_at} for every BUY that actually FILLED shares —
+    keyed off ``filled_qty>0`` with a ``filled_at``, NOT ``status=='filled'``.
+
+    A marketable buy that PARTIALLY fills then cancels its unfilled remainder
+    reads ``status=='canceled'`` yet opened a real position; keying off status
+    would miss it, and the open catch-up flatten would then wrongly close that
+    fresh position as an overnight carry (the SSPC 84/88 case, 2026-06-24).
+    Scans bracket legs too.
+    """
+    fills: list[dict] = []
+    for o in orders or []:
+        for x in [o, *(o.get("legs") or [])]:
+            try:
+                filled_qty = float(x.get("filled_qty") or 0)
+            except (TypeError, ValueError):
+                filled_qty = 0.0
+            if str(x.get("side")) == "buy" and x.get("filled_at") and filled_qty > 0:
+                fills.append({"symbol": x.get("symbol") or o.get("symbol"),
+                              "filled_at": x.get("filled_at")})
+    return fills
+
 # Order states in which a sell order still RESERVES position quantity. While an
 # order is in one of these states, that many shares show as ``held_for_orders``
 # and are unavailable to a separate close. (A ``filled``/``canceled`` leg no
