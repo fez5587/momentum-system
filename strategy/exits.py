@@ -63,6 +63,12 @@ class ExitConfig:
     trail_mode: str = TRAIL_NONE   # none | prior_low | pct
     trail_pct: float = 0.0         # pct trail: stop = high_water * (1 - trail_pct)
     trail_after_r: float = 1.0     # only start trailing once +this R is reached
+    # STEP-TRAIL from the buy price: once the high-water reaches +N*step R, ratchet
+    # the stop up to +(N-1)*step R — at +0.25R the stop sits at entry (breakeven),
+    # at +0.5R at +0.25R, at +0.75R at +0.5R, ... Locks a small pop from
+    # round-tripping AND climbs under a runner. Starts from entry, independent of
+    # trail_after_r / trail_mode. 0 = off.
+    trail_r_step: float = 0.0
     scale_out_r: float = 0.0       # sell scale_out_pct at +this R (0 = off)
     scale_out_pct: float = 0.5     # fraction sold at scale_out_r
     first_red_exit: bool = False   # exit on first close below the prior bar's low
@@ -106,6 +112,7 @@ class ExitConfig:
             trail_mode=v.get("TRADING_EXIT_TRAIL_MODE", TRAIL_NONE).strip().lower(),
             trail_pct=f("TRADING_EXIT_TRAIL_PCT", "0.0"),
             trail_after_r=f("TRADING_EXIT_TRAIL_AFTER_R", "1.0"),
+            trail_r_step=f("TRADING_EXIT_TRAIL_R_STEP", "0.0"),
             scale_out_r=f("TRADING_EXIT_SCALE_OUT_R", "0.0"),
             scale_out_pct=f("TRADING_EXIT_SCALE_OUT_PCT", "0.5"),
             first_red_exit=b("TRADING_EXIT_FIRST_RED", "0"),
@@ -124,6 +131,8 @@ class ExitConfig:
         if self.trail_mode != TRAIL_NONE:
             how = f"{self.trail_pct:.1%}" if self.trail_mode == TRAIL_PCT else "prior-low"
             parts.append(f"trail {how} after {self.trail_after_r:g}R")
+        if self.trail_r_step:
+            parts.append(f"step-trail {self.trail_r_step:g}R")
         if self.scale_out_r:
             parts.append(f"scale {self.scale_out_pct:.0%}@{self.scale_out_r:g}R")
         if self.first_red_exit:
@@ -188,6 +197,14 @@ def _trail_stop(stop: float, entry: float, high_water: float,
             new = max(new, bar_low)
         elif cfg.trail_mode == TRAIL_PCT and cfg.trail_pct > 0:
             new = max(new, high_water * (1.0 - cfg.trail_pct))
+    # step-trail from the buy price: once the high-water clears +step R, lock the
+    # stop one step behind (at +0.25R -> breakeven, +0.5R -> +0.25R, ...). risk is
+    # recovered from reached_r so this needs no extra args. Only ratchets up (max).
+    if cfg.trail_r_step and cfg.trail_r_step > 0 and reached_r >= cfg.trail_r_step:
+        steps = int(reached_r / cfg.trail_r_step)        # floor; >= 1 inside this guard
+        locked_r = (steps - 1) * cfg.trail_r_step
+        risk = (high_water - entry) / reached_r if reached_r else 0.0
+        new = max(new, entry + locked_r * risk)
     # percentage profit-lock checkpoints: once the trade has been up gain%, pin
     # the stop to at least entry*(1+lock%) so a winner keeps a minimum gain.
     if cfg.profit_lock_tiers and entry > 0:

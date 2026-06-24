@@ -10,6 +10,7 @@ from strategy.exits import (
     ExitConfig,
     TRAIL_PCT,
     TRAIL_PRIOR_LOW,
+    _trail_stop,
     catastrophe_triggered,
     manage_live,
     parse_profit_tiers,
@@ -112,6 +113,30 @@ def test_trail_prior_low_captures_partial_gain():
                       ExitConfig(target_r=5.0, trail_mode=TRAIL_PRIOR_LOW, trail_after_r=1.0))
     assert r.reason == "trail_stop"
     assert r.r_multiple > 1.0   # locked in more than breakeven
+
+
+def test_step_trail_ratchet_levels():
+    # entry 10, risk 1 -> reached_r in R == price - 10. Verify the ladder.
+    cfg = ExitConfig(target_r=5.0, trail_r_step=0.25, breakeven_at_r=0.0,
+                     breakeven_at_pct=0.0)
+    f = lambda hw, rr, stop=9.0: _trail_stop(stop, 10.0, hw, 9.5, rr, cfg)
+    assert f(10.20, 0.20) == 9.0      # below the first +0.25R step -> no ratchet
+    assert f(10.25, 0.25) == 10.00    # +0.25R -> breakeven
+    assert f(10.50, 0.50) == 10.25    # +0.5R  -> +0.25R
+    assert f(10.75, 0.75) == 10.50    # +0.75R -> +0.5R
+    assert f(10.75, 0.75, stop=10.60) == 10.60   # only ever ratchets UP
+
+
+def test_step_trail_locks_a_small_pop():
+    # +0.5R pop then fade. step-trail 0.25R ratchets the stop to +0.25R, so the
+    # fade exits at +0.25R instead of round-tripping (the SOFI failure mode).
+    pop_then_fade = _bars([(10.5, 10.0, 10.4),    # +0.5R high -> stop locks at 10.25
+                           (10.3, 9.5, 9.6)])     # fades; low 9.5 hits 10.25
+    r = simulate_exit(10.0, 9.0, pop_then_fade, ExitConfig(target_r=5.0, trail_r_step=0.25))
+    assert round(r.r_multiple, 2) == 0.25
+    # without it, the same fade round-trips to a loss (rides to the 9.6 close)
+    r0 = simulate_exit(10.0, 9.0, pop_then_fade, ExitConfig(target_r=5.0))
+    assert r0.r_multiple < 0
 
 
 def test_scale_out_blends_realized_r():
