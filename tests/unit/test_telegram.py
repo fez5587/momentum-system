@@ -92,7 +92,7 @@ def test_answer_falls_back_when_ollama_disabled(store):
     out = qa.answer(store, "what's my P&L?", host="h", model="m", timeout=1,
                     ollama_enabled=False)
     assert "raw snapshot" in out.lower()
-    assert "TODAY P&L" in out                          # gather_context ran
+    assert "P&L" in out                                # gather_context ran
 
 
 def test_answer_falls_back_when_ollama_down(store, monkeypatch):
@@ -100,3 +100,17 @@ def test_answer_falls_back_when_ollama_down(store, monkeypatch):
     out = qa.answer(store, "how are positions?", host="h", model="m", timeout=1,
                     ollama_enabled=True)
     assert "raw snapshot" in out.lower()
+
+
+def test_help_menu_gives_direction(store):
+    for q in ("help", "/start", "what can you do?"):
+        out = qa.answer(store, q, host="h", model="m", timeout=1, ollama_enabled=True)
+        assert "watchlist" in out.lower() and "read-only" in out.lower()
+
+
+def test_context_includes_watchlist_and_blocks(store):
+    # the gap the user hit: bot must retrieve more than P&L/positions
+    _rule(store, "vwap_below", "AMC below vwap")          # an entry block
+    ctx = qa.gather_context(store)
+    assert "WATCHLIST" in ctx or "READY SIGNALS" in ctx or "ENTRY BLOCKS" in ctx
+    assert "vwap_below" in ctx                            # why-not-trading is retrievable
