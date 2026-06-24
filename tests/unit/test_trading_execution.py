@@ -312,6 +312,22 @@ def test_liquidity_cap_off_when_unified_disabled(store):
     assert q > int(0.01 * 10_000)             # not capped -> risk-based size is larger
 
 
+def test_fill_model_resting_rests_at_level(store):
+    emit_signal(store, symbol="REST", entry=14.0, stop=13.45, above_vwap=True)
+    make_service(store).request_approvals_for_ready_signals()   # default resting
+    req = query_approval_queue(store)[0]["execution_request"]
+    assert req["entry_price"] == 14.0                            # rests AT the level
+
+
+def test_fill_model_marketable_lifts_above_trigger(store):
+    emit_signal(store, symbol="MKT", entry=14.0, stop=13.45, above_vwap=True)
+    make_service(store, entry_fill_model="marketable").request_approvals_for_ready_signals()
+    req = query_approval_queue(store)[0]["execution_request"]
+    assert req["entry_price"] == round(14.0 * 1.004, 2)         # a hair above (slippage 0.4%)
+    assert req["entry_price"] > 14.0
+    assert req["stop_loss_price"] == 13.45                      # R still measured from the level
+
+
 def test_no_duplicate_requests_for_same_symbol(store):
     emit_signal(store)
     service = make_service(store)

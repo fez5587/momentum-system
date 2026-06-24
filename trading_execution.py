@@ -91,6 +91,15 @@ class ExecutionSettings:
     # the fast trigger path, leaving live auto entries unprotected (see the
     # consolidation plan). Fail-open on missing data. False = pre-unification.
     unified_entry: bool = False
+    # Auto-path FILL MODEL (the last real divergence from the fast path):
+    #   "resting"    — rest a buy-limit AT the breakout level; fills only on a
+    #                  pullback to it (today's behaviour; misses runners that gap
+    #                  up and never return).
+    #   "marketable" — limit a hair above the trigger (entry * (1+slippage)); fills
+    #                  as price breaks UP through the level (what the fast path
+    #                  does), catching runners. The limit caps the fill price, so a
+    #                  halt-resume gap-through can't be chased.
+    entry_fill_model: str = "resting"
     max_daily_loss_pct: float = 0.03
     # on a daily-loss breach, also flatten open positions + cancel unfilled entries
     flatten_on_breach: bool = True
@@ -231,6 +240,7 @@ class ExecutionSettings:
             max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
             require_above_vwap=flag("TRADING_REQUIRE_ABOVE_VWAP", "1"),
             unified_entry=flag("TRADING_UNIFIED_ENTRY", "1"),
+            entry_fill_model=values.get("TRADING_ENTRY_FILL_MODEL", "resting"),
             liquidity_max_volume_pct=float(
                 values.get("TRADING_LIQUIDITY_MAX_VOLUME_PCT", "0.0")
             ),
@@ -746,11 +756,20 @@ class TradingExecutionService:
             entry_f = float(entry)
             stop_f = float(stop)
             risk_per_share = entry_f - stop_f
+            # FILL MODEL (unification): rest a limit AT the level (default), or place
+            # a marketable limit a hair above the trigger so it fills as price breaks
+            # UP through it (the fast path's runner-catching behaviour). The limit
+            # caps the fill price either way, so a gap-through can't be chased. R
+            # (stop/target) is measured from the level (entry_f), not the limit.
+            limit_price = (
+                round(entry_f * (1.0 + self.settings.trigger_slippage_pct), 2)
+                if self.settings.entry_fill_model == "marketable" else entry_f
+            )
             request = ExecutionRequest(
                 symbol=symbol,
                 side="buy",
                 quantity=sizing.position_size,
-                entry_price=entry_f,
+                entry_price=limit_price,
                 stop_loss_price=stop_f,
                 take_profit_price=round(
                     entry_f + self.settings.reward_multiple * risk_per_share, 2
