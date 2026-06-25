@@ -75,6 +75,25 @@ squeeze logs once, not 1,895×), never emit `signal_ready`, never set a symbol "
 - **Catalyst tag** needs Ollama running that day — force-enable it for the shadow grading pass so news-backed vs not can be measured?
 - **Distinct-runner-n ≥30** may be unrealistic given runner sparsity — a Bayesian interval at low n instead of a point rate?
 
+## ⚠️ P0 reality-check (2026-06-25) — READ BEFORE P1
+The P0 detector is built + unit-tested (fires correctly on a clean synthetic vertical). But running
+it over the **real** PLSM 2026-06-24 bars fired **0 times — correctly** — and the *why* reshapes this
+whole effort:
+- PLSM's session HIGH (12.85) was made at the **9:35 ET open** (it gapped from ~$4 **pre-market**); RTH
+  was then a day-long **fade**. The "+400% to $20" the trader cites happened **pre-market**, which the
+  bot does not ingest (RTH-only `minute_bars`) or trade.
+- PLSM was **halted for 228 of ~390 RTH minutes** — its RTH move is **halt-resumption GAPS**
+  (+3.6%, −12.5%, −17.3%, −14.4% …), NOT a smooth consecutive-bar vertical. A detector keyed on
+  consecutive green bars + smooth velocity **structurally cannot** see a halt-gapped move.
+
+**Implication:** the momentum-ignition opportunity is largely a **pre-market + halt-resumption**
+phenomenon, not an RTH smooth-vertical one. Capturing it would need (a) **pre-market/extended-hours bar
+ingestion**, (b) **halt-aware, gap-up detection** (resumption gaps, not consecutive bars), and (c) the
+bot to **trade pre-market / halt resumptions** — which runs straight into the **halt-down blowup risk**
+(FCUV) the anti-chase guards exist to prevent. That is a far bigger lift than an RTH detector, and an
+operator decision before P1: invest in pre-market+halt data/logic, or shelve the ignition lane and bank
+the ORB/float work instead. The P0 detector + tests remain a correct foundation either way.
+
 ## Hard constraints (non-negotiable)
 Shadow-only until forward data proves it · never touches the ORB book or anti-chase guards · ships dark
 (`SHADOW_IGNITION_ENABLED=0`) · binary rules, no fitting · do NOT gate on RVOL or float (both broken for
