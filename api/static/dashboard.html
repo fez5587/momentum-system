@@ -154,6 +154,20 @@
     background: linear-gradient(180deg, var(--accent), #2a6fd6); flex-shrink: 0;
     box-shadow: 0 0 8px rgba(91,163,255,.5);
   }
+  /* collapsible panels: <details class="panel"><summary><h2>..</h2></summary>..</details> */
+  details.panel > summary { list-style: none; cursor: pointer; outline: none; }
+  details.panel > summary::-webkit-details-marker { display: none; }
+  details.panel > summary > h2 { margin: 0; }
+  details.panel > summary > h2::after {
+    content: "▾"; margin-left: 12px; color: var(--muted); font-size: 11px;
+    flex-shrink: 0; transition: color .15s ease;
+  }
+  details.panel:not([open]) > summary > h2::after { content: "▸"; }
+  details.panel:not([open]) > summary > h2 { border-bottom: none; }
+  details.panel > summary:hover > h2 { color: #c3cde6; }
+  details.panel > summary:hover > h2::after { color: var(--accent); }
+  details.panel[open] > summary > h2 { background: linear-gradient(180deg, var(--panel-hi), rgba(22,28,42,.5)); }
+  #panels-toggle { margin-left: 4px; }
   .count { font: 600 11px var(--mono); background: var(--border); color: var(--text); border-radius: 10px; padding: 1px 8px; }
   .hint { margin-left: auto; font: 500 10px var(--mono); color: var(--muted); letter-spacing: .3px; text-transform: none; }
   table { width: 100%; border-collapse: collapse; }
@@ -407,6 +421,7 @@
   <div class="spacer"></div>
   <button id="sound-toggle" class="hdr-btn" title="Toggle signal alert sound">SOUND OFF</button>
   <button id="kbd-toggle" class="hdr-btn" title="Keyboard shortcuts (?)">KEYS</button>
+  <button id="panels-toggle" class="hdr-btn" title="Expand or collapse every panel">EXPAND ALL</button>
   <div class="conn"><div id="conn-dot" class="dot"></div><span id="stamp" class="stamp">connecting...</span></div>
 </header>
 
@@ -430,70 +445,93 @@
 </div>
 
 <main>
-  <section class="panel full">
-    <h2>Armed Triggers <span id="trig-count" class="count">0</span><span id="cat-engine" class="cat-engine"></span><span class="hint">live proximity to the opening-range breakout &middot; closest to fire on top</span></h2>
+  <details class="panel full" id="p-armed" open>
+    <summary><h2>Armed Triggers <span id="trig-count" class="count">0</span><span id="cat-engine" class="cat-engine"></span><span class="hint">live proximity to the opening-range breakout &middot; closest to fire on top</span></h2></summary>
     <div id="armed-triggers"><span class="empty">No armed gappers — waiting for the open / first bars.</span></div>
-  </section>
+  </details>
 
-  <section class="panel full">
-    <h2>Catalyst Engine <span id="cat-feed-count" class="count">0</span><span class="hint">what the local LLM read &amp; how it ruled &middot; 🟢 bullish &middot; 🔻 bearish &middot; 🔴 dilutive &middot; hover a row for the model's reasoning</span></h2>
-    <div id="catalyst-feed"><span class="empty">No catalyst reads yet — the news enrichment loop hasn't classified any headlines.</span></div>
-  </section>
-
-  <section class="panel full">
-    <h2>Account <span id="acct-count" class="count">0</span></h2>
-    <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
-  </section>
-
-  <section class="panel full">
-    <h2>All-Time Score <span class="hint">cumulative across every closed round-trip — bot's record to date</span></h2>
-    <div id="alltime" class="acct-row"><span class="empty">No closed trades recorded yet.</span></div>
-  </section>
-
-  <section class="panel full">
-    <h2>Daily Performance <span id="daily-count" class="count">0</span><span class="hint">per-day P&amp;L bars + cumulative equity curve &middot; click a day to open it</span></h2>
-    <div id="daily-curve"><span class="empty">No trading days recorded yet.</span></div>
-  </section>
-
-  <section class="panel">
-    <h2>Trades <span id="trades-count" class="count">0</span><span id="trades-net" class="hint"></span></h2>
-    <div id="trades"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Approval Queue <span id="aq-count" class="count">0</span><span class="hint">A approve top &middot; R reject top</span></h2>
-    <div id="approval-queue"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Ready Signals <span id="rs-count" class="count">0</span></h2>
-    <div id="ready-signals"></div>
-  </section>
-
-  <section class="panel">
-    <h2>Open Positions <span id="pos-count" class="count">0</span></h2>
+  <details class="panel full" id="p-positions" open>
+    <summary><h2>Open Positions <span id="pos-count" class="count">0</span></h2></summary>
     <div id="positions"></div>
-  </section>
+  </details>
 
-  <section class="panel">
-    <h2>Watch States <span id="ws-count" class="count">0</span><span class="hint">click a row for criteria</span></h2>
+  <details class="panel" id="p-approval" open>
+    <summary><h2>Approval Queue <span id="aq-count" class="count">0</span><span class="hint">A approve top &middot; R reject top</span></h2></summary>
+    <div id="approval-queue"></div>
+  </details>
+
+  <details class="panel" id="p-ready" open>
+    <summary><h2>Ready Signals <span id="rs-count" class="count">0</span></h2></summary>
+    <div id="ready-signals"></div>
+  </details>
+
+  <details class="panel full" id="p-account" open>
+    <summary><h2>Account <span id="acct-count" class="count">0</span></h2></summary>
+    <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
+  </details>
+
+  <details class="panel full" id="p-catalyst">
+    <summary><h2>Catalyst Engine <span id="cat-feed-count" class="count">0</span><span class="hint">what the local LLM read &amp; how it ruled &middot; 🟢 bullish &middot; 🔻 bearish &middot; 🔴 dilutive &middot; hover a row for the model's reasoning</span></h2></summary>
+    <div id="catalyst-feed"><span class="empty">No catalyst reads yet — the news enrichment loop hasn't classified any headlines.</span></div>
+  </details>
+
+  <details class="panel" id="p-trades">
+    <summary><h2>Trades <span id="trades-count" class="count">0</span><span id="trades-net" class="hint"></span></h2></summary>
+    <div id="trades"></div>
+  </details>
+
+  <details class="panel" id="p-watch">
+    <summary><h2>Watch States <span id="ws-count" class="count">0</span><span class="hint">click a row for criteria</span></h2></summary>
     <div class="inject">
       <input id="inject-input" placeholder="add symbol..." maxlength="6" autocomplete="off">
       <button id="inject-btn">Watch</button>
     </div>
     <div id="watch-states"></div>
-  </section>
+  </details>
 
-  <section class="panel">
-    <h2>Activity Feed <span id="feed-count" class="count">0</span></h2>
+  <details class="panel full" id="p-daily">
+    <summary><h2>Daily Performance <span id="daily-count" class="count">0</span><span class="hint">per-day P&amp;L bars + cumulative equity curve &middot; click a day to open it</span></h2></summary>
+    <div id="daily-curve"><span class="empty">No trading days recorded yet.</span></div>
+  </details>
+
+  <details class="panel full" id="p-alltime">
+    <summary><h2>All-Time Score <span class="hint">cumulative across every closed round-trip — bot's record to date</span></h2></summary>
+    <div id="alltime" class="acct-row"><span class="empty">No closed trades recorded yet.</span></div>
+  </details>
+
+  <details class="panel" id="p-feed">
+    <summary><h2>Activity Feed <span id="feed-count" class="count">0</span></h2></summary>
     <div id="feed"></div>
-  </section>
+  </details>
 
-  <section class="panel">
-    <h2>Order Lifecycle <span id="ol-count" class="count">0</span></h2>
+  <details class="panel" id="p-orders">
+    <summary><h2>Order Lifecycle <span id="ol-count" class="count">0</span></h2></summary>
     <div id="order-lifecycle"></div>
-  </section>
+  </details>
 </main>
+<script>
+(function(){
+  // Collapsible panels — remember each panel's open/closed state across refreshes,
+  // and an expand/collapse-all toggle. Pure UI; the live app JS keys off the inner ids.
+  var KEY = 'momentum.panels.v2', saved = {};
+  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}'); } catch (e) {}
+  var panels = document.querySelectorAll('details.panel[id]');
+  panels.forEach(function(d){
+    if (d.id in saved) d.open = !!saved[d.id];
+    d.addEventListener('toggle', function(){
+      saved[d.id] = d.open;
+      try { localStorage.setItem(KEY, JSON.stringify(saved)); } catch (e) {}
+    });
+  });
+  var btn = document.getElementById('panels-toggle');
+  if (btn) btn.addEventListener('click', function(){
+    var all = document.querySelectorAll('details.panel');
+    var anyClosed = [].some.call(all, function(d){ return !d.open; });
+    all.forEach(function(d){ d.open = anyClosed; });
+    btn.textContent = anyClosed ? 'COLLAPSE ALL' : 'EXPAND ALL';
+  });
+})();
+</script>
 
 <div id="toast" class="toast"></div>
 

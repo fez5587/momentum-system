@@ -31,6 +31,7 @@ giving each test the same isolation DuckDB ":memory:" gave it.
 from __future__ import annotations
 
 import os
+import urllib.parse as _urlparse
 import uuid
 from pathlib import Path
 from typing import Any
@@ -173,11 +174,31 @@ class PgConnection:
         return self._conn
 
 
+# The LAN Postgres is reached from WSL via EITHER the Windows netsh portproxy on
+# 127.0.0.1 OR a direct route to the host 192.168.1.5 — and which one works FLIPS across
+# WSL/host reboots and network-mode (mirrored vs NAT) changes. So when DATABASE_URL points
+# at a known LAN endpoint, try the configured host first and then the alternate, so the
+# loop self-heals on boot regardless of the current tunnel state (this is the recurring
+# crash-loop landmine). "connection refused" returns instantly, so the fallback is cheap.
+_LAN_DB_HOSTS = ("127.0.0.1", "localhost", "192.168.1.5")
+_LAN_DB_FALLBACKS = ("192.168.1.5", "127.0.0.1")
+
+
+def _dsn_with_host(dsn: str, host: str) -> str:
+    p = _urlparse.urlsplit(dsn)
+    userinfo = ""
+    if p.username:
+        userinfo = _urlparse.quote(p.username, safe="")
+        if p.password:
+            userinfo += ":" + _urlparse.quote(p.password, safe="")
+        userinfo += "@"
+    netloc = f"{userinfo}{host}:{p.port or 5432}"
+    return _urlparse.urlunsplit((p.scheme, netloc, p.path, p.query, p.fragment))
+
+
 def _connect():
     dsn = os.environ.get("DATABASE_URL")
-    if dsn:
-        conn = psycopg2.connect(dsn)
-    else:
+    if not dsn:
         conn = psycopg2.connect(
             host=os.environ.get("PGHOST", "/home/philip/pgrun"),
             port=os.environ.get("PGPORT", "5432"),
@@ -185,8 +206,22 @@ def _connect():
             password=os.environ.get("PGPASSWORD", ""),
             dbname=os.environ.get("PGDATABASE", "momentum"),
         )
-    conn.autocommit = True
-    return conn
+        conn.autocommit = True
+        return conn
+
+    candidates = [dsn]
+    host = _urlparse.urlsplit(dsn).hostname
+    if host in _LAN_DB_HOSTS:                       # only swap hosts for the LAN PG
+        candidates += [_dsn_with_host(dsn, h) for h in _LAN_DB_FALLBACKS if h != host]
+    last_err: Exception | None = None
+    for cand in candidates:
+        try:
+            conn = psycopg2.connect(cand, connect_timeout=5)
+            conn.autocommit = True
+            return conn
+        except psycopg2.OperationalError as exc:
+            last_err = exc
+    raise last_err if last_err else psycopg2.OperationalError("no DATABASE_URL candidates")
 
 
 def _apply_schema(conn, search_path: str | None = None) -> None:
