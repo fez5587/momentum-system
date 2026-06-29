@@ -1,0 +1,137 @@
+{
+  "uid": "momentum-live",
+  "title": "Momentum — Live",
+  "tags": ["momentum"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "time": { "from": "now/d", "to": "now" },
+  "templating": { "list": [] },
+  "annotations": { "list": [] },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Account equity",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT (payload_json::jsonb->>'total_equity')::float AS equity FROM events WHERE event_type='account_summary_updated' ORDER BY timestamp DESC LIMIT 1"
+      }]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Ready signals (today)",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "fieldConfig": { "defaults": { "thresholds": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "blue", "value": 1 } ] } }, "overrides": [] },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "background", "graphMode": "none" },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT count(DISTINCT payload_json::jsonb->>'symbol')::int AS ready FROM events WHERE event_type='signal_ready'"
+      }]
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Symbols evaluated",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] }, "colorMode": "value", "graphMode": "none" },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT count(DISTINCT payload_json::jsonb->>'symbol')::int AS evaluated FROM events WHERE event_type='criteria_evaluated'"
+      }]
+    },
+    {
+      "id": 3,
+      "type": "table",
+      "title": "Evaluation board — what it's looking at + the determination",
+      "gridPos": { "h": 14, "w": 14, "x": 0, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "status" },
+            "properties": [ { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              { "id": "mappings", "value": [
+                { "type": "value", "options": { "ready": { "color": "green", "index": 0 }, "late": { "color": "yellow", "index": 1 }, "blocked": { "color": "red", "index": 2 } } } ] } ] },
+          { "matcher": { "id": "byName", "options": "gap" }, "properties": [ { "id": "unit", "value": "percentunit" } ] },
+          { "matcher": { "id": "byName", "options": "score" }, "properties": [ { "id": "unit", "value": "percent" } ] }
+        ]
+      },
+      "options": { "sortBy": [ { "displayName": "score", "desc": true } ] },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT * FROM ( SELECT DISTINCT ON (sym) sym AS symbol, status, score, gap, rvol, reason FROM ( SELECT payload_json::jsonb->>'symbol' sym, payload_json::jsonb->'criteria_results'->>'status' status, (payload_json::jsonb->>'success_score_pct')::float score, (payload_json::jsonb->'criteria_results'->>'gap_pct')::float gap, (payload_json::jsonb->'criteria_results'->>'relative_volume')::float rvol, payload_json::jsonb->'criteria_results'->>'reason' reason, timestamp ts FROM events WHERE event_type='criteria_evaluated' ) t ORDER BY sym, ts DESC ) x ORDER BY score DESC"
+      }]
+    },
+    {
+      "id": 4,
+      "type": "table",
+      "title": "Ready signals",
+      "gridPos": { "h": 7, "w": 10, "x": 14, "y": 4 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp AS time, payload_json::jsonb->>'symbol' AS symbol, message FROM events WHERE event_type='signal_ready' ORDER BY timestamp DESC LIMIT 25"
+      }]
+    },
+    {
+      "id": 5,
+      "type": "table",
+      "title": "Risk events (breaker / backouts)",
+      "gridPos": { "h": 7, "w": 10, "x": 14, "y": 11 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "targets": [{
+        "refId": "A",
+        "format": "table",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp AS time, payload_json::jsonb->>'rule_type' AS rule, message FROM events WHERE event_type='risk_rule_triggered' ORDER BY timestamp DESC LIMIT 25"
+      }]
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Minute bars ingested",
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 18 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "fieldConfig": { "defaults": { "custom": { "drawStyle": "bars", "fillOpacity": 40 } }, "overrides": [] },
+      "targets": [{
+        "refId": "A",
+        "format": "time_series",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp AS time, (payload_json::jsonb->>'output_count')::float AS minute_rows FROM events WHERE event_type='module_tick' AND payload_json::jsonb->>'module'='ingestion' AND $__timeFilter(timestamp) ORDER BY 1"
+      }]
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Account equity",
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 18 },
+      "datasource": { "type": "postgres", "uid": "momentum_pg" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" }, "overrides": [] },
+      "targets": [{
+        "refId": "A",
+        "format": "time_series",
+        "rawQuery": true,
+        "rawSql": "SELECT timestamp AS time, (payload_json::jsonb->>'total_equity')::float AS equity FROM events WHERE event_type='account_summary_updated' AND $__timeFilter(timestamp) ORDER BY 1"
+      }]
+    }
+  ]
+}

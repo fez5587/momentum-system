@@ -1,0 +1,158 @@
+{{- if .Values.grafana.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "momentum.grafanaName" . }}-provisioning
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+data:
+  # Datasource points at the in-cluster Postgres service (not the old LAN IP).
+  datasource.yaml: |
+    apiVersion: 1
+    datasources:
+      - name: Momentum
+        uid: momentum_pg
+        type: postgres
+        access: proxy
+        url: {{ include "momentum.postgresName" . }}:{{ .Values.postgres.port }}
+        user: {{ .Values.postgres.username }}
+        jsonData:
+          database: {{ .Values.postgres.database }}
+          sslmode: disable
+          postgresVersion: 1600
+        secureJsonData:
+          # Resolved at runtime from the env var below so it always matches the
+          # password stored in the Secret (avoids re-deriving it here).
+          password: $POSTGRES_PASSWORD
+        isDefault: true
+        editable: true
+  provider.yaml: |
+    apiVersion: 1
+    providers:
+      - name: momentum
+        orgId: 1
+        type: file
+        disableDeletion: false
+        updateIntervalSeconds: 10
+        allowUiUpdates: true
+        options:
+          path: /etc/grafana/provisioning/dashboards
+          foldersFromFilesStructure: false
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "momentum.grafanaName" . }}-dashboards
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+data:
+  momentum.json: |-
+    {{- .Files.Get "files/dashboard.json" | nindent 4 }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "momentum.grafanaName" . }}
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+    app.kubernetes.io/component: grafana
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "momentum.selectorLabels" (dict "ctx" . "component" "grafana") | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "momentum.selectorLabels" (dict "ctx" . "component" "grafana") | nindent 8 }}
+    spec:
+      containers:
+        - name: grafana
+          image: {{ .Values.grafana.image | quote }}
+          ports:
+            - name: http
+              containerPort: 3000
+          env:
+            - name: GF_AUTH_ANONYMOUS_ENABLED
+              value: "true"
+            - name: GF_AUTH_ANONYMOUS_ORG_ROLE
+              value: "Admin"
+            - name: GF_AUTH_DISABLE_LOGIN_FORM
+              value: "true"
+            - name: GF_DASHBOARDS_MIN_REFRESH_INTERVAL
+              value: "2s"
+            # Interpolated into the provisioned datasource (secureJsonData.password).
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "momentum.secretName" . }}
+                  key: POSTGRES_PASSWORD
+          volumeMounts:
+            - name: datasources
+              mountPath: /etc/grafana/provisioning/datasources
+            - name: dashboard-provider
+              mountPath: /etc/grafana/provisioning/dashboards/provider.yaml
+              subPath: provider.yaml
+            - name: dashboards
+              mountPath: /etc/grafana/provisioning/dashboards/momentum.json
+              subPath: momentum.json
+            - name: storage
+              mountPath: /var/lib/grafana
+          resources:
+            {{- toYaml .Values.grafana.resources | nindent 12 }}
+      volumes:
+        - name: datasources
+          configMap:
+            name: {{ include "momentum.grafanaName" . }}-provisioning
+            items:
+              - key: datasource.yaml
+                path: datasource.yaml
+        - name: dashboard-provider
+          configMap:
+            name: {{ include "momentum.grafanaName" . }}-provisioning
+            items:
+              - key: provider.yaml
+                path: provider.yaml
+        - name: dashboards
+          configMap:
+            name: {{ include "momentum.grafanaName" . }}-dashboards
+        - name: storage
+          {{- if .Values.grafana.persistence.enabled }}
+          persistentVolumeClaim:
+            claimName: {{ include "momentum.grafanaName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "momentum.grafanaName" . }}
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.grafana.service.type }}
+  selector:
+    {{- include "momentum.selectorLabels" (dict "ctx" . "component" "grafana") | nindent 4 }}
+  ports:
+    - name: http
+      port: {{ .Values.grafana.service.port }}
+      targetPort: http
+{{- if .Values.grafana.persistence.enabled }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "momentum.grafanaName" . }}
+  labels:
+    {{- include "momentum.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  {{- if .Values.grafana.persistence.storageClass }}
+  storageClassName: {{ .Values.grafana.persistence.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.grafana.persistence.size | quote }}
+{{- end }}
+{{- end }}

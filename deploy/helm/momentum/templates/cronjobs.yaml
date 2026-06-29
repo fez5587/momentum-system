@@ -1,0 +1,59 @@
+{{- if .Values.cronjobs.enabled }}
+{{- $root := . }}
+{{- $jobs := dict "journal" .Values.cronjobs.journal "eod-replay" .Values.cronjobs.eodReplay "nightly-tune" .Values.cronjobs.nightlyTune }}
+{{- range $key, $job := $jobs }}
+{{- if $job.enabled }}
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ include "momentum.fullname" $root }}-{{ $key }}
+  labels:
+    {{- include "momentum.labels" $root | nindent 4 }}
+    app.kubernetes.io/component: cron-{{ $key }}
+spec:
+  schedule: {{ $job.schedule | quote }}
+  # US/Eastern so the market-clock schedules in .env's *.sh comments hold.
+  timeZone: {{ $root.Values.cronjobs.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+  jobTemplate:
+    spec:
+      backoffLimit: 1
+      template:
+        metadata:
+          labels:
+            {{- include "momentum.selectorLabels" (dict "ctx" $root "component" (printf "cron-%s" $key)) | nindent 12 }}
+        spec:
+          restartPolicy: Never
+          {{- with $root.Values.imagePullSecrets }}
+          imagePullSecrets:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: {{ $key }}
+              image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag }}"
+              imagePullPolicy: {{ $root.Values.image.pullPolicy }}
+              command: {{ toYaml $job.command | nindent 16 }}
+              envFrom:
+                - configMapRef:
+                    name: {{ include "momentum.configMapName" $root }}
+                - secretRef:
+                    name: {{ include "momentum.secretName" $root }}
+              volumeMounts:
+                - name: app-data
+                  mountPath: /app/data
+          volumes:
+            - name: app-data
+              {{- if $root.Values.app.persistence.enabled }}
+              # Shared with the app pod (nightly-tune writes learned_params.json
+              # the loop reads on boot). RWO ⇒ cron pods schedule onto the app's node.
+              persistentVolumeClaim:
+                claimName: {{ include "momentum.appDataPvcName" $root }}
+              {{- else }}
+              emptyDir: {}
+              {{- end }}
+{{- end }}
+{{- end }}
+{{- end }}

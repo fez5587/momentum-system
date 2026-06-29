@@ -1,0 +1,19 @@
+# Grafana datasource for the docker-compose stack — points at the in-network
+# `postgres` service (not the LAN IP used by grafana/provisioning/datasources).
+# Credentials are interpolated from the PG_* env vars set on the grafana service.
+apiVersion: 1
+datasources:
+  - name: Momentum
+    uid: momentum_pg
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: ${PG_USER}
+    jsonData:
+      database: ${PG_DATABASE}
+      sslmode: disable
+      postgresVersion: 1600
+    secureJsonData:
+      password: ${PG_PASSWORD}
+    isDefault: true
+    editable: true

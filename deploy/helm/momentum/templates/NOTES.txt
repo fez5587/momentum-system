@@ -1,0 +1,28 @@
+Momentum System deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Components:
+  - PostgreSQL (StatefulSet, single source of truth) : svc/{{ include "momentum.postgresName" . }}:{{ .Values.postgres.port }}
+  - App loop + embedded dashboard (replicas: 1)       : svc/{{ include "momentum.appName" . }}:{{ .Values.service.port }}
+{{- if .Values.cronjobs.enabled }}
+  - CronJobs (journal, eod-replay, nightly-tune)      : timeZone {{ .Values.cronjobs.timeZone }}
+{{- end }}
+{{- if .Values.grafana.enabled }}
+  - Grafana                                           : svc/{{ include "momentum.grafanaName" . }}:{{ .Values.grafana.service.port }}
+{{- end }}
+
+Reach the dashboard:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "momentum.appName" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  open http://localhost:{{ .Values.service.port }}
+
+{{- if not .Values.secrets.existingSecret }}
+{{- if or (not .Values.secrets.alpacaApiKey) (not .Values.secrets.alpacaSecretKey) }}
+
+WARNING: Alpaca keys are not set — the loop runs in dry mode (no live data/orders).
+  Supply them: helm upgrade {{ .Release.Name }} ... \
+    --set secrets.alpacaApiKey=YOUR_KEY --set secrets.alpacaSecretKey=YOUR_SECRET
+{{- end }}
+{{- end }}
+
+The DB schema auto-creates on the app's first connection. Verify:
+  kubectl -n {{ .Release.Namespace }} exec sts/{{ include "momentum.postgresName" . }} -- \
+    psql -U {{ .Values.postgres.username }} -d {{ .Values.postgres.database }} -c '\dt'
