@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pandas as pd
 
-from research.labeler import compute_setup, compute_vwap_reclaim_setups
+from research.labeler import compute_setup, compute_vwap_reclaim_setups, _wilson_lower
 
 COLS = ["timestamp", "session_date", "is_premarket", "is_regular_hours",
         "is_afterhours", "open", "high", "low", "close", "volume", "vwap"]
@@ -106,3 +106,13 @@ def test_vwap_reclaim_silent_on_one_way_fade():
     fade = _bars(_leg(0, 2.00, 1.20, 26))
     assert compute_vwap_reclaim_setups("FADE", D, fade, prior_close=2.10,
                                        avg_vol=50_000, cats={}) == []
+
+
+def test_wilson_lower_bound():
+    # the honest small-sample lower bound: below the point estimate, 0 at n=0,
+    # monotonic in successes, and tighter (higher) as n grows at a fixed rate.
+    assert _wilson_lower(0, 0) == 0.0
+    assert _wilson_lower(50, 100) < 0.5                 # LB sits below the 50% point est
+    assert 0.39 < _wilson_lower(50, 100) < 0.41         # ~0.404 for 50/100
+    assert _wilson_lower(28, 48) > _wilson_lower(20, 48)  # monotonic in k
+    assert _wilson_lower(500, 1000) > _wilson_lower(50, 100)  # tighter at larger n, same rate

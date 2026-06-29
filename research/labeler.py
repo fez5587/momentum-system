@@ -48,6 +48,30 @@ VR_SETUP_VERSION = "vr1"
 VR_NAME = "vwap_reclaim"
 VR_MIN_BARS = 21
 
+# P3 PRE-REGISTERED promotion hypothesis (locked 2026-06-29 from the edit-audit, BEFORE
+# any forward data). The raw setup is negative after cost (stop-unit artifact); the only
+# subset that survived adversarial refutation is price>=$5 AND impulse in the MID tercile,
+# scored as a +2R/RUNNER filter (NOT +1R). These bands are POST-HOC on the 24-day window
+# -- a HYPOTHESIS to validate forward, never to be hand-tuned to fit. PASS BAR: on
+# out-of-sample fires the conditioned subset's +2R Wilson-95 lower bound must exceed the
+# base +2R rate AND its absolute max-upside-60m must beat same-symbol-day ORB at +5%/+10%.
+VR_PROMO_MIN_PRICE = 5.0
+VR_PROMO_IMPULSE_LO = 0.15
+VR_PROMO_IMPULSE_HI = 0.26
+VR_PROMO_BASE_2R = 0.349        # the unconditioned +2R base rate the subset must clear
+
+
+def _wilson_lower(k: int, n: int, z: float = 1.96) -> float:
+    """Lower bound of the Wilson score interval for k/n at confidence z (default 95%).
+    Honest small-sample lower bound -- the bar a rate must clear, not the point estimate."""
+    if n == 0:
+        return 0.0
+    p = k / n
+    d = 1 + z * z / n
+    centre = p + z * z / (2 * n)
+    half = z * ((p * (1 - p) / n + z * z / (4 * n * n)) ** 0.5)
+    return max(0.0, (centre - half) / d)
+
 _MB_COLS = ["timestamp", "session_date", "is_premarket", "is_regular_hours",
            "is_afterhours", "open", "high", "low", "close", "volume", "vwap"]
 
@@ -275,7 +299,13 @@ def compute_vwap_reclaim_setups(symbol, session_date, df, prior_close, avg_vol,
     over the RTH bars and emits on each RISING EDGE (not-valid -> valid) with a bar
     cooldown so one curl episode is one setup. Each emit carries the detector's OWN
     entry/stop/R; labels come from _forward_labels (no skew). STRICT time split: the
-    detector at bar i sees only bars[:i+1]; labels use only RTH bars after i. PURE."""
+    detector at bar i sees only bars[:i+1]; labels use only RTH bars after i. PURE.
+
+    The shadow base track keeps EVERY curl fire (placeability gate OFF: min_r_*=0) so
+    report-vr's base rates stay complete and the placeability filter's effect is
+    measurable; validate-vr applies placeability + the promotion conditioning. The live
+    detector defaults the gate ON -- that is a live-tradeability default, not a base-rate
+    one."""
     df = df.copy()
     df["is_regular_hours"] = df["is_regular_hours"].astype(bool)
     rth = df[df["is_regular_hours"]].reset_index(drop=True)
@@ -286,7 +316,7 @@ def compute_vwap_reclaim_setups(symbol, session_date, df, prior_close, avg_vol,
         return []
     out, prev_fire, last_emit = [], False, -10 ** 9
     for i in range(VR_MIN_BARS - 1, len(rth)):
-        sig = detect_vwap_reclaim(rth.iloc[:i + 1])
+        sig = detect_vwap_reclaim(rth.iloc[:i + 1], min_r_frac=0.0, min_r_abs=0.0)
         firing = sig.is_valid
         rising = firing and not prev_fire and (i - last_emit) >= cooldown
         prev_fire = firing
@@ -389,6 +419,63 @@ def report_vwap_reclaim(con):
     if cmp and cmp[1]:
         print(f"\nHEAD-TO-HEAD (same symbol-days): ORB '{SETUP_VERSION}' reached +1R = "
               f"{(cmp[0] or 0)*100:.0f}% over {cmp[1]} ORB setups (vs the vwap_reclaim {row[0]*100:.0f}% above)")
+
+
+def validate_vwap_reclaim(con, min_r_frac=0.015, min_r_abs=0.02):
+    """Score the PRE-REGISTERED promotion candidate against the locked pass bar (P3).
+    Candidate = vr1 fires that are PLACEABLE (R >= max(min_r_abs, min_r_frac*entry))
+    AND price >= VR_PROMO_MIN_PRICE AND impulse in [VR_PROMO_IMPULSE_LO, _HI]. The bar:
+      (1) +2R Wilson-95 lower bound > VR_PROMO_BASE_2R (a runner filter, not a +1R one), and
+      (2) absolute max-upside-60m beats same-symbol-day ORB at BOTH +5% and +10%.
+    Runs identically on in-sample and forward data; in-sample is a HYPOTHESIS, not a pass."""
+    sub = con.execute(
+        "SELECT se.symbol, se.session_date, "
+        "CASE WHEN l.reached_2r_before_minus_1r THEN 1 ELSE 0 END, l.max_upside_next_60m "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "WHERE se.setup_version=? AND se.entry_reference_price >= ? "
+        "AND se.impulse_pct >= ? AND se.impulse_pct <= ? "
+        "AND (se.entry_reference_price - se.invalidation_price) >= "
+        "    GREATEST(?, ? * se.entry_reference_price)",
+        [VR_SETUP_VERSION, VR_PROMO_MIN_PRICE, VR_PROMO_IMPULSE_LO, VR_PROMO_IMPULSE_HI,
+         min_r_abs, min_r_frac]).fetchall()
+    n = len(sub)
+    print("=== vwap_reclaim PROMOTION-CANDIDATE validation (P3, pre-registered bar) ===")
+    print(f"  rule: placeable (R>=max(${min_r_abs:.2f},{min_r_frac*100:.1f}%)) AND price>=${VR_PROMO_MIN_PRICE:.0f} "
+          f"AND impulse in [{VR_PROMO_IMPULSE_LO},{VR_PROMO_IMPULSE_HI}]")
+    if not n:
+        print("  no candidate fires yet (run build-vr first / awaiting forward data).")
+        return
+    k2r = sum(r[2] for r in sub)
+    lb = _wilson_lower(k2r, n)
+    up5 = sum(1 for r in sub if (r[3] or 0) >= 0.05) / n
+    up10 = sum(1 for r in sub if (r[3] or 0) >= 0.10) / n
+    days = len({(r[0], r[1]) for r in sub})
+    # ORB on the SAME symbol-days, absolute 60m up-move thresholds
+    orb = con.execute(
+        "WITH sd AS (SELECT DISTINCT se.symbol, se.session_date "
+        "  FROM setup_events se JOIN outcome_labels l ON l.setup_id=se.setup_id "
+        "  WHERE se.setup_version=? AND se.entry_reference_price >= ? "
+        "  AND se.impulse_pct >= ? AND se.impulse_pct <= ? "
+        "  AND (se.entry_reference_price - se.invalidation_price) >= GREATEST(?, ? * se.entry_reference_price)) "
+        "SELECT avg(CASE WHEN l.max_upside_next_60m>=0.05 THEN 1.0 ELSE 0 END), "
+        "       avg(CASE WHEN l.max_upside_next_60m>=0.10 THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id=se.setup_id "
+        "JOIN sd ON sd.symbol=se.symbol AND sd.session_date=se.session_date "
+        "WHERE se.setup_version=?",
+        [VR_SETUP_VERSION, VR_PROMO_MIN_PRICE, VR_PROMO_IMPULSE_LO, VR_PROMO_IMPULSE_HI,
+         min_r_abs, min_r_frac, SETUP_VERSION]).fetchone()
+    orb_up5, orb_up10, orb_n = (orb[0] or 0), (orb[1] or 0), int(orb[2] or 0)
+    pass_2r = lb > VR_PROMO_BASE_2R
+    pass_abs = (up5 >= orb_up5) and (up10 >= orb_up10)
+    mark = lambda ok: "PASS" if ok else "FAIL"
+    print(f"  candidate: {n} fires, {days} session-days")
+    print(f"  +2R rate {k2r}/{n} = {k2r/n*100:.0f}% | Wilson-95 LB {lb*100:.1f}% vs base "
+          f"{VR_PROMO_BASE_2R*100:.1f}%  -> [{mark(pass_2r)}]")
+    print(f"  abs +5%/60m  {up5*100:.0f}% vs ORB {orb_up5*100:.0f}% | "
+          f"+10%/60m {up10*100:.0f}% vs ORB {orb_up10*100:.0f}% (ORB n={orb_n})  -> [{mark(pass_abs)}]")
+    print(f"  OVERALL: [{mark(pass_2r and pass_abs)}]")
+    print("  NOTE: in-sample (post-hoc tercile selection) is a HYPOTHESIS, not a pass. "
+          "The bar is locked; only OUT-OF-SAMPLE forward fires can clear it.")
 
 
 def report(con):
@@ -513,6 +600,7 @@ def main():
     bv.add_argument("--limit", type=int); bv.add_argument("--rebuild", action="store_true")
     bv.add_argument("--cooldown", type=int, default=10)
     sub.add_parser("report-vr", help="forward outcomes of the vwap_reclaim shadow track")
+    sub.add_parser("validate-vr", help="score the pre-registered promotion candidate vs the locked bar")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -525,6 +613,8 @@ def main():
         build_vwap_reclaim(con, limit=args.limit, rebuild=args.rebuild, cooldown=args.cooldown)
     elif args.cmd == "report-vr":
         report_vwap_reclaim(con)
+    elif args.cmd == "validate-vr":
+        validate_vwap_reclaim(con)
 
 
 if __name__ == "__main__":

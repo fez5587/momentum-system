@@ -71,6 +71,25 @@ def test_target_rr_and_macd_tag_logged():
     assert r.signal_values["target_rr"] > 0                      # HOD is above the entry
 
 
+def test_unplaceable_tight_stop_rejected():
+    """P3: a very shallow pullback yields a sub-1.5% R (stop inside the spread). The
+    curl is otherwise valid, so the placeability gate must reject it -- and disabling
+    the gate must let it fire (proving it's the gate, not another criterion)."""
+    # impulse 4.0->6.0, SHALLOW pullback to ~5.80 (held ~90%), curl to ~5.84:
+    # entry ~5.84, stop ~5.79 -> R ~0.9% of price -> unplaceable.
+    tight = _df(_seg(4.0, 6.0, 18, 12000) + _seg(6.0, 5.80, 8, 8000) + _seg(5.80, 5.84, 14, 11000))
+    r = detect_vwap_reclaim(tight)
+    assert not r.is_valid and "unplaceable" in (r.reason or "")
+    assert r.signal_values["r_frac"] < 0.015                     # the diagnosed cause
+    off = detect_vwap_reclaim(tight, min_r_frac=0.0, min_r_abs=0.0)
+    assert off.is_valid and off.reason == "vwap_reclaim"         # gate was the only blocker
+
+
+def test_clean_fire_is_placeable():
+    r = detect_vwap_reclaim(CLEAN)
+    assert r.is_valid and r.signal_values["r_frac"] >= 0.015     # a real, placeable stop
+
+
 def test_local_anchor_rearms_after_higher_leg_gave_back():
     """P1: the whole-session anchor goes permanently blind once the day's single HOD
     deeply gives back, but a name often sets a SECOND leg from a higher base and curls

@@ -100,6 +100,8 @@ def detect_vwap_reclaim(
     hold_frac: float = 0.5,
     hod_margin: float = 0.02,
     lookback: int | None = 40,
+    min_r_frac: float = 0.015,
+    min_r_abs: float = 0.02,
     min_bars: int = 21,
 ) -> VwapReclaimSignal:
     """Detect a VWAP-reclaim continuation (first-pullback curl). Pure.
@@ -107,7 +109,14 @@ def detect_vwap_reclaim(
     The impulse leg is anchored to a ROLLING LOCAL-SWING window of `lookback`
     bars (P1), not the day's single HOD -- so it re-arms on each intraday leg.
     Pass lookback=None for the legacy whole-session anchor (used in tests to
-    contrast the two)."""
+    contrast the two).
+
+    PLACEABILITY GATE (P3): the stop is the pullback low, so a shallow pullback
+    yields a sub-tick R that sits INSIDE the spread -- the P2 edge audit found
+    46.5% of fires had R < 1.5% of price (a median $0.05 stop on a $2.62 name),
+    making the backtested +1R/-1R physically unfillable and the setup negative
+    after cost. Reject any fire with R = (entry - pullback_low) < max(min_r_abs,
+    min_r_frac * entry). Set min_r_frac=0, min_r_abs=0 to disable (analysis only)."""
     if bars is None or len(bars) < min_bars:
         return VwapReclaimSignal(False, reason=f"need >= {min_bars} bars")
     bars = bars.reset_index(drop=True)
@@ -153,7 +162,9 @@ def detect_vwap_reclaim(
     green = float(ema9.iloc[last]) >= float(ema20.iloc[last])
 
     entry = float(close.iloc[last])
-    rr = ((hod - entry) / (entry - pullback_low)) if entry > pullback_low else 0.0
+    r_abs = entry - pullback_low                           # the stop distance (= 1R)
+    placeable = r_abs >= max(min_r_abs, min_r_frac * entry)
+    rr = ((hod - entry) / r_abs) if r_abs > 0 else 0.0
     vals = {
         "run_pct": round(run / run_low, 4) if run_low > 0 else None,
         "pullback_low": round(pullback_low, 4),
@@ -165,6 +176,7 @@ def detect_vwap_reclaim(
         "macd_hist": round(_macd_hist(close), 5),
         "crossed_vwap_up": bool(crossed_vwap_up),
         "target_rr": round(rr, 2),
+        "r_frac": round(r_abs / entry, 4) if entry > 0 else None,
     }
 
     if not ran:
@@ -177,6 +189,8 @@ def detect_vwap_reclaim(
         return VwapReclaimSignal(False, reason="at/too near HOD (not the curl)", signal_values=vals)
     if not green:
         return VwapReclaimSignal(False, reason="momentum not green (ema9 < ema20)", signal_values=vals)
+    if not placeable:
+        return VwapReclaimSignal(False, reason="stop unplaceable (R inside the spread)", signal_values=vals)
 
     return VwapReclaimSignal(
         True,
