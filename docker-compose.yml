@@ -1,0 +1,137 @@
+# Full local stack for the Momentum System — mirrors the Helm package (deploy/).
+#
+#   docker compose up -d                      # postgres + app loop + dashboard
+#   docker compose --profile monitoring up -d # also start Grafana
+#   docker compose run --rm nightly-tune      # run a scheduled job on demand
+#
+# Config/secrets come from a local .env (copy from .env.example). DATABASE_URL is
+# overridden below to point at the in-network postgres service regardless of what
+# .env says, so the stack is self-contained. Without ALPACA_* keys the loop runs
+# in dry mode (dashboard + DB still work).
+
+services:
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-momentum}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-momentum}
+      POSTGRES_DB: ${POSTGRES_DB:-momentum}
+      # Keep data in a subdir so the volume root doesn't clash with PGDATA init.
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    ports:
+      # Exposed for psql/Grafana-on-host debugging; remove if not needed.
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-momentum} -d ${POSTGRES_DB:-momentum}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # Trading loop WITH the embedded dashboard (the dashboard's approve/reject/exit
+  # endpoints need the in-process TradingExecutionService — see deploy/README.md).
+  app:
+    build: .
+    command: ["python", "run_live_paper.py"]
+    env_file:
+      - path: .env
+        required: false
+    environment: &app-env
+      # Built from the postgres service; overrides any DATABASE_URL in .env.
+      DATABASE_URL: postgresql://${POSTGRES_USER:-momentum}:${POSTGRES_PASSWORD:-momentum}@postgres:5432/${POSTGRES_DB:-momentum}
+      DASHBOARD_HOST: "0.0.0.0"
+      DASHBOARD_PORT: "8010"
+      # Schema auto-creates from storage/pg_schema.sql on first connect.
+      PG_SKIP_SCHEMA: "0"
+    ports:
+      - "8010:8010"
+    volumes:
+      # DuckDB research file, logs, learned_params.json, schwab tokens. Shared
+      # with the job services so nightly-tune's output reaches the loop.
+      - app-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---- Scheduled jobs (the *.sh crontab equivalents). On-demand only: they sit
+  # under the "jobs" profile so `up` doesn't start them. Run with:
+  #   docker compose run --rm journal | eod-replay | nightly-tune
+  # (Use host cron / a scheduler to invoke these on the ET schedule in .env.)
+  journal:
+    build: .
+    profiles: ["jobs"]
+    command: ["python", "momentum_cli.py", "journal"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *app-env
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  eod-replay:
+    build: .
+    profiles: ["jobs"]
+    command: ["python", "eod_replay.py"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *app-env
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  nightly-tune:
+    build: .
+    profiles: ["jobs"]
+    command: ["python", "nightly_tune.py"]
+    env_file:
+      - path: .env
+        required: false
+    environment: *app-env
+    volumes:
+      - app-data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  # ---- Grafana (optional): `docker compose --profile monitoring up -d`
+  grafana:
+    image: grafana/grafana:11.2.0
+    profiles: ["monitoring"]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_MIN_REFRESH_INTERVAL: "2s"
+      # Interpolated into the provisioned datasource (see datasource override).
+      PG_USER: ${POSTGRES_USER:-momentum}
+      PG_PASSWORD: ${POSTGRES_PASSWORD:-momentum}
+      PG_DATABASE: ${POSTGRES_DB:-momentum}
+    ports:
+      - "3000:3000"
+    volumes:
+      # Compose-specific datasource points at the in-network postgres service;
+      # the dashboard + provider are reused from the existing grafana/ dir.
+      - ./deploy/compose/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pg-data:
+  app-data:
+  grafana-data:

@@ -15,6 +15,43 @@ its **PostgreSQL datastore** — inside a single Kubernetes namespace.
 The app loop and the CronJobs run the **same image** (built from the repo
 `Dockerfile`), just with different commands.
 
+## Local development with Docker Compose
+
+For a single-machine stack (same components, no Kubernetes) use the root
+`docker-compose.yml`. It builds the app from the `Dockerfile`, brings up
+PostgreSQL with a persistent volume, and runs the loop with its embedded
+dashboard. Config comes from a local `.env` (optional — without `ALPACA_*` keys
+the loop runs in dry mode; the dashboard and DB still work). `DATABASE_URL` is
+overridden to the in-network `postgres` service, so the stack is self-contained.
+
+```bash
+cp .env.example .env        # optional: add ALPACA_* keys for live data
+
+docker compose up -d --build            # postgres + app loop + dashboard (:8010)
+docker compose logs -f app              # watch the loop
+open http://localhost:8010              # dashboard
+
+docker compose --profile monitoring up -d   # also start Grafana (:3000)
+```
+
+The scheduled jobs sit under the `jobs` profile so they don't auto-start; run
+them on demand (or from host cron / a scheduler on the ET times in `.env`):
+
+```bash
+docker compose run --rm nightly-tune
+docker compose run --rm eod-replay
+docker compose run --rm journal
+```
+
+Postgres credentials default to `momentum`/`momentum`/`momentum`; override with
+`POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` in `.env`. Named volumes
+`pg-data`, `app-data`, and `grafana-data` persist across restarts (the jobs share
+`app-data` with the app so `nightly_tune.py`'s `learned_params.json` reaches the
+loop). The Compose Grafana uses its own datasource override at
+`deploy/compose/grafana/datasources/momentum.yaml` (pointed at the `postgres`
+service); the legacy `grafana/docker-compose.yml` is unrelated and left for
+Grafana-only use against an external DB.
+
 ## Build & publish the image
 
 Pushes to the working branch / `main` / `v*` tags trigger
