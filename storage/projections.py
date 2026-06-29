@@ -791,3 +791,46 @@ def query_catalyst_advisory(store, lookback_hours: int = 8) -> dict:
                 "headline": headline,
             }
     return out
+
+
+def query_trade_analysis(store, for_date: str | None = None) -> dict:
+    """Local-LLM AI trade analysis for the dashboard.
+
+    {analysis_type: {symbol: {decision, confidence, summary, concerns}}} for a
+    session — 'armed'/'weak'/'postmortem' keyed by symbol, 'eod' under ''. Reads
+    ai_trade_analysis_cache directly; never raises, {} on any fault (table absent
+    / analysis never ran) so the dashboard degrades cleanly."""
+    try:
+        if for_date and str(for_date).lower() not in ("live", "today", ""):
+            sess = for_date
+        else:
+            row = store.con.execute(
+                "SELECT MAX(session_date) FROM ai_trade_analysis_cache").fetchone()
+            sess = row[0] if row else None
+        if sess is None:
+            return {}
+        rows = store.con.execute(
+            "SELECT analysis_type, symbol, decision, confidence, summary, concerns "
+            "FROM ai_trade_analysis_cache WHERE session_date = ? "
+            "ORDER BY analyzed_at DESC",
+            [sess],
+        ).fetchall()
+    except Exception:  # noqa: BLE001
+        return {}
+    out: dict[str, dict] = {}
+    for atype, sym, decision, confidence, summary, concerns in rows:
+        bucket = out.setdefault(atype, {})
+        key = (sym or "").upper()
+        if key in bucket:  # newest first -> keep latest per symbol
+            continue
+        try:
+            concerns_list = json.loads(concerns) if concerns else []
+        except (TypeError, ValueError):
+            concerns_list = []
+        bucket[key] = {
+            "decision": decision,
+            "confidence": round(float(confidence), 3) if confidence is not None else None,
+            "summary": summary,
+            "concerns": concerns_list,
+        }
+    return out

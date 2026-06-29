@@ -50,6 +50,11 @@ from research.ingestion.scheduler import Scheduler
 from research.ingestion.watcher_task import ResearchWatchlistProvider
 from research.ingestion.discovery import run_discovery, screen_universe
 from research.ingestion.news_enrichment import enrich_recent_news
+from strategy.evaluation.trade_analysis import (
+    run_closed_trade_analysis,
+    run_session_narrative,
+    run_trade_analysis,
+)
 from config import OllamaConfig
 from research.multi_schema import open_research_db
 from runtime.exit_manager import LiveExitManager
@@ -840,10 +845,32 @@ def main(argv: list[str] | None = None) -> int:
         return (f"enriched={res['enriched']} skipped={res['skipped']} "
                 f"errors={res['errors']}")
 
+    # AI trade analysis — advisory only, OFF the hot path. Reads the in-memory
+    # armed-trigger book + the day's closed trades and writes the local LLM's read
+    # (pursue/avoid verdict, weak-setup diagnosis, post-mortems, EOD note) into
+    # ai_trade_analysis_cache for the dashboard. Gated by ollama.enabled AND the
+    # trade_analysis flag; a context_hash skips unchanged setups so a stable board
+    # doesn't keep hitting the GPU. Degrades to a no-op if Ollama is down.
+    def step_analyze():
+        if not (ollama_cfg.enabled and ollama_cfg.trade_analysis_enabled):
+            return "skipped (disabled)"
+        from storage.projections import query_session_pnl
+        sess = _now_session_date()
+        snap = rt["book"].snapshot()
+        trades = (query_session_pnl(rt["store"], session_id=rt["session_id"]) or {}).get("trades", [])
+        a = run_trade_analysis(rt["research_con"], snap, ollama_cfg, sess)
+        p = run_closed_trade_analysis(rt["research_con"], trades, ollama_cfg, sess)
+        e = run_session_narrative(rt["research_con"], snap, trades, ollama_cfg, sess)
+        return (f"setups={a['analyzed']} postmortem={p['analyzed']} "
+                f"eod={e['analyzed']} (skipped={a['skipped'] + p['skipped'] + e['skipped']})")
+
     scheduler = Scheduler()
     scheduler.add("enrich", step_enrich,
                   float(ollama_cfg.enrichment_interval_seconds),
                   enabled=ollama_cfg.enabled and ollama_cfg.enrichment_enabled)
+    scheduler.add("analyze", step_analyze,
+                  float(ollama_cfg.trade_analysis_interval_seconds),
+                  enabled=ollama_cfg.enabled and ollama_cfg.trade_analysis_enabled)
     scheduler.add("discover", step_discover,
                   float(os.environ.get("DISCOVER_INTERVAL_SECONDS", "300")),
                   enabled=_flag("DISCOVER_ENABLED", "1"))
@@ -869,7 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         for task in scheduler.tasks:
             task.last_run = -10**9
         results = {}
-        for name in ("discover", "ingest", "enrich", "watch", "arm", "sync", "execute", "exits", "eod"):
+        for name in ("discover", "ingest", "enrich", "watch", "arm", "analyze", "sync", "execute", "exits", "eod"):
             for task in scheduler.tasks:
                 if task.name == name and task.enabled:
                     results.update(scheduler_run_one(task))

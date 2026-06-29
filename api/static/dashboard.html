@@ -220,6 +220,14 @@
   .st-weak    .trig-state { color: #7d8590; } .st-weak    .trig-fill { background: #39414d; }
   .st-waiting .trig-state { color: #7d8590; } .st-waiting .trig-fill { background: #30363d; }
   .st-armed.near .trig-bar { box-shadow: 0 0 0 1px #f1c40f55; }
+  /* AI trade-analysis verdict chip + EOD note */
+  .ai-chip { display: inline-block; padding: 0 5px; margin-right: 4px; border-radius: 3px;
+    font: 700 9px var(--mono); text-transform: uppercase; letter-spacing: .3px; vertical-align: middle; }
+  .ai-note { margin: 0 0 9px; padding: 8px 11px; background: #6e40c911; border: 1px solid #6e40c944;
+    border-radius: 6px; font: 500 11px var(--sans); color: var(--text); }
+  .ai-note .ai-note-h { font: 700 9px var(--mono); text-transform: uppercase; letter-spacing: .5px;
+    color: #a371f7; margin-right: 6px; }
+  .ai-note .ai-note-take { color: var(--muted); font-size: 10px; }
   /* intraday equity sparkline */
   .pnl-spark { flex: 1.5 1 200px; }
   .eqspark { margin-top: 2px; } .eqspark svg { display: block; }
@@ -292,6 +300,7 @@
 <main>
   <section class="panel full">
     <h2>Armed Triggers <span id="trig-count" class="count">0</span><span class="hint">live proximity to the opening-range breakout &middot; closest to fire on top</span></h2>
+    <div id="ai-eod-note" class="ai-note" style="display:none"></div>
     <div id="armed-triggers"><span class="empty">No armed gappers — waiting for the open / first bars.</span></div>
   </section>
 
@@ -541,6 +550,29 @@ function renderWatch(ws) {
 // Armed-trigger proximity radar — for each loaded gapper, a bar showing where the
 // LIVE price sits between the stop (left) and the breakout trigger (the marker).
 // The fill grows toward the marker as price nears the break; crossing it = fired.
+// Local-LLM AI verdict chip. ai = {decision, confidence, summary, concerns}.
+const AI_COLORS = { pursue: '#2ea043', avoid: '#f85149', monitor: '#d29922', defer: '#8b949e' };
+function aiChip(ai) {
+  if (!ai || !ai.decision || ai.decision === 'none') return '';
+  const c = AI_COLORS[ai.decision] || '#8b949e';
+  const conf = ai.confidence != null ? ' ' + Math.round(ai.confidence * 100) + '%' : '';
+  const tip = esc((ai.summary || '') +
+    (ai.concerns && ai.concerns.length ? ' — ' + ai.concerns.join('; ') : ''));
+  return '<span class="ai-chip" title="' + tip + '" style="background:' + c +
+    '22;color:' + c + ';border:1px solid ' + c + '55">🤖 ' + esc(ai.decision) + conf + '</span>';
+}
+
+function renderEodNote(ta) {
+  const host = $("ai-eod-note");
+  if (!host) return;
+  const eod = ta && ta.eod && ta.eod[""];
+  if (!eod || !eod.summary) { host.style.display = 'none'; host.innerHTML = ''; return; }
+  const takeaways = (eod.concerns && eod.concerns.length)
+    ? '<div class="ai-note-take">' + eod.concerns.map(esc).join(' &middot; ') + '</div>' : '';
+  host.innerHTML = '<span class="ai-note-h">🤖 AI session note</span>' + esc(eod.summary) + takeaways;
+  host.style.display = '';
+}
+
 const TRIG_ORDER = { fired: 0, filled: 1, armed: 2, weak: 3, waiting: 4 };
 function renderTriggers(tw) {
   const arr = (tw && tw.triggers) || [];
@@ -571,7 +603,7 @@ function renderTriggers(tw) {
       + (hasBar ? '<div class="trig-fill" style="width:' + fill.toFixed(1) + '%"></div><div class="trig-trigline" style="left:' + trigPos.toFixed(1) + '%"></div>' : '')
       + '</div>'
       + '<div class="trig-dist ' + distCls + '">' + distTxt + '</div>'
-      + '<div class="trig-cat">' + (t.catalyst ? esc(t.catalyst) : '') + '</div>'
+      + '<div class="trig-cat">' + aiChip(t.ai) + (t.catalyst ? esc(t.catalyst) : '') + '</div>'
       + '</div>';
   }).join('');
 }
@@ -659,6 +691,7 @@ function render(d) {
   fr.style.color = (rk.data_age_s == null) ? "" : (rk.data_age_s > 180 ? "#ff4d4f" : rk.data_age_s > 90 ? "#f1c40f" : "");
 
   renderTriggers(d.triggers);
+  renderEodNote(d.trade_analysis);
   renderEquity(d.equity_curve);
 
   const accts = d.accounts || [];

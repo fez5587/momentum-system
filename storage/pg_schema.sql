@@ -412,6 +412,27 @@ CREATE INDEX IF NOT EXISTS idx_news_catalyst_cache_symbol
 CREATE INDEX IF NOT EXISTS idx_news_catalyst_cache_enriched
     ON news_catalyst_cache (enriched_at);
 
+-- AI trade analysis (advisory): the local LLM's read of armed/weak setups,
+-- closed trades, and the day's session. One current row per (type, symbol, day);
+-- context_hash lets a pass skip re-calling the model when nothing changed.
+-- analysis_type: 'armed' | 'weak' | 'postmortem' | 'eod'. symbol '' = session-level.
+CREATE TABLE IF NOT EXISTS ai_trade_analysis_cache (
+    analysis_type   VARCHAR,
+    symbol          VARCHAR,
+    session_date    DATE,
+    context_hash    VARCHAR,
+    decision        VARCHAR,        -- 'pursue'|'avoid'|'monitor'|'defer'|'none'
+    confidence      DOUBLE PRECISION,
+    summary         VARCHAR,
+    concerns        VARCHAR,        -- JSON array of strings
+    detail          VARCHAR,        -- JSON blob of the structured input context
+    model           VARCHAR,
+    analyzed_at     TIMESTAMP DEFAULT current_timestamp,
+    PRIMARY KEY (analysis_type, symbol, session_date)
+);
+CREATE INDEX IF NOT EXISTS idx_ai_trade_analysis_session
+    ON ai_trade_analysis_cache (session_date, analysis_type);
+
 CREATE TABLE IF NOT EXISTS telemetry_events (
     id VARCHAR PRIMARY KEY,
     event_type VARCHAR,

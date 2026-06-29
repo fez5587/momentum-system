@@ -169,6 +169,12 @@ class OllamaConfig(BaseModel):
     # Phase 2 score blend (ships OFF; separate from enrichment so turning on the
     # advisory/dashboard does NOT silently change trade scoring).
     catalyst_score_enabled: bool = False
+    # AI trade analysis (advisory layer): armed "pursue?" verdict, weak-setup
+    # diagnosis, closed-trade post-mortems, EOD session narrative. OFF the hot
+    # path, advisory only — never gates a trade. Ships OFF.
+    trade_analysis_enabled: bool = False
+    trade_analysis_interval_seconds: int = 180
+    trade_analysis_batch_limit: int = 8  # max setups analyzed per pass (GPU budget)
 
     @classmethod
     def from_env(cls, env: dict[str, str] | None = None) -> "OllamaConfig":
@@ -209,6 +215,9 @@ class OllamaConfig(BaseModel):
             dilution_veto_enabled=b("NEWS_DILUTION_VETO_ENABLED", False),
             dilution_veto_min_conviction=f("NEWS_DILUTION_VETO_CONVICTION", 0.6),
             catalyst_score_enabled=b("NEWS_CATALYST_SCORE_ENABLED", False),
+            trade_analysis_enabled=b("TRADE_ANALYSIS_ENABLED", False),
+            trade_analysis_interval_seconds=i("TRADE_ANALYSIS_INTERVAL_SECONDS", 180),
+            trade_analysis_batch_limit=i("TRADE_ANALYSIS_BATCH_LIMIT", 8),
         )
 
 

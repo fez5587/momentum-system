@@ -42,6 +42,7 @@ from storage.projections import (
     query_order_lifecycle_snapshot,
     query_ready_signals_snapshot,
     query_risk_state,
+    query_trade_analysis,
     query_session_pnl,
     query_session_summary,
     query_symbol_criteria,
@@ -104,11 +105,26 @@ class DashboardState:
                 # Local-LLM catalyst advisory (live only). {} when enrichment has
                 # never run, so the dashboard simply shows no catalyst column.
                 catalyst = query_catalyst_advisory(store) if is_live else {}
+                # Local-LLM AI trade analysis (armed/weak verdict, post-mortems,
+                # EOD note). Works live and for a past session; {} until it runs.
+                trade_analysis = query_trade_analysis(store, for_date=for_date)
+                armed_verdicts = trade_analysis.get("armed", {})
+                weak_verdicts = trade_analysis.get("weak", {})
                 approval_queue = query_approval_queue(store) if is_live else []
                 for row in approval_queue:  # attach advisory for the human approver
-                    adv = catalyst.get(str(row.get("symbol") or "").upper())
+                    sym = str(row.get("symbol") or "").upper()
+                    adv = catalyst.get(sym)
                     if adv:
                         row["catalyst"] = adv
+                    verdict = armed_verdicts.get(sym) or weak_verdicts.get(sym)
+                    if verdict:
+                        row["ai"] = verdict
+                triggers = query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0}
+                for trow in triggers.get("triggers", []):  # attach AI verdict per armed name
+                    sym = str(trow.get("symbol") or "").upper()
+                    verdict = armed_verdicts.get(sym) or weak_verdicts.get(sym)
+                    if verdict:
+                        trow["ai"] = verdict
                 return {
                     "generated_at": datetime.now(timezone.utc).isoformat(),
                     "execution_mode": self.execution_mode,
@@ -117,9 +133,10 @@ class DashboardState:
                     "available_dates": _available_dates(store),
                     "pnl": query_session_pnl(store, for_date=for_date),
                     "risk": query_risk_state(store, for_date=for_date),
-                    "triggers": query_armed_triggers(store) if is_live else {"triggers": [], "armed": 0},
+                    "triggers": triggers,
                     "equity_curve": query_equity_curve(store, for_date=for_date),
                     "catalyst": catalyst,
+                    "trade_analysis": trade_analysis,
                     "approval_queue": approval_queue,
                     "ready_signals": query_ready_signals_snapshot(store) if is_live else [],
                     # watch_states is a LIVE concept (and the heaviest projection
