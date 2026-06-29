@@ -44,6 +44,24 @@ P0 REAL-DATA FINDING (2026-06-29, RTH minute bars):
   takes). P1 FIX: anchor to a ROLLING local-swing window, not the day's one HOD.
   (Do NOT widen hold_frac to force MIMI/UPC green -- that's fitting n=4 noise; the
   generalizing fix is the local anchor, validated later on many shadow signals.)
+
+P1 (2026-06-29): the impulse leg is now anchored to a rolling `lookback` window
+(default 40 bars), not the day's single HOD, so the detector re-arms on each intraday
+leg. test_local_anchor_rearms_after_higher_leg_gave_back proves the property: when an
+earlier, HIGHER leg deeply gives back (which permanently blocks the whole-session
+anchor on "broke the hold"), the local anchor still fires on a later leg curling off a
+higher-low base, targeting that leg's local high rather than the stale day HOD.
+
+P1 FINDING -- the P0 premise was WRONG, and ground-truthing the raw bars caught it:
+MIMI and UPC do NOT have an RTH VWAP-reclaim setup. Both spiked in the PRE-MARKET
+(MIMI 2.93->4.98, UPC 8.54->17.89) and their RTH was a one-way FADE below VWAP (MIMI
+4.09->3.15 under VWAP all day; UPC popped at the open then made lower highs and lost
+VWAP by 14:17). So 0 RTH fires is CORRECT, not blindness -- there is no long curl to
+catch; if the trader profited it was a pre-market play or a SHORT of the fade, neither
+of which a long-only RTH detector should ever fire on. The detector fires precisely on
+the names that DO curl in RTH (SDOT 6/26 trending 10->22, FCUV 6/25). Lesson (same as
+the ignition/PLSM finding): when the move is pre-market, the RTH detector should stay
+silent. Params left at principled defaults; calibration deferred to P2/P3 shadow.
 """
 
 from __future__ import annotations
@@ -81,9 +99,15 @@ def detect_vwap_reclaim(
     min_run_pct: float = 0.10,
     hold_frac: float = 0.5,
     hod_margin: float = 0.02,
+    lookback: int | None = 40,
     min_bars: int = 21,
 ) -> VwapReclaimSignal:
-    """Detect a VWAP-reclaim continuation (first-pullback curl). Pure."""
+    """Detect a VWAP-reclaim continuation (first-pullback curl). Pure.
+
+    The impulse leg is anchored to a ROLLING LOCAL-SWING window of `lookback`
+    bars (P1), not the day's single HOD -- so it re-arms on each intraday leg.
+    Pass lookback=None for the legacy whole-session anchor (used in tests to
+    contrast the two)."""
     if bars is None or len(bars) < min_bars:
         return VwapReclaimSignal(False, reason=f"need >= {min_bars} bars")
     bars = bars.reset_index(drop=True)
@@ -95,18 +119,25 @@ def detect_vwap_reclaim(
     ema20 = calculate_ema(close, 20)
     last = len(bars) - 1
 
-    hod = float(high.max())
-    hod_idx = int(high.idxmax())
-    # a pullback (and a curl bar) must exist AFTER the HOD -- else we're at/near the
-    # top, which is exactly the spike-top entry we must avoid.
-    if hod_idx > last - 2:
-        return VwapReclaimSignal(False, reason="at/near HOD (no pullback to curl from)")
+    # P1: anchor the impulse to a ROLLING LOCAL-SWING window, not the day's one HOD.
+    # Search the leg high over [win_start, last-2] so >=2 bars remain for a pullback
+    # and a curl. This re-arms on each intraday leg (the trader's "first pullback off
+    # each leg"), curing the spike->HOD->fade blindness the whole-session anchor had:
+    # once a name topped and faded, a session-absolute base made every later bar read
+    # as "pullback broke the hold" forever (held_frac went negative). A local base
+    # measures the pullback against the leg it actually came from.
+    win_start = max(0, last - lookback + 1) if lookback else 0
+    leg_search = high.iloc[win_start:last - 1]             # excludes the last 2 bars
+    if leg_search.empty:
+        return VwapReclaimSignal(False, reason="window too small for a leg + curl")
+    hod = float(leg_search.max())                          # the LOCAL leg high
+    hod_idx = int(leg_search.idxmax())
 
-    run_low = float(low.iloc[:hod_idx + 1].min())          # base the impulse ran from
+    run_low = float(low.iloc[win_start:hod_idx + 1].min())  # local base the leg ran from
     run = hod - run_low
     ran = run_low > 0 and run / run_low >= min_run_pct
-    pb_low_idx = int(low.iloc[hod_idx + 1:].idxmin())      # the pullback bottom
-    pullback_low = float(low.iloc[pb_low_idx])             # low after the HOD
+    pb_low_idx = int(low.iloc[hod_idx + 1:].idxmin())      # the pullback bottom (after the leg high)
+    pullback_low = float(low.iloc[pb_low_idx])
     held = run > 0 and pullback_low >= run_low + hold_frac * run
 
     # the curl: the latest bar makes a fresh high SINCE THE PULLBACK LOW (the curl

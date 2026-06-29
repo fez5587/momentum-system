@@ -69,3 +69,20 @@ def test_target_rr_and_macd_tag_logged():
     r = detect_vwap_reclaim(CLEAN)
     assert "target_rr" in r.signal_values and "macd_hist" in r.signal_values
     assert r.signal_values["target_rr"] > 0                      # HOD is above the entry
+
+
+def test_local_anchor_rearms_after_higher_leg_gave_back():
+    """P1: the whole-session anchor goes permanently blind once the day's single HOD
+    deeply gives back, but a name often sets a SECOND leg from a higher base and curls
+    off it. leg1 spikes to 7 (low vol so VWAP isn't dragged up) then gives most of it
+    back; leg2 runs 4.5->5.8 and curls off a higher-low pullback. Global anchor: the
+    leg1 give-back reads as 'broke the hold' forever. Local anchor: re-arms on leg2."""
+    data = (_seg(4.0, 7.0, 12, 3000) + _seg(7.0, 4.5, 10, 3000) + _seg(4.5, 5.8, 10, 15000)
+            + _seg(5.8, 5.3, 6, 9000) + _seg(5.3, 5.6, 8, 14000))
+    df = _df(data)
+    g = detect_vwap_reclaim(df, lookback=None)                   # legacy whole-session anchor
+    l = detect_vwap_reclaim(df, lookback=25)                     # local-swing anchor
+    assert not g.is_valid and "hold" in (g.reason or "").lower()  # blocked by leg1's give-back
+    assert l.is_valid and l.reason == "vwap_reclaim"             # re-armed on leg2
+    assert l.target_level < 6.0                                  # targets leg2's local high, not the 7.0 HOD
+    assert l.signal_values["pullback_held_frac"] >= 0.5          # the higher low held locally
