@@ -329,6 +329,22 @@ class AlpacaPaperClient:
             trades.update(payload.get("trades") or {})
         return trades
 
+    def get_latest_quotes(self, symbols: list[str]) -> dict[str, dict]:
+        """Latest NBBO quote per symbol (bid/ask). Mirrors ``get_latest_trades``;
+        each quote dict carries Alpaca's raw keys — ``bp``/``ap`` (bid/ask price)
+        and ``bs``/``as`` (sizes). On the free IEX feed quotes are thinner than
+        SIP, so a symbol may be absent; callers must treat a missing entry as
+        "unknown spread", not a tight one."""
+        quotes: dict[str, dict] = {}
+        for chunk in self._chunked(symbols, 100):
+            payload = self._data(
+                "GET",
+                "/v2/stocks/quotes/latest",
+                params={"symbols": ",".join(chunk), "feed": self.settings.feed},
+            )
+            quotes.update(payload.get("quotes") or {})
+        return quotes
+
     def get_most_actives(self, top: int = 20, by: str = "volume") -> list[dict]:
         payload = self._data(
             "GET",

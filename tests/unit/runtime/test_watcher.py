@@ -124,6 +124,40 @@ def test_none_catalyst_provider_is_unchanged(store, provider):
         store2.close()
 
 
+def _criteria_spread(store, symbol="GOOD"):
+    import json
+    events = store.query_events(event_type="criteria_evaluated", symbol=symbol)
+    assert events, "expected a criteria_evaluated event"
+    payload = json.loads(events[-1]["payload_json"])
+    return payload["payload"]["spread_pct"]
+
+
+def test_spread_provider_logged_observe_only(store, provider):
+    # a spread provider attaches spread_pct to the evaluation/ready events but
+    # must NOT change the ready/blocked outcome (observe-only).
+    watcher = Watcher(
+        store, provider,
+        WatcherConfig(session_id="ts", mode=EventMode.PAPER, min_quality=0.0),
+        spread_provider=lambda sym: 0.012 if sym == "GOOD" else None,
+    )
+    result = watcher.tick(SESSION_DATE)
+    # outcome identical to the no-provider baseline
+    assert "GOOD" in result.ready and "FADE" in result.blocked
+    # and the metric is carried onto the events
+    assert _criteria_spread(store, "GOOD") == 0.012
+    import json
+    ev = store.query_events(event_type="signal_ready", symbol="GOOD")
+    p = json.loads(ev[-1]["payload_json"])
+    sig = p.get("signal_data") or p.get("payload", {}).get("signal_data")
+    assert sig["spread_pct"] == 0.012
+
+
+def test_no_spread_provider_logs_none(store, provider):
+    # default (no provider) -> spread_pct logs as None, matching prior behavior
+    make_watcher(store, provider).tick(SESSION_DATE)
+    assert _criteria_spread(store, "GOOD") is None
+
+
 def test_signal_ready_debounced_across_ticks(store, provider):
     watcher = make_watcher(store, provider)
     watcher.tick(SESSION_DATE)

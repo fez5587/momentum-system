@@ -238,6 +238,36 @@ def build_runtime(args: argparse.Namespace) -> dict:
         from research.ingestion.news_enrichment import catalyst_score
         return catalyst_score(catalyst_provider(symbol))
 
+    # Decision-time bid/ask spread provider (observe-only). One per-symbol quote,
+    # TTL-cached so a watch pass doesn't re-fetch, mapped to spread_pct. Returns
+    # None on any fault / missing quote / when disabled, so the watcher logs the
+    # metric without ever blocking or breaking on a quote blip. Default ON when a
+    # client exists; set SPREAD_PCT_ENABLED=0 to silence the extra quote calls.
+    _spread_cache: dict[str, tuple[float, float | None]] = {}
+    _SPREAD_TTL = 15.0
+
+    def _spread_enabled() -> bool:
+        return os.environ.get("SPREAD_PCT_ENABLED", "1").strip().lower() in {
+            "1", "true", "yes", "on"}
+
+    def spread_provider(symbol: str):
+        if client is None or not _spread_enabled():
+            return None
+        import time as _time
+        from strategy.evaluation.liquidity import compute_spread_pct
+        now = _time.monotonic()
+        hit = _spread_cache.get(symbol)
+        if hit is not None and (now - hit[0]) < _SPREAD_TTL:
+            return hit[1]
+        val = None
+        try:
+            quote = (client.get_latest_quotes([symbol]) or {}).get(symbol) or {}
+            val = compute_spread_pct(quote.get("bp"), quote.get("ap"))
+        except Exception:  # noqa: BLE001
+            val = None
+        _spread_cache[symbol] = (now, val)
+        return val
+
     watcher = Watcher(
         store,
         ResearchWatchlistProvider(
@@ -258,6 +288,7 @@ def build_runtime(args: argparse.Namespace) -> dict:
         catalyst_score_provider=(
             catalyst_score_provider if ollama_cfg.catalyst_score_enabled else None
         ),
+        spread_provider=spread_provider,
     )
 
     exec_settings = ExecutionSettings.from_env()
