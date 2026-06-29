@@ -81,6 +81,7 @@ class Watcher:
         provider: WatchlistProvider,
         config: WatcherConfig | None = None,
         catalyst_score_provider: Callable[[str], float | None] | None = None,
+        spread_provider: Callable[[str], float | None] | None = None,
     ):
         self.store = store
         self.provider = provider
@@ -88,6 +89,11 @@ class Watcher:
         # optional symbol -> 0..1 catalyst score (or None). Injected so the pure
         # evaluator stays DB-free; None provider == today's behavior exactly.
         self.catalyst_score_provider = catalyst_score_provider
+        # optional symbol -> decision-time bid/ask spread fraction (or None).
+        # Observe-only: it is logged onto the evaluation/ready events but does NOT
+        # gate. None provider == today's behavior exactly (spread_pct logs as None,
+        # matching the always-null minute_bars.spread_pct column).
+        self.spread_provider = spread_provider
         if not self.config.session_id:
             self.config.session_id = f"session-{date.today().isoformat()}"
         # symbol -> current state for this session
@@ -205,6 +211,16 @@ class Watcher:
                 )
                 result.evaluated += 1
 
+                # Decision-time bid/ask spread (observe-only). Guarded like the
+                # catalyst provider so a quote blip never kills the loop; None
+                # when no provider is injected or the quote is missing/bad.
+                spread_pct = None
+                if self.spread_provider is not None:
+                    try:
+                        spread_pct = self.spread_provider(symbol)
+                    except Exception:  # noqa: BLE001
+                        spread_pct = None
+
                 self.store.emit(
                     CriteriaEvaluatedEvent(
                         timestamp=datetime.now(),
@@ -222,6 +238,7 @@ class Watcher:
                             "detail": evaluation.criteria_detail,
                             "gap_pct": evaluation.gap_pct,
                             "relative_volume": evaluation.relative_volume,
+                            "spread_pct": spread_pct,
                             "status": evaluation.status,
                             "reason": evaluation.reason,
                         },
@@ -235,6 +252,7 @@ class Watcher:
                             "reason": evaluation.reason,
                             "gap_pct": evaluation.gap_pct,
                             "relative_volume": evaluation.relative_volume,
+                            "spread_pct": spread_pct,
                         },
                     )
                 )
@@ -244,6 +262,7 @@ class Watcher:
                     if self._states.get(symbol) != "ready":
                         setup = evaluation.setups[0]
                         self._transition(symbol, "ready", setup["setup_type"])
+                        signal_data = {**setup, "spread_pct": spread_pct}
                         self.store.emit(
                             SignalReadyEvent(
                                 timestamp=datetime.now(),
@@ -257,12 +276,12 @@ class Watcher:
                                 symbol=symbol,
                                 signal_type=setup["setup_type"],
                                 confidence=setup["confidence"],
-                                signal_data=setup,
+                                signal_data=signal_data,
                                 payload={
                                     "symbol": symbol,
                                     "signal_type": setup["setup_type"],
                                     "confidence": setup["confidence"],
-                                    "signal_data": setup,
+                                    "signal_data": signal_data,
                                 },
                             )
                         )
