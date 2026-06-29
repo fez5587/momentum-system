@@ -1,0 +1,71 @@
+"""VWAP-reclaim continuation detector (P0): binary gates on synthetic first-pullbacks.
+
+Pure + deterministic. A real-trader-name regression fixture (MIMI/SDOT) is deferred
+to the P2 nightly scorer over real shadow signals."""
+
+import pandas as pd
+
+from strategy.evaluation.vwap_reclaim import detect_vwap_reclaim
+
+COLS = ["open", "high", "low", "close", "volume"]
+
+
+def _seg(p0, p1, n, vol=10000):
+    """n bars walking linearly from price p0 to p1 (small symmetric wicks)."""
+    rows, span = [], abs(p1 - p0) / n
+    for i in range(n):
+        o = p0 + (p1 - p0) * i / n
+        c = p0 + (p1 - p0) * (i + 1) / n
+        rows.append((o, max(o, c) + span * 0.3 + 0.01, min(o, c) - span * 0.3 - 0.01, c, vol))
+    return rows
+
+
+def _df(rows):
+    return pd.DataFrame(rows, columns=COLS)
+
+
+# impulse 4.0->6.0, pullback 6.0->5.2 (holds 50% of the run, =5.0), curl 5.2->5.7
+# (a new high above the pullback, still below the 6.0 HOD).
+CLEAN = _df(_seg(4.0, 6.0, 18, 12000) + _seg(6.0, 5.2, 8, 8000) + _seg(5.2, 5.7, 14, 11000))
+
+
+def test_clean_vwap_reclaim_fires():
+    r = detect_vwap_reclaim(CLEAN)
+    assert r.is_valid and r.reason == "vwap_reclaim"
+    assert r.target_level == round(CLEAN["high"].max(), 4)        # target = HOD
+    assert 5.0 < r.stop_level < 5.5                               # stop = pullback low
+    assert r.breakout_level < r.target_level                      # entry below HOD (the curl)
+    sv = r.signal_values
+    assert sv["pullback_held_frac"] >= 0.5 and sv["ema9_ge_ema20"]
+    assert sv["dist_from_vwap"] >= 0                              # at/above VWAP
+
+
+def test_at_hod_rejected():
+    # a pure run-up ending at the high -> no pullback to curl from (anti spike-top)
+    r = detect_vwap_reclaim(_df(_seg(4.0, 6.0, 30, 11000)))
+    assert not r.is_valid and "HOD" in (r.reason or "")
+
+
+def test_deep_pullback_rejected():
+    # pullback to 4.7 < the 50% hold level (5.0) -> gave the move back
+    deep = _df(_seg(4.0, 6.0, 18, 12000) + _seg(6.0, 4.7, 8, 8000) + _seg(4.7, 5.4, 14, 11000))
+    r = detect_vwap_reclaim(deep)
+    assert not r.is_valid and "hold" in (r.reason or "").lower()
+
+
+def test_no_impulse_rejected():
+    # flat chop, never ran -> no impulse
+    flat = _df([(4.0, 4.03, 3.97, 4.0, 9000) for _ in range(30)])
+    r = detect_vwap_reclaim(flat)
+    assert not r.is_valid
+
+
+def test_insufficient_bars():
+    r = detect_vwap_reclaim(_df(_seg(4.0, 6.0, 10)))
+    assert not r.is_valid and "need" in (r.reason or "")
+
+
+def test_target_rr_and_macd_tag_logged():
+    r = detect_vwap_reclaim(CLEAN)
+    assert "target_rr" in r.signal_values and "macd_hist" in r.signal_values
+    assert r.signal_values["target_rr"] > 0                      # HOD is above the entry
