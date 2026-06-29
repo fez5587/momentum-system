@@ -52,6 +52,42 @@ def test_classify_headline_happy_path(monkeypatch):
     assert a.is_dilutive is False and a.rationale == "FDA nod"
 
 
+def test_classify_headline_sends_schema_by_default(monkeypatch):
+    captured = {}
+
+    def capture(req, *a, **k):
+        captured["body"] = json.loads(req.data.decode())
+        return _ollama_reply({
+            "catalyst_type": "earnings", "sentiment": 0.5,
+            "conviction": 0.6, "is_dilutive": False, "rationale": "beat",
+        })
+
+    monkeypatch.setattr(ne.urllib.request, "urlopen", capture)
+    ne.classify_headline("QRS beats estimates", tickers="QRS")
+    fmt = captured["body"]["format"]
+    # schema-constrained decoding: format is the JSON schema, enum-locked
+    assert isinstance(fmt, dict)
+    assert fmt["properties"]["catalyst_type"]["enum"] == sorted(ne.CATALYST_TYPES)
+    assert set(fmt["required"]) == {
+        "catalyst_type", "sentiment", "conviction", "is_dilutive", "rationale",
+    }
+
+
+def test_classify_headline_use_schema_false_sends_plain_json(monkeypatch):
+    captured = {}
+
+    def capture(req, *a, **k):
+        captured["body"] = json.loads(req.data.decode())
+        return _ollama_reply({
+            "catalyst_type": "other", "sentiment": 0.0,
+            "conviction": 0.0, "is_dilutive": False, "rationale": "",
+        })
+
+    monkeypatch.setattr(ne.urllib.request, "urlopen", capture)
+    ne.classify_headline("anything", use_schema=False)
+    assert captured["body"]["format"] == "json"
+
+
 def test_classify_headline_network_down_returns_none(monkeypatch):
     def boom(*a, **k):
         raise OSError("connection refused")

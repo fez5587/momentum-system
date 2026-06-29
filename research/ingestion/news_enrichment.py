@@ -41,6 +41,24 @@ CATALYST_TYPES = {
     "none",
 }
 
+# JSON schema handed to Ollama's ``format`` field so the model is constrained at
+# decode time (enum-locked catalyst_type, typed numbers/bool) — far fewer malformed
+# rows than free-form ``"format": "json"``. Built from CATALYST_TYPES so the two
+# never drift. Current Ollama enforces this grammar during generation.
+CATALYST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "catalyst_type": {"type": "string", "enum": sorted(CATALYST_TYPES)},
+        "sentiment": {"type": "number", "minimum": -1.0, "maximum": 1.0},
+        "conviction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+        "is_dilutive": {"type": "boolean"},
+        "rationale": {"type": "string"},
+    },
+    "required": [
+        "catalyst_type", "sentiment", "conviction", "is_dilutive", "rationale",
+    ],
+}
+
 # Cheap stdlib floor for the dilution veto so it still works when Ollama is down.
 # The LLM CONFIRMS dilution; this regex is the safety net, not the primary signal.
 _DILUTIVE_RE = re.compile(
@@ -95,6 +113,20 @@ def build_prompt(headline: str, snippet: str = "", tickers: str = "") -> str:
         '  "is_dilutive": true ONLY for confirmed share dilution (offering, ATM, '
         "registered direct, warrant, shelf takedown), else false\n"
         '  "rationale": one short sentence (max ~200 chars)\n\n'
+        "Examples:\n"
+        'Headline: XYZ Therapeutics Announces $50 Million Registered Direct Offering Priced At-The-Market\n'
+        '{"catalyst_type": "offering_dilution", "sentiment": -0.8, "conviction": 0.9, '
+        '"is_dilutive": true, "rationale": "Registered direct ATM offering dilutes '
+        'shareholders; bearish for the stock."}\n'
+        'Headline: ABC Pharma Receives FDA Approval for Lead Drug Candidate\n'
+        '{"catalyst_type": "fda_approval", "sentiment": 0.9, "conviction": 0.9, '
+        '"is_dilutive": false, "rationale": "FDA approval is a major de-risking '
+        'catalyst; strongly bullish."}\n'
+        'Headline: QRS Inc. Reports Q3 Revenue Up 40%, Beats Analyst Estimates\n'
+        '{"catalyst_type": "earnings", "sentiment": 0.7, "conviction": 0.75, '
+        '"is_dilutive": false, "rationale": "Earnings beat with strong revenue '
+        'growth; bullish."}\n\n'
+        "Now classify this news:\n"
         + ctx
     )
 
@@ -143,11 +175,16 @@ def classify_headline(
     timeout: int = 30,
     temperature: float = 0.3,
     max_tokens: int = 256,
+    use_schema: bool = True,
 ) -> CatalystAnalysis | None:
-    """Ask a local Ollama model to classify a headline. None on any failure."""
+    """Ask a local Ollama model to classify a headline. None on any failure.
+
+    ``use_schema`` (default) constrains decoding with ``CATALYST_SCHEMA``; set it
+    False to fall back to plain ``"format": "json"`` (e.g. older Ollama)."""
     if not (headline or snippet):
         return None
     prompt = build_prompt(headline, snippet, tickers)
+    fmt = CATALYST_SCHEMA if use_schema else "json"
     try:
         req = urllib.request.Request(
             f"{host}/api/generate",
@@ -156,7 +193,7 @@ def classify_headline(
                     "model": model,
                     "prompt": prompt,
                     "stream": False,
-                    "format": "json",
+                    "format": fmt,
                     "options": {
                         "temperature": temperature,
                         "num_predict": max_tokens,
