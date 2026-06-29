@@ -428,8 +428,6 @@
 <div id="naked-banner" class="naked-banner"></div>
 <div class="risk-strip" id="risk-strip">
   <div><span class="label">Risk</span><span id="risk-status" class="rdot">—</span></div>
-  <div><span class="label">Positions</span><b id="risk-pos">—</b></div>
-  <div><span class="label">Gross</span><b id="risk-gross">—</b></div>
   <div><span class="label">Day vs limit</span><b id="risk-day">—</b></div>
   <div><span class="label">Data</span><b id="risk-fresh">—</b></div>
 </div>
@@ -465,7 +463,7 @@
     <div id="ready-signals"></div>
   </details>
 
-  <details class="panel full" id="p-account" open>
+  <details class="panel" id="p-account">
     <summary><h2>Account <span id="acct-count" class="count">0</span></h2></summary>
     <div id="accounts" class="acct-row"><span class="empty">No account snapshot yet — waiting for broker sync.</span></div>
   </details>
@@ -713,9 +711,13 @@ function renderCriteriaGrid(data) {
 }
 
 function renderWatch(ws) {
-  $("ws-count").textContent = ws.length;
+  // hide the score-gate 'blocked' rows (usually 100s of them) — show what's actually
+  // watching/ready first; if everything is blocked, still show some so it's not blank.
+  const relevant = ws.filter(w => w.state !== "blocked");
+  const shown = (relevant.length ? relevant : ws).slice(0, 25);
+  $("ws-count").textContent = shown.length < ws.length ? shown.length + " / " + ws.length : ws.length;
   if (!ws.length) { fill("watch-states", null, "Watcher has not evaluated any symbols yet."); return; }
-  const rows = ws.map(w => {
+  const rows = shown.map(w => {
     const isOpen = expanded.has(w.symbol);
     const main = '<tr class="expandable" onclick="toggleCriteria(\'' + esc(w.symbol) + '\')">' +
       '<td><span class="caret ' + (isOpen ? "open" : "") + '">▶</span> <span class="sym">' + esc(w.symbol) + '</span></td>' +
@@ -846,7 +848,7 @@ function renderCatalystFeed(feed) {
       : 'No catalyst reads yet — the news enrichment loop hasn\'t classified any headlines.') + '</span>';
     return;
   }
-  host.innerHTML = arr.map(r => {
+  host.innerHTML = arr.slice(0, 20).map(r => {
     const s = r.sentiment == null ? 0 : +r.sentiment, conv = r.conviction == null ? 0 : +r.conviction;
     const typ = String(r.catalyst_type || 'none').replace(/_/g, ' ');
     let dot, badge = '';
@@ -1045,8 +1047,6 @@ function render(d) {
   const rsEl = $("risk-status");
   rsEl.textContent = (rk.status || "—").toUpperCase();
   rsEl.className = "rdot " + (rk.status || "");
-  $("risk-pos").textContent = (rk.open_positions != null ? rk.open_positions : "—") + " / " + (rk.max_concurrent != null ? rk.max_concurrent : "—");
-  $("risk-gross").textContent = rk.gross_pct != null ? (rk.gross_pct * 100).toFixed(0) + "% / " + (rk.max_gross_pct * 100).toFixed(0) + "%" : "—";
   $("risk-day").textContent = rk.day_pnl_pct != null ? (rk.day_pnl_pct * 100).toFixed(1) + "% / -" + (rk.daily_loss_limit_pct * 100).toFixed(0) + "%" : "—";
   const fr = $("risk-fresh");
   fr.textContent = rk.data_age_s != null ? rk.data_age_s.toFixed(0) + "s" : "—";
@@ -1066,9 +1066,7 @@ function render(d) {
   if (accts.length) {
     $("accounts").innerHTML = accts.map(a =>
       '<div class="metric"><div class="label">' + esc(a.broker_name) + ' &middot; ' + esc(a.account_id) + '</div><div class="value">' + money(a.total_equity != null ? a.total_equity : a.net_liquidating_value) + '</div></div>' +
-      '<div class="metric"><div class="label">Cash</div><div class="value">' + money(a.cash_balance) + '</div></div>' +
-      '<div class="metric"><div class="label">Buying Power</div><div class="value">' + money(a.buying_power) + '</div></div>' +
-      '<div class="metric"><div class="label">Synced</div><div class="value" style="font-size:13px">' + timeOf(a.timestamp) + '</div></div>'
+      '<div class="metric"><div class="label">Cash</div><div class="value">' + money(a.cash_balance) + '</div></div>'
     ).join("");
   } else {
     $("accounts").innerHTML = '<span class="empty">No account snapshot yet — waiting for broker sync.</span>';
@@ -1092,14 +1090,16 @@ function render(d) {
     })
   ), "No pending approvals.");
 
-  const rs = d.ready_signals || [];
+  // top 15 by quality only — rendering all (often 80+) sprays a chart fetch per row and
+  // buries the best setups; "Setup" is dropped (≈every row is opening_range_break).
+  const rsAll = d.ready_signals || [];
+  const rs = rsAll.slice().sort((a, b) => (+b.quality_score || 0) - (+a.quality_score || 0)).slice(0, 15);
   const catMap = d.catalyst || {};
-  $("rs-count").textContent = rs.length;
+  $("rs-count").textContent = rsAll.length > 15 ? "15 / " + rsAll.length : rsAll.length;
   fill("ready-signals", table(
-    ["Symbol", "Chart", "Setup", "Catalyst", "Entry", "Stop", "Qual", "Time"],
+    ["Symbol", "Chart", "Catalyst", "Entry", "Stop", "Qual", "Time"],
     rs.map(s => '<tr><td class="sym">' + esc(s.symbol) + '</td>' +
       '<td class="spark-wrap"><canvas class="spark" data-spark="' + esc(s.symbol) + '" data-entry="' + (s.entry_price != null ? s.entry_price : "") + '" data-stop="' + (s.stop_loss_price != null ? s.stop_loss_price : "") + '"></canvas></td>' +
-      '<td>' + esc(s.signal_type || "—") + '</td>' +
       '<td class="rs-cat">' + (trigCatalyst(catMap[(s.symbol || "").toUpperCase()] || catMap[s.symbol], null) || '<span class="muted">—</span>') + '</td>' +
       '<td class="num">' + fmt(s.entry_price) + '</td>' +
       '<td class="num">' + fmt(s.stop_loss_price) + '</td>' +
@@ -1138,7 +1138,7 @@ function render(d) {
 
   const fills = d.fills || [];
   $("feed-count").textContent = fills.length;
-  fill("feed", fills.length ? fills.map(f => {
+  fill("feed", fills.length ? fills.slice(0, 20).map(f => {
     const color = f.kind === "order_filled" ? "var(--green)" : "var(--accent)";
     const verb = f.kind === "order_filled" ? "FILL" : "SENT";
     return '<div class="feed-row"><span class="feed-dot" style="background:' + color + '"></span>' +
@@ -1149,8 +1149,11 @@ function render(d) {
       '<span>' + esc(f.quantity != null ? f.quantity : "") + ' @ ' + fmt(f.price) + '</span></div>';
   }).join("") : null, "No fills yet this session.");
 
-  const ol = d.order_lifecycle || [];
-  $("ol-count").textContent = ol.length;
+  // show only the ACTIONABLE orders — the raw count (often 1000s incl. rejected/cancelled)
+  // reads as an alarm and the noise buries live orders.
+  const olAll = d.order_lifecycle || [];
+  const ol = olAll.filter(o => o.status !== "rejected" && o.status !== "cancelled");
+  $("ol-count").textContent = olAll.length > ol.length ? ol.length + " / " + olAll.length : ol.length;
   fill("order-lifecycle", table(
     ["Order", "Symbol", "Side", "Qty", "Price", "Status", "Updated"],
     ol.slice(0, 30).map(o => '<tr><td class="num" style="color:var(--muted)">' + esc(String(o.order_id || "").slice(0, 8)) + '</td>' +

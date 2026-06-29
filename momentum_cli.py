@@ -434,9 +434,9 @@ def _heartbeat(ts) -> tuple[str, str]:
         when = ts if isinstance(ts, _dt) else _dt.fromisoformat(str(ts))
         secs = (_dt.now() - when.replace(tzinfo=None)).total_seconds()
     except Exception:  # noqa: BLE001
-        return ("loop signal seen", "green")
+        return ("live", "green")
     color = "green" if secs < 15 else ("yellow" if secs < 45 else "red")
-    return (f"loop {int(secs)}s ago", color)
+    return (f"{int(secs)}s", color)
 
 
 _STATE_STYLE = {
@@ -621,15 +621,31 @@ def _render_board(con):
     trig_rows, snap_ts, armed_n = _triggers_snapshot(con)
     hb_text, hb_color = _heartbeat(snap_ts)
 
-    # --- the 6 armed triggers: the focused, live watchlist ------------------
+    # --- armed triggers: the one action surface. Show every actionable row
+    # (armed/fired/long) uncapped, then at most the top few scanning rows by rvol,
+    # dropping corrupt-data noise (0-volume / absurd-gap rows) that buries the signal.
     tt = Table(box=box.SIMPLE_HEAVY, expand=True,
-               title="armed triggers — the most-promising gappers, ready to fire")
+               title="ARMED TRIGGERS  [dim](· armed  ▶ fired  ◆ long)[/dim]")
     for c, j in (("symbol", "left"), ("state", "left"), ("price", "right"),
                  ("gap", "right"), ("rvol", "right"), ("trigger", "right"),
                  ("→trigger", "right"), ("stop", "right")):
         tt.add_column(c, justify=j, no_wrap=True)
     tt.add_column("catalyst", justify="left", overflow="ellipsis", max_width=34)
-    for r in trig_rows:
+
+    _ACTIONABLE = {"armed", "fired", "filled"}
+
+    def _real_row(r):                       # drop 0-volume / corrupt-gap scanning noise
+        rv, gp = r.get("rvol"), r.get("gap")
+        if not rv:
+            return False
+        return not (isinstance(gp, (int, float)) and abs(gp) > 1000)
+
+    actionable = [r for r in trig_rows if r.get("state") in _ACTIONABLE]
+    scanning = sorted((r for r in trig_rows if r.get("state") not in _ACTIONABLE and _real_row(r)),
+                      key=lambda r: (r.get("rvol") or 0), reverse=True)
+    shown_rows = actionable + scanning[:4]
+    hidden_scan = max(0, len(scanning) - 4)
+    for r in shown_rows:
         style, label = _STATE_STYLE.get(r.get("state"), ("white", r.get("state", "?")))
         price = r.get("price"); trig = r.get("trigger"); dist = r.get("dist")
         stop = r.get("stop"); gap = r.get("gap"); rvol = r.get("rvol")
@@ -647,16 +663,12 @@ def _render_board(con):
             f"{stop:.2f}" if isinstance(stop, (int, float)) else "—",
             f"[cyan]{cat}[/cyan]" if cat else "[dim]—[/dim]",
         )
-    if not trig_rows:
+    if not shown_rows:
         tt.add_row("[dim]—[/dim]", "[dim]waiting for the open / first bars[/dim]",
                    "—", "—", "—", "—", "—", "—", "—")
-
-    sig = con.execute("SELECT timestamp, message FROM events WHERE event_type='signal_ready' "
-                      "ORDER BY timestamp DESC LIMIT 5").fetchall()
-    st = Table(title="ready signals", box=box.SIMPLE)
-    st.add_column("time", style="cyan"); st.add_column("signal", overflow="fold")
-    for ts, m in sig:
-        st.add_row(str(ts)[11:19], m or "")
+    elif hidden_scan:
+        tt.add_row(f"[dim]+{hidden_scan} more[/dim]", "[dim]scanning[/dim]",
+                   "—", "—", "—", "—", "—", "—", "—")
 
     open_unreal = _open_unrealized(con)
     trades, realized = _todays_trades(con)
@@ -665,29 +677,44 @@ def _render_board(con):
         day_pnl = realized + open_unreal
     matched = _matched_realized(day_pnl, open_unreal, realized)
     dcol = "green" if day_pnl >= 0 else "red"
-    pt = Table(title=f"today's trades — day P&L [{dcol}]{day_pnl:+,.0f}[/] "
-                     f"([dim]matched {matched:+,.0f} · open {open_unreal:+,.0f}[/])",
+    # day P&L lives once in the header; the title carries only the unique matched/open split
+    pt = Table(title=f"today's trades  [dim](matched {matched:+,.0f} · open {open_unreal:+,.0f})[/dim]",
                box=box.SIMPLE)
-    for c in ("time", "symbol", "qty", "entry", "exit", "P&L", ""):
-        pt.add_column(c, justify="left" if c in ("symbol", "") else "right")
-    for t in sorted(trades, key=lambda x: x["time"], reverse=True)[:14]:
+    for c in ("time", "symbol", "qty", "entry", "exit", "P&L"):
+        pt.add_column(c, justify="left" if c == "symbol" else "right")
+    # open lots float to the top and are NEVER capped off; closed fill the rest up to 6
+    _tr = sorted(trades, key=lambda x: x["time"], reverse=True)
+    opens = [t for t in _tr if t["pnl"] is None]
+    closed = [t for t in _tr if t["pnl"] is not None]
+    budget = max(0, 6 - len(opens))
+    for t in opens + closed[:budget]:
         pnl = t["pnl"]
-        if pnl is None:
-            pnl_str, tag = "[dim]—[/dim]", "[yellow]● open[/yellow]"
-        else:
-            pnl_str = f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.0f}[/]"
-            tag = "closed"
-        pt.add_row(t["time"], str(t["symbol"]), f"{t['qty']:.0f}", f"{t['entry']:.2f}",
-                   f"{t['exit']:.2f}" if t["exit"] else "—", pnl_str, tag)
+        pnl_str = "[dim]—[/dim]" if pnl is None else f"[{'green' if pnl >= 0 else 'red'}]{pnl:+.0f}[/]"
+        mark = "[yellow]●[/yellow] " if pnl is None else ""
+        pt.add_row(t["time"], f"{mark}{t['symbol']}", f"{t['qty']:.0f}", f"{t['entry']:.2f}",
+                   f"{t['exit']:.2f}" if t["exit"] else "—", pnl_str)
     if not trades:
-        pt.add_row("—", "[dim]no trades today yet[/dim]", "—", "—", "—", "—", "—")
+        pt.add_row("—", "[dim]no trades today yet[/dim]", "—", "—", "—", "—")
+    elif len(closed) > budget:
+        pt.add_row("", f"[dim]+{len(closed) - budget} earlier closed[/dim]", "", "", "", "")
 
+    # risk: collapse consecutive identical fires (e.g. 4× the same naked-stop exit) into
+    # one ×N row, then cap at 3 — a repeating alert must not flood the board.
     risk = con.execute("SELECT timestamp, message FROM events WHERE event_type='risk_rule_triggered' "
-                       "ORDER BY timestamp DESC LIMIT 4").fetchall()
-    rk = Table(title="risk / circuit breaker", box=box.SIMPLE)
+                       "ORDER BY timestamp DESC LIMIT 12").fetchall()
+    rk = Table(title="RISK / CIRCUIT BREAKER  [dim](last 3)[/dim]", box=box.SIMPLE)
     rk.add_column("time", style="cyan"); rk.add_column("rule", overflow="fold")
+    deduped: list = []
     for ts, m in risk:
-        rk.add_row(str(ts)[11:19], m or "")
+        if deduped and deduped[-1][1] == m:
+            deduped[-1][2] += 1
+        else:
+            deduped.append([ts, m, 1])
+    for ts, m, cnt in deduped[:3]:
+        rule = m or ""
+        if cnt > 1:
+            rule += f" [dim]×{cnt}[/dim]"
+        rk.add_row(str(ts)[11:19], rule)
 
     n_eval = len(_latest_eval_board(con))
     # naked/under-protected alarm — the failure that cost us this session and the
@@ -704,12 +731,12 @@ def _render_board(con):
         f"equity [green]{eq}[/green]   "
         f"day P&L [bold {dcol}]{day_pnl:+,.0f}[/]   "
         f"[{hb_color}]♥ {hb_text}[/{hb_color}]   "
-        f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scanning"
-        f"{naked_line}\n"
-        f"[dim]hunting $1–5 gappers (≥ gap% on ≥ 2× volume); buy the break of the "
-        f"opening-range high, stop at its low · Ctrl-C to exit[/dim]",
+        f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scan"
+        f"{naked_line}",
         style="red" if naked else "cyan")
-    return Group(header, tt, st, pt, rk)
+    # order = safety-first: header (protected? green? live?) → armed (about to fire?) →
+    # risk/circuit-breaker (promoted above trades, it's a safety surface) → trades log.
+    return Group(header, tt, rk, pt)
 
 
 @app.command()
