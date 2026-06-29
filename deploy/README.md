@@ -95,3 +95,51 @@ kubectl -n momentum create job --from=cronjob/momentum-nightly-tune tune-test
 - **CronJob `spec.timeZone`** requires Kubernetes ≥ 1.27.
 - The legacy `grafana/docker-compose.yml` is left in place for local use; the
   chart provisions its own Grafana against the in-cluster Postgres.
+
+## Future hardening (roadmap)
+
+The package deploys and runs, but the items below separate "it comes up" from
+"runs reliably for a trading system." They are **not implemented yet** — captured
+here so they can be picked up later. Each notes what, why, and the rough approach.
+
+### Reliability
+
+- **Loop-heartbeat liveness** *(needs an app-code change).* Today `/api/health`
+  (`api/main.py:343`) returns a static `{"ok": true}`, which only proves the
+  dashboard *thread* is alive. The trading loop runs in the main thread
+  (`run_live_paper.py:328`), so a **crashed** loop exits the process and Kubernetes
+  restarts it (fine), but a **hung** loop (stuck network call, deadlock) keeps
+  answering health checks `200` and runs undetected. Approach: have the loop stamp a
+  last-tick timestamp into `DashboardState` each iteration, make `/api/health` (or a
+  new `/healthz`) return `503` when the last tick is older than a threshold, and
+  point the Deployment's `livenessProbe` at it. Highest-value item.
+- **Postgres backup CronJob.** The event store is the source of truth and nothing
+  backs it up. Approach: a chart CronJob running `pg_dump` (postgres image, creds
+  from the Secret) to the app `data` PVC with N-day retention; optionally offload to
+  object storage.
+- **Schema bootstrap hook.** The schema auto-applies on the app's first connection,
+  so a first-run race between the app and a CronJob is possible. Approach: a
+  `pre-install`/`pre-upgrade` Helm-hook Job that applies `storage/pg_schema.sql`
+  deterministically, with `PG_SKIP_SCHEMA=1` set on the app and CronJobs.
+
+### Security
+
+- **Pod hardening.** Add a `securityContext` across workloads: `runAsNonRoot`, drop
+  ALL capabilities, `seccompProfile: RuntimeDefault`, and `readOnlyRootFilesystem`
+  where feasible (the app needs `/app/data` writable — already a mounted volume).
+- **NetworkPolicy.** Default-deny in the namespace; allow only the app, CronJobs, and
+  Grafana to reach Postgres:5432, and restrict who can reach the dashboard.
+- **Grafana auth.** The chart inherits anonymous-admin from the original compose
+  (`templates/grafana.yaml` env). Make it off by default in-cluster, with a real
+  admin password sourced from the Secret (`GF_SECURITY_ADMIN_PASSWORD`).
+
+### CI / operational
+
+- **Chart CI validation.** Add a CI job running `helm lint` + `helm template` +
+  `kubeconform` on every push — catches template/schema errors automatically (the
+  chart could not be rendered in the sandbox where it was authored, since image-blob
+  CDNs were egress-blocked).
+- **Image digest pinning.** For production installs, pin `image` by SHA digest rather
+  than the mutable `latest` tag.
+- **PodDisruptionBudget / singleton guard.** A PDB for the singleton loop plus a
+  guard so it is never scaled above `1` or evicted to zero unexpectedly.
