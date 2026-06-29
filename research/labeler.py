@@ -35,7 +35,9 @@ from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
 from strategy.evaluation.runner_propensity import runner_propensity
 from strategy.evaluation.volume_metrics import calculate_time_of_day_rvol
+from strategy.evaluation.vwap_pullback_entry import find_vwap_pullback_entry
 from strategy.evaluation.vwap_reclaim import detect_vwap_reclaim
+from strategy.exits import ExitConfig, simulate_exit
 
 FEATURE_VERSION = "v1"
 LABEL_VERSION = "v1"
@@ -60,6 +62,17 @@ VR_PROMO_MIN_PRICE = 5.0
 VR_PROMO_IMPULSE_LO = 0.15
 VR_PROMO_IMPULSE_HI = 0.26
 VR_PROMO_BASE_2R = 0.349        # the unconditioned +2R base rate the subset must clear
+
+# No-chase entry shadow-validation (the final mechanic lever). Realistic per-name round-trip
+# cost proxy (minute_bars has no NBBO, so a price-tiered spread/slippage stand-in). PRE-
+# REGISTERED bar locked BEFORE forward data: promote the no-chase VWAP-pullback entry only if
+# its mean PERCENT return (net of this cost) is STRICTLY POSITIVE out-of-sample.
+NOCHASE_COST_SUB3 = 0.04        # sub-$3 microcaps (~55% of the gapper book) — wide spreads
+NOCHASE_COST_OTHER = 0.02       # >=$3 names
+
+
+def _round_trip_cost(price: float) -> float:
+    return NOCHASE_COST_SUB3 if price < 3.0 else NOCHASE_COST_OTHER
 
 
 def _wilson_lower(k: int, n: int, z: float = 1.96) -> float:
@@ -479,6 +492,69 @@ def validate_vwap_reclaim(con, min_r_frac=0.015, min_r_abs=0.02):
           "The bar is locked; only OUT-OF-SAMPLE forward fires can clear it.")
 
 
+def validate_no_chase_entry(con, target_r=2.0):
+    """Final mechanic lever (shadow): does the NO-CHASE VWAP-pullback entry beat the
+    ORB-high breakout in PERCENT return net of a REALISTIC per-name cost? Reuses the live
+    simulate_exit on real forward bars, with the CUMULATIVE session VWAP (calculate_vwap,
+    NOT minute_bars.vwap). PRE-REGISTERED bar: the no-chase entry's mean net% must be
+    STRICTLY POSITIVE (out-of-sample) to promote -- 'less negative than the ORB' is NOT a pass."""
+    cfg = ExitConfig(target_r=target_r)
+    rows = con.execute(
+        "SELECT se.symbol, se.session_date, se.setup_time, se.entry_reference_price, se.invalidation_price "
+        "FROM setup_events se JOIN engineered_features f ON f.id = se.setup_id "
+        "WHERE se.setup_version='v1' AND se.entry_reference_price > 0 AND se.invalidation_price > 0 "
+        "AND COALESCE(f.premarket_gap_pct, f.gap_pct) >= 0.10", []).fetchall()
+    nochase, orb = [], []          # (session_date, net_pct)
+    universe = offered = 0
+    for sym, d, st, hi, lo in rows:
+        bars = con.execute(
+            "SELECT timestamp, open, high, low, close, volume FROM minute_bars "
+            "WHERE symbol=? AND session_date=? AND is_regular_hours ORDER BY timestamp", [sym, d]).fetchall()
+        if len(bars) < 6:
+            continue
+        universe += 1
+        df = pd.DataFrame(bars, columns=["timestamp", "open", "high", "low", "close", "volume"])
+        for cc in ("open", "high", "low", "close", "volume"):
+            df[cc] = df[cc].astype(float)
+        df["vwap"] = calculate_vwap(df).values            # cumulative session VWAP
+        fwd = df[df["timestamp"] > st].reset_index(drop=True)
+        if not len(fwd):
+            continue
+        hi, lo = float(hi), float(lo)
+        if hi > lo:
+            r = simulate_exit(hi, lo, fwd, cfg)
+            orb.append((str(d), r.r_multiple * (hi - lo) / hi - _round_trip_cost(hi)))
+        ent = find_vwap_pullback_entry(fwd)
+        if ent.found and ent.entry_price and ent.stop_price and ent.entry_price > ent.stop_price:
+            offered += 1
+            after = fwd.iloc[ent.entry_idx + 1:].reset_index(drop=True)
+            if len(after):
+                r = simulate_exit(ent.entry_price, ent.stop_price, after, cfg)
+                nc = r.r_multiple * (ent.entry_price - ent.stop_price) / ent.entry_price
+                nochase.append((str(d), nc - _round_trip_cost(ent.entry_price)))
+
+    def mean(xs):
+        return sum(v for _, v in xs) / len(xs) if xs else 0.0
+    nc_mean, orb_mean = mean(nochase), mean(orb)
+    print("=== NO-CHASE ENTRY shadow-validation (v1 gappers, % net of realistic per-name cost) ===")
+    print(f"  cost proxy: {NOCHASE_COST_SUB3*100:.0f}% round-trip sub-$3, {NOCHASE_COST_OTHER*100:.0f}% else (no NBBO in bars)")
+    print(f"  universe {universe} gappers | no-chase entry OFFERED on {offered} "
+          f"({offered/universe*100:.0f}%) | traded {len(nochase)}")
+    print(f"  ORB-high breakout (all gappers)   mean net% {orb_mean*100:+.2f}%")
+    print(f"  NO-CHASE VWAP-pullback (when offered) mean net% {nc_mean*100:+.2f}%  "
+          f"(median {sorted(v for _,v in nochase)[len(nochase)//2]*100:+.2f}%)" if nochase else "")
+    # day-jackknife the no-chase mean (drop each session-day)
+    days = sorted({dd for dd, _ in nochase})
+    jk = [sum(v for dd, v in nochase if dd != x) / max(1, len([1 for dd, _ in nochase if dd != x]))
+          for x in days]
+    if jk:
+        print(f"  no-chase day-jackknife mean net% range: [{min(jk)*100:+.2f}%, {max(jk)*100:+.2f}%] over {len(days)} days")
+    passed = nc_mean > 0
+    print(f"  PRE-REGISTERED BAR (mean net% strictly > 0): [{'PASS' if passed else 'FAIL'}]")
+    print("  NOTE: in-sample over 19 autocorrelated days = a HYPOTHESIS; the bar is locked, only "
+          "OUT-OF-SAMPLE forward fires can clear it. 'Less negative than ORB' is NOT a pass.")
+
+
 def runner_rank_report(con):
     """Measure the cheap-price + premarket-gap SELECTION lever on the v1 ORB labeled set:
     does the runner_propensity tier separate runners (and +1R/+2R) from the base? Shadow
@@ -664,6 +740,7 @@ def main():
     sub.add_parser("report-vr", help="forward outcomes of the vwap_reclaim shadow track")
     sub.add_parser("validate-vr", help="score the pre-registered promotion candidate vs the locked bar")
     sub.add_parser("runner-rank", help="measure the cheap-price + premarket-gap selection lever")
+    sub.add_parser("validate-entry", help="shadow-validate the no-chase VWAP-pullback entry vs the locked bar")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -680,6 +757,8 @@ def main():
         validate_vwap_reclaim(con)
     elif args.cmd == "runner-rank":
         runner_rank_report(con)
+    elif args.cmd == "validate-entry":
+        validate_no_chase_entry(con)
 
 
 if __name__ == "__main__":
