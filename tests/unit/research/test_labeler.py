@@ -4,7 +4,7 @@ from datetime import date, datetime
 
 import pandas as pd
 
-from research.labeler import compute_setup
+from research.labeler import compute_setup, compute_vwap_reclaim_setups
 
 COLS = ["timestamp", "session_date", "is_premarket", "is_regular_hours",
         "is_afterhours", "open", "high", "low", "close", "volume", "vwap"]
@@ -70,3 +70,39 @@ def test_skips_session_without_full_opening_range():
     short = _bars([(0, 1.0, 1.1, 1.0, 1.05), (1, 1.05, 1.1, 1.0, 1.06),
                    (2, 1.06, 1.1, 1.0, 1.04)])
     assert compute_setup("X", D, short, prior_close=1.0, avg_vol=1000, cats={}) is None
+
+
+# --- vwap_reclaim shadow track --------------------------------------------
+
+def _leg(m0, p0, p1, n):
+    """n bars (minute offsets from m0) walking linearly p0->p1 with small wicks."""
+    out, span = [], abs(p1 - p0) / n
+    for i in range(n):
+        o = p0 + (p1 - p0) * i / n
+        c = p0 + (p1 - p0) * (i + 1) / n
+        out.append((m0 + i, o, max(o, c) + span * 0.3 + 0.005, min(o, c) - span * 0.3 - 0.005, c))
+    return out
+
+
+def test_vwap_reclaim_fires_and_labels_a_winner():
+    # impulse 1.00->1.40, pullback to 1.25 (holds), curl 1.25->1.36 (new high, below the
+    # 1.40 leg high), then a continuation to 1.60 -> the forward label should be a +1R win.
+    seq = (_leg(0, 1.00, 1.40, 12) + _leg(12, 1.40, 1.25, 6)
+           + _leg(18, 1.25, 1.36, 6) + _leg(24, 1.36, 1.60, 8))
+    setups = compute_vwap_reclaim_setups("CURL", D, _bars(seq), prior_close=0.80,
+                                         avg_vol=50_000, cats={})
+    assert setups, "detector should fire on the curl"
+    setup, label = setups[0]
+    assert setup["setup_name"] == "vwap_reclaim" and setup["setup_version"] == "vr1"
+    assert 1.25 < setup["entry_reference_price"] < 1.40       # bought the curl, below the leg high
+    assert setup["invalidation_price"] < setup["entry_reference_price"]  # stop = pullback low
+    assert setup["session_minute_number"] > 17               # fired after the pullback
+    assert label["reached_1r_before_minus_1r"] is True       # the continuation paid out
+    assert label["failed_breakout_flag"] is False
+
+
+def test_vwap_reclaim_silent_on_one_way_fade():
+    # a monotone fade below VWAP -> no curl -> no shadow setups (anti falling-knife)
+    fade = _bars(_leg(0, 2.00, 1.20, 26))
+    assert compute_vwap_reclaim_setups("FADE", D, fade, prior_close=2.10,
+                                       avg_vol=50_000, cats={}) == []

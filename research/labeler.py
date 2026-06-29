@@ -34,12 +34,19 @@ from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
 from strategy.evaluation.volume_metrics import calculate_time_of_day_rvol
+from strategy.evaluation.vwap_reclaim import detect_vwap_reclaim
 
 FEATURE_VERSION = "v1"
 LABEL_VERSION = "v1"
 SETUP_VERSION = "v1"
 ORB_BARS = 5
 TARGET_R = 2.0
+
+# vwap_reclaim shadow track (P2): the trader's first-pullback continuation, scored by
+# the SAME forward machinery as the ORB labeler so its base rates are comparable.
+VR_SETUP_VERSION = "vr1"
+VR_NAME = "vwap_reclaim"
+VR_MIN_BARS = 21
 
 _MB_COLS = ["timestamp", "session_date", "is_premarket", "is_regular_hours",
            "is_afterhours", "open", "high", "low", "close", "volume", "vwap"]
@@ -83,6 +90,65 @@ def _catalyst_at(cats: dict, symbol: str, setup_ts) -> tuple:
         return (None, None)
     fresh = (setup_ts - best[0]).total_seconds() / 60.0
     return (best[1], round(fresh, 1))
+
+
+def _forward_labels(rth, setup_ts, entry_ref, invalidation, session_open) -> dict:
+    """Forward-only outcome labels from a decision point. STRICT time split: uses
+    only RTH bars strictly AFTER setup_ts; entry_ref/invalidation define R. Shared by
+    the ORB labeler and the vwap_reclaim shadow track so both are scored identically
+    (no skew). Pessimistic R-outcome: a bar that touches BOTH +R and -1R counts as the
+    stop. held-VWAP uses the EVOLVING cumulative session VWAP, not the per-bar vwap."""
+    R = entry_ref - invalidation
+    fwd = rth[rth["timestamp"] > setup_ts].reset_index(drop=True)
+
+    def _win(n):
+        return fwd[fwd["timestamp"] <= setup_ts + pd.Timedelta(minutes=n)]
+
+    def _max_up(n):
+        w = _win(n)
+        return round((float(w["high"].max()) - entry_ref) / entry_ref, 5) if len(w) else None
+
+    def _max_dd(n):
+        w = _win(n)
+        return round((float(w["low"].min()) - entry_ref) / entry_ref, 5) if len(w) else None
+
+    reached_1r = reached_2r = False
+    for _, b in fwd.iterrows():
+        if float(b["low"]) <= invalidation:
+            break
+        if float(b["high"]) >= entry_ref + 2 * R:
+            reached_2r = reached_1r = True
+        elif float(b["high"]) >= entry_ref + R:
+            reached_1r = True
+
+    rth2 = rth.copy().reset_index(drop=True)
+    rth2["cvwap"] = calculate_vwap(rth2).values
+    fwd_idx = rth2[rth2["timestamp"] > setup_ts]
+
+    def _held_vwap(n):
+        w = fwd_idx[fwd_idx["timestamp"] <= setup_ts + pd.Timedelta(minutes=n)]
+        return bool(len(w) and (w["close"].astype(float) >= w["cvwap"]).all())
+
+    failed = bool((fwd["high"].astype(float) > entry_ref).any()
+                  and (fwd["low"].astype(float) < invalidation).any())
+    session_high = float(rth["high"].max())
+    high_vs_open = (session_high - session_open) / session_open if session_open else 0.0
+    trend_day = bool(high_vs_open >= 0.20)
+
+    t_up = t_dd = None
+    if len(fwd):
+        hi_i = fwd["high"].astype(float).idxmax()
+        lo_i = fwd["low"].astype(float).idxmin()
+        t_up = (fwd.iloc[hi_i]["timestamp"] - setup_ts).total_seconds() / 60.0
+        t_dd = (fwd.iloc[lo_i]["timestamp"] - setup_ts).total_seconds() / 60.0
+
+    return dict(max_upside_next_5m=_max_up(5), max_upside_next_15m=_max_up(15),
+                max_upside_next_60m=_max_up(60), max_drawdown_next_5m=_max_dd(5),
+                max_drawdown_next_15m=_max_dd(15), max_drawdown_next_60m=_max_dd(60),
+                reached_1r_before_minus_1r=reached_1r, reached_2r_before_minus_1r=reached_2r,
+                held_vwap_5m=_held_vwap(5), held_vwap_15m=_held_vwap(15),
+                trend_day_flag=trend_day, failed_breakout_flag=failed,
+                time_to_max_upside_minutes=t_up, time_to_max_drawdown_minutes=t_dd)
 
 
 def build_one(con, symbol, session_date, daily: dict, cats: dict):
@@ -137,52 +203,8 @@ def compute_setup(symbol, session_date, df, prior_close, avg_vol, cats: dict):
     cat_type, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
     above_vwap = bool(vwap is not None and last_close >= vwap)
 
-    # ---- LABELS: only bars strictly AFTER the decision point --------------
-    fwd = rth[rth["timestamp"] > setup_ts].reset_index(drop=True)
-
-    def _win(n):
-        return fwd[fwd["timestamp"] <= setup_ts + pd.Timedelta(minutes=n)]
-
-    def _max_up(n):
-        w = _win(n)
-        return round((float(w["high"].max()) - entry_ref) / entry_ref, 5) if len(w) else None
-
-    def _max_dd(n):
-        w = _win(n)
-        return round((float(w["low"].min()) - entry_ref) / entry_ref, 5) if len(w) else None
-
-    # R-outcome — pessimistic: a bar that touches BOTH counts as the stop.
-    reached_1r = reached_2r = False
-    for _, b in fwd.iterrows():
-        if float(b["low"]) <= invalidation:
-            break
-        if float(b["high"]) >= entry_ref + 2 * R:
-            reached_2r = reached_1r = True
-        elif float(b["high"]) >= entry_ref + R:
-            reached_1r = True
-
-    # held-VWAP over the EVOLVING cumulative session VWAP (not the per-bar vwap)
-    rth2 = rth.copy().reset_index(drop=True)
-    rth2["cvwap"] = calculate_vwap(rth2).values
-    fwd_idx = rth2[rth2["timestamp"] > setup_ts]
-
-    def _held_vwap(n):
-        w = fwd_idx[fwd_idx["timestamp"] <= setup_ts + pd.Timedelta(minutes=n)]
-        return bool(len(w) and (w["close"].astype(float) >= w["cvwap"]).all())
-
-    failed = bool((fwd["high"].astype(float) > entry_ref).any()
-                  and (fwd["low"].astype(float) < invalidation).any())
-    session_high = float(rth["high"].max())
-    high_vs_open = (session_high - session_open) / session_open
-    trend_day = bool(high_vs_open >= 0.20)
-
-    # time-to-max over the forward session
-    t_up = t_dd = None
-    if len(fwd):
-        hi_i = fwd["high"].astype(float).idxmax()
-        lo_i = fwd["low"].astype(float).idxmin()
-        t_up = (fwd.iloc[hi_i]["timestamp"] - setup_ts).total_seconds() / 60.0
-        t_dd = (fwd.iloc[lo_i]["timestamp"] - setup_ts).total_seconds() / 60.0
+    # ---- LABELS: only bars strictly AFTER the decision point (shared helper) --
+    lab = _forward_labels(rth, setup_ts, entry_ref, invalidation, session_open)
 
     sid = f"{symbol}:{session_date}:{SETUP_VERSION}"
     setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
@@ -200,14 +222,7 @@ def compute_setup(symbol, session_date, df, prior_close, avg_vol, cats: dict):
                 vix_level=None,
                 metadata_json=json.dumps({"dq_score": round(dq.score, 3), "dq_grade": dq.grade,
                                           "bar_count_at_setup": len(upto), "R": round(R, 5)}))
-    label = dict(setup_id=sid, label_version=LABEL_VERSION,
-                 max_upside_next_5m=_max_up(5), max_upside_next_15m=_max_up(15),
-                 max_upside_next_60m=_max_up(60), max_drawdown_next_5m=_max_dd(5),
-                 max_drawdown_next_15m=_max_dd(15), max_drawdown_next_60m=_max_dd(60),
-                 reached_1r_before_minus_1r=reached_1r, reached_2r_before_minus_1r=reached_2r,
-                 held_vwap_5m=_held_vwap(5), held_vwap_15m=_held_vwap(15),
-                 trend_day_flag=trend_day, failed_breakout_flag=failed,
-                 time_to_max_upside_minutes=t_up, time_to_max_drawdown_minutes=t_dd)
+    label = dict(setup_id=sid, label_version=LABEL_VERSION, **lab)
     return setup, feat, label
 
 
@@ -247,6 +262,130 @@ def build(con, limit=None, rebuild=False):
     print(f"\nbuilt {built} setups across {len(sessions)} symbol-sessions "
           f"({skipped} skipped: <{ORB_BARS} RTH bars or no range)")
     return built
+
+
+# ----------------------------------------------------------------------------
+# vwap_reclaim shadow track (P2): slide the live detector over history, emit a
+# non-tradeable setup_event on each fire, score it with the SAME forward labels.
+# ----------------------------------------------------------------------------
+
+def compute_vwap_reclaim_setups(symbol, session_date, df, prior_close, avg_vol,
+                                cats: dict, *, cooldown=10) -> list:
+    """0..N shadow vwap_reclaim setups for one session. Slides detect_vwap_reclaim
+    over the RTH bars and emits on each RISING EDGE (not-valid -> valid) with a bar
+    cooldown so one curl episode is one setup. Each emit carries the detector's OWN
+    entry/stop/R; labels come from _forward_labels (no skew). STRICT time split: the
+    detector at bar i sees only bars[:i+1]; labels use only RTH bars after i. PURE."""
+    df = df.copy()
+    df["is_regular_hours"] = df["is_regular_hours"].astype(bool)
+    rth = df[df["is_regular_hours"]].reset_index(drop=True)
+    if len(rth) < VR_MIN_BARS:
+        return []
+    session_open = float(rth.iloc[0]["open"])
+    if session_open <= 0:
+        return []
+    out, prev_fire, last_emit = [], False, -10 ** 9
+    for i in range(VR_MIN_BARS - 1, len(rth)):
+        sig = detect_vwap_reclaim(rth.iloc[:i + 1])
+        firing = sig.is_valid
+        rising = firing and not prev_fire and (i - last_emit) >= cooldown
+        prev_fire = firing
+        if not rising:
+            continue
+        entry_ref = float(sig.breakout_level)
+        invalidation = float(sig.stop_level)
+        if entry_ref <= invalidation:
+            continue
+        last_emit = i
+        setup_ts = rth.iloc[i]["timestamp"]
+        sv = sig.signal_values
+        vwap_at = round(entry_ref - float(sv.get("dist_from_vwap") or 0.0), 5)
+        _, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
+        sid = f"{symbol}:{session_date}:{pd.Timestamp(setup_ts).strftime('%H%M')}:{VR_SETUP_VERSION}"
+        setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
+                     setup_name=VR_NAME, setup_version=VR_SETUP_VERSION,
+                     entry_reference_price=entry_ref, invalidation_price=invalidation,
+                     target_r_multiple=round(float(sv.get("target_rr") or 0.0), 2),
+                     impulse_pct=sv.get("run_pct"), pullback_low=invalidation,
+                     pullback_depth_pct=sv.get("pullback_held_frac"),
+                     above_vwap_flag=True, vwap_at_trigger=vwap_at,
+                     catalyst_freshness_at_trigger=cat_fresh, session_minute_number=i + 1)
+        lab = _forward_labels(rth, setup_ts, entry_ref, invalidation, session_open)
+        out.append((setup, dict(setup_id=sid, label_version=LABEL_VERSION, **lab)))
+    return out
+
+
+def build_vwap_reclaim(con, limit=None, rebuild=False, cooldown=10):
+    if rebuild:
+        con.execute("DELETE FROM outcome_labels WHERE setup_id IN "
+                    "(SELECT setup_id FROM setup_events WHERE setup_version=?)", [VR_SETUP_VERSION])
+        con.execute("DELETE FROM setup_events WHERE setup_version=?", [VR_SETUP_VERSION])
+    daily = _preload_daily(con)
+    cats = _preload_catalysts(con)
+    sessions = con.execute(
+        "SELECT DISTINCT symbol, session_date FROM minute_bars ORDER BY session_date, symbol"
+        + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
+    built = sess_with = 0
+    for sym, d in sessions:
+        rows = con.execute(
+            f"SELECT {', '.join(_MB_COLS)} FROM minute_bars WHERE symbol=? AND session_date=? "
+            "ORDER BY timestamp", [sym, d]).fetchall()
+        if not rows:
+            continue
+        dfb = pd.DataFrame(rows, columns=_MB_COLS)
+        pc, av = daily.get((sym, d), (None, None))
+        try:
+            setups = compute_vwap_reclaim_setups(sym, d, dfb, pc, av, cats, cooldown=cooldown)
+        except Exception as exc:  # noqa: BLE001 — one bad session can't stop the build
+            print(f"  ! {sym} {d}: {exc}")
+            continue
+        if setups:
+            sess_with += 1
+        for setup, label in setups:
+            _insert(con, "setup_events", setup)
+            _insert(con, "outcome_labels", label)
+            built += 1
+    print(f"built {built} vwap_reclaim shadow fires across {sess_with} sessions "
+          f"(of {len(sessions)} symbol-sessions scanned)")
+    return built
+
+
+def report_vwap_reclaim(con):
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?", [VR_SETUP_VERSION]).fetchone()[0]
+    if not n:
+        print("No vwap_reclaim setups — run `build-vr` first.")
+        return
+    days, syms = con.execute(
+        "SELECT count(DISTINCT session_date), count(DISTINCT symbol) FROM setup_events "
+        "WHERE setup_version=?", [VR_SETUP_VERSION]).fetchone()
+    print(f"=== vwap_reclaim shadow report ({n} fires, {syms} symbols, {days} session-days) ===")
+    row = con.execute(
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.reached_2r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.failed_breakout_flag THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.held_vwap_15m THEN 1.0 ELSE 0 END), "
+        "avg(l.max_upside_next_15m), avg(l.max_upside_next_60m), avg(l.max_drawdown_next_15m), "
+        "avg(se.target_r_multiple) "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [VR_SETUP_VERSION]).fetchone()
+    print("\nFORWARD OUTCOMES (from each curl-fire, strict time split):")
+    print(f"  reached +1R before -1R : {row[0]*100:.0f}%")
+    print(f"  reached +2R before -1R : {row[1]*100:.0f}%")
+    print(f"  failed (poke then lose stop): {row[2]*100:.0f}%")
+    print(f"  held VWAP 15m          : {row[3]*100:.0f}%")
+    print(f"  avg max-upside 15m/60m : {(row[4] or 0)*100:.1f}% / {(row[5] or 0)*100:.1f}%")
+    print(f"  avg max-drawdown 15m   : {(row[6] or 0)*100:.1f}%")
+    print(f"  avg detector target R:R (to local high): {row[7] or 0:.1f}")
+    # head-to-head vs the ORB baseline (v1) on the SAME symbol-days, if it's built
+    cmp = con.execute(
+        "WITH vr AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN vr ON vr.symbol = se.symbol AND vr.session_date = se.session_date "
+        "WHERE se.setup_version=?", [VR_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    if cmp and cmp[1]:
+        print(f"\nHEAD-TO-HEAD (same symbol-days): ORB '{SETUP_VERSION}' reached +1R = "
+              f"{(cmp[0] or 0)*100:.0f}% over {cmp[1]} ORB setups (vs the vwap_reclaim {row[0]*100:.0f}% above)")
 
 
 def report(con):
@@ -367,6 +506,10 @@ def main():
     b = sub.add_parser("build"); b.add_argument("--limit", type=int); b.add_argument("--rebuild", action="store_true")
     sub.add_parser("report")
     sub.add_parser("lift")
+    bv = sub.add_parser("build-vr", help="build the vwap_reclaim shadow track")
+    bv.add_argument("--limit", type=int); bv.add_argument("--rebuild", action="store_true")
+    bv.add_argument("--cooldown", type=int, default=10)
+    sub.add_parser("report-vr", help="forward outcomes of the vwap_reclaim shadow track")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -375,6 +518,10 @@ def main():
         report(con)
     elif args.cmd == "lift":
         lift(con)
+    elif args.cmd == "build-vr":
+        build_vwap_reclaim(con, limit=args.limit, rebuild=args.rebuild, cooldown=args.cooldown)
+    elif args.cmd == "report-vr":
+        report_vwap_reclaim(con)
 
 
 if __name__ == "__main__":
