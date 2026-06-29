@@ -33,6 +33,7 @@ from research.multi_schema import open_research_db
 from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
+from strategy.evaluation.runner_propensity import runner_propensity
 from strategy.evaluation.volume_metrics import calculate_time_of_day_rvol
 from strategy.evaluation.vwap_reclaim import detect_vwap_reclaim
 
@@ -478,6 +479,67 @@ def validate_vwap_reclaim(con, min_r_frac=0.015, min_r_abs=0.02):
           "The bar is locked; only OUT-OF-SAMPLE forward fires can clear it.")
 
 
+def runner_rank_report(con):
+    """Measure the cheap-price + premarket-gap SELECTION lever on the v1 ORB labeled set:
+    does the runner_propensity tier separate runners (and +1R/+2R) from the base? Shadow
+    measurement only -- NOT wired into live selection. Heavy small-n caveat (few gappers,
+    autocorrelated days)."""
+    rows = con.execute(
+        "SELECT se.entry_reference_price, f.premarket_gap_pct, f.gap_pct, "
+        "CASE WHEN l.reached_1r_before_minus_1r THEN 1 ELSE 0 END, "
+        "CASE WHEN l.reached_2r_before_minus_1r THEN 1 ELSE 0 END, "
+        "CASE WHEN l.trend_day_flag THEN 1 ELSE 0 END "
+        "FROM setup_events se JOIN engineered_features f ON f.id = se.setup_id "
+        "JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "WHERE se.setup_version=? AND se.entry_reference_price > 0", [SETUP_VERSION]).fetchall()
+    if not rows:
+        print("No v1 labeled setups — run `build` first.")
+        return
+    scored = []
+    for price, pmgap, gap, r1, r2, runner in rows:
+        rp = runner_propensity(float(price),
+                               gap_pct=float(gap) if gap is not None else None,
+                               premarket_gap_pct=float(pmgap) if pmgap is not None else None)
+        scored.append((rp, int(r1), int(r2), int(runner), float(rp.gap_used or 0.0)))
+    gappers = [s for s in scored if s[0].gap_tier >= 1]            # gap >= 10%
+    ng = len(gappers)
+    if not ng:
+        print("No gappers (gap>=10%) in the v1 set."); return
+
+    def rate(rowset, idx):
+        return sum(s[idx] for s in rowset) / len(rowset) if rowset else 0.0
+    base_run, base_r1, base_r2 = rate(gappers, 3), rate(gappers, 1), rate(gappers, 2)
+    print(f"=== runner-propensity SELECTION lever (v1 gappers, gap>=10%, n={ng}) ===")
+    print(f"  base among gappers: runner(+20%) {base_run*100:.0f}% | +1R {base_r1*100:.0f}% | +2R {base_r2*100:.0f}%")
+
+    def bucket(rowset, label):
+        groups: dict = {}
+        for s in rowset:
+            groups.setdefault(label(s[0]), []).append(s)
+        for key in sorted(groups):
+            g = groups[key]
+            lift = (rate(g, 3) / base_run) if base_run else 0
+            print(f"    {key:>16}  runner {rate(g,3)*100:4.0f}%  +1R {rate(g,1)*100:3.0f}%  "
+                  f"+2R {rate(g,2)*100:3.0f}%  n={len(g):3d}  runner-lift {lift:.2f}x")
+
+    print("  by COMBINED tier (gap_tier + price_tier, higher = more runner-prone):")
+    bucket(gappers, lambda rp: f"tier {rp.tier}")
+    print("  by GAP tier alone (the dominant axis):")
+    bucket(gappers, lambda rp: {1: "gap 10-25%", 2: "gap 25-50%", 3: "gap >=50%"}[rp.gap_tier])
+    print("  by PRICE tier alone (secondary co-signal):")
+    bucket(gappers, lambda rp: {0: "price >=$5", 1: "price $2-5", 2: "price <$2"}[rp.price_tier])
+
+    # operational kicker: the live TRIGGER_GAP_MAX (~35%) excludes the strongest gappers
+    excl = [s for s in gappers if s[4] > 0.35]
+    kept = [s for s in gappers if s[4] <= 0.35]
+    if excl:
+        print(f"  GAP-CAP KICKER: the live ~35% gap cap would EXCLUDE {len(excl)} gappers whose runner "
+              f"rate is {rate(excl,3)*100:.0f}% (vs {rate(kept,3)*100:.0f}% for the kept <=35%) -- "
+              f"capping discards the best runners.")
+    print("  CAVEAT: small n, 19 autocorrelated days; gap & price are correlated so the combined tier "
+          "barely beats gap alone. A hypothesis to shadow-confirm forward, not a validated rank.")
+
+
 def report(con):
     n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?", [SETUP_VERSION]).fetchone()[0]
     if not n:
@@ -601,6 +663,7 @@ def main():
     bv.add_argument("--cooldown", type=int, default=10)
     sub.add_parser("report-vr", help="forward outcomes of the vwap_reclaim shadow track")
     sub.add_parser("validate-vr", help="score the pre-registered promotion candidate vs the locked bar")
+    sub.add_parser("runner-rank", help="measure the cheap-price + premarket-gap selection lever")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -615,6 +678,8 @@ def main():
         report_vwap_reclaim(con)
     elif args.cmd == "validate-vr":
         validate_vwap_reclaim(con)
+    elif args.cmd == "runner-rank":
+        runner_rank_report(con)
 
 
 if __name__ == "__main__":
