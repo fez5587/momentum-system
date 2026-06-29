@@ -301,7 +301,10 @@ def compute_vwap_reclaim_setups(symbol, session_date, df, prior_close, avg_vol,
         sv = sig.signal_values
         vwap_at = round(entry_ref - float(sv.get("dist_from_vwap") or 0.0), 5)
         _, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
-        sid = f"{symbol}:{session_date}:{pd.Timestamp(setup_ts).strftime('%H%M')}:{VR_SETUP_VERSION}"
+        # key on the RTH bar INDEX (unique per session) -- NOT the wall-clock minute:
+        # some sessions have sub-minute/irregular timestamps, so two fires a cooldown
+        # apart can share an HH:MM and collide on the primary key.
+        sid = f"{symbol}:{session_date}:b{i}:{VR_SETUP_VERSION}"
         setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
                      setup_name=VR_NAME, setup_version=VR_SETUP_VERSION,
                      entry_reference_price=entry_ref, invalidation_price=invalidation,
