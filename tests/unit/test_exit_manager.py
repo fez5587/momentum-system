@@ -204,6 +204,31 @@ def test_no_trail_attempt_when_market_closed():
     assert broker.replaced == []           # closed -> no trail attempt (no churn)
 
 
+def test_breakeven_position_reanchors_to_opening_range():
+    """A carried breakeven position re-anchors its +0.25R trail to TODAY's opening range
+    (ref = open, R = first-5-bar high-low) and ladders the stop from the open — locking in
+    TIGHTER than the wide entry-based synthetic R would."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "10.6", "qty": "100"}]
+    leg = {"id": "be", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "10.0", "status": "accepted"}
+    broker = _FakeBroker(pos, leg)
+    # opening range (first 5 bars) ~10.0–10.3 (R≈0.3), then runs to 10.6
+    bars = _bars([(10.1, 10.0, 10.05), (10.2, 10.05, 10.15), (10.3, 10.1, 10.25),
+                  (10.25, 10.15, 10.2), (10.3, 10.2, 10.28), (10.5, 10.3, 10.45),
+                  (10.6, 10.45, 10.6)])
+    mgr = LiveExitManager(
+        broker, store, lambda s: bars,
+        cfg=ExitConfig(trail_r_step=0.25, default_trail_r_pct=0.10), session_id="t",
+    )
+    mgr.manage()
+    assert broker.replaced, "should re-anchor + trail from the opening range"
+    new_stop = broker.replaced[-1][1]
+    assert 10.0 < new_stop < 10.6      # above breakeven, below market
+    assert new_stop > 10.25            # tighter than the entry-synthetic R (~10.25) -> OR-anchored
+    assert "AAA" in mgr._open_anchored
+
+
 def test_breakeven_position_frozen_when_disabled():
     """default_trail_r_pct=0 keeps the old behaviour — a breakeven stop is left frozen."""
     store = EventStore(":memory:")

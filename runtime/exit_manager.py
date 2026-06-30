@@ -52,6 +52,7 @@ class LiveExitManager:
         self.mode = mode
         self._tracked: dict[str, _Tracked] = {}
         self._naked_passes: dict[str, int] = {}   # consecutive passes a held position had no live stop
+        self._open_anchored: set[str] = set()     # breakeven carries re-anchored to today's opening range
 
     # -- broker helpers ----------------------------------------------------
 
@@ -174,6 +175,7 @@ class LiveExitManager:
         for sym in list(self._tracked):  # stop tracking closed names
             if sym not in held:
                 self._tracked.pop(sym, None)
+                self._open_anchored.discard(sym)
         if not held:
             return []
         # fetch the orders snapshot ONCE per pass (status="all" is the heavy call;
@@ -279,17 +281,32 @@ class LiveExitManager:
                 # the move since entry, not since we first noticed the position)
                 entry_ts = self._entry_time(sym, orders) or _last_ts(bars)
                 if cur_stop >= entry:
-                    # stop is at/above entry (breakeven already reached on a healthy
-                    # trade, OR the original R was lost — stop stripped/invalid), so there
-                    # is no real risk distance to trail from. Trail on a SYNTHETIC R so the
-                    # step-trail / profit-lock still ratchet the broker stop UP as it rises
-                    # (only ever up, never below the live stop). 0 = leave it frozen.
+                    # stop is at/above entry (breakeven reached, OR the original R was
+                    # lost — stripped/invalid), so there's no real risk distance to trail
+                    # from. RE-ANCHOR the +0.25R ladder to TODAY's opening range (ref =
+                    # the open, R = the OR height) so it tracks today's move, not the stale
+                    # overnight entry. Until the OR forms, trail off a synthetic R off
+                    # entry, then re-anchor. Only ever ratchets UP. 0 = leave it frozen.
                     if not self.cfg.default_trail_r_pct:
                         continue
-                    init = entry * (1.0 - self.cfg.default_trail_r_pct)
-                    self._tracked[sym] = _Tracked(entry, init, entry_ts)
+                    anchor = _open_range_anchor(bars)
+                    if anchor:
+                        ref, init, entry_ts = anchor
+                        self._open_anchored.add(sym)
+                    else:
+                        ref, init = entry, entry * (1.0 - self.cfg.default_trail_r_pct)
+                    self._tracked[sym] = _Tracked(ref, init, entry_ts)
                 else:
                     self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts)
+            elif (sym not in self._open_anchored and cur_stop is not None
+                  and cur_stop >= entry and self.cfg.default_trail_r_pct):
+                # tracked on the synthetic R before the opening range formed — re-anchor
+                # to the OR now that it has (one-shot; the stop only ratchets up).
+                anchor = _open_range_anchor(bars)
+                if anchor:
+                    ref, init, ots = anchor
+                    self._tracked[sym] = _Tracked(ref, init, ots)
+                    self._open_anchored.add(sym)
             tr = self._tracked[sym]
 
             since = _bars_since(bars, tr.entry_ts)
@@ -348,6 +365,27 @@ class LiveExitManager:
                     except Exception as exc:  # noqa: BLE001
                         logger.warning("stop move failed %s: %s", sym, exc)
         return actions
+
+
+def _open_range_anchor(bars: pd.DataFrame, orb_bars: int = 5):
+    """Re-anchor a carried position's +0.25R trail to TODAY's OPENING RANGE: reference =
+    the session open, R = the first ``orb_bars`` bars' high-low. So the step-trail ladders
+    the stop up FROM THE OPEN (tracking today's move) instead of the stale overnight entry.
+    Returns (ref, init_stop, open_ts), or None until the range has formed / if degenerate."""
+    try:
+        if bars is None or len(bars) < orb_bars:
+            return None
+        first = bars.iloc[:orb_bars]
+        hi = float(first["high"].astype(float).max())
+        lo = float(first["low"].astype(float).min())
+        r = hi - lo
+        if r <= 0:
+            return None
+        o = bars.iloc[0]
+        ref = float(o["open"]) if "open" in bars.columns else float(o["close"])
+        return (ref, ref - r, pd.Timestamp(o["timestamp"]))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _last_ts(bars: pd.DataFrame):

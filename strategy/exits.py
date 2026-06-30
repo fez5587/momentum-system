@@ -89,12 +89,11 @@ class ExitConfig:
     # filled bracket's legs can attach first). 0 = off. The preventive complement
     # to the catastrophe stop (which is the -X% backstop).
     enforce_stop_grace_passes: int = 2
-    # When a held position is first seen already protected at BREAKEVEN+ but its
-    # original R is lost (the bracket stop was stripped or invalid — e.g. a fill below
-    # the ORB-low left the stop > entry), there is no real risk distance to trail from,
-    # so the stop would sit frozen at breakeven. Trail it on a SYNTHETIC R of this
-    # fraction of entry instead, so the step-trail / profit-lock ratchet it UP as the
-    # name rises (only ever up, never below the live breakeven stop). 0 = leave frozen.
+    # A held position at BREAKEVEN+ with no real R to trail from (a carried position, or
+    # the bracket stop was stripped/invalid) has its +0.25R trail RE-ANCHORED to today's
+    # opening range by the exit manager. This is the PRE-OPENING-RANGE FALLBACK R (a
+    # fraction of entry) used only until the opening range has formed, so a carry still
+    # ratchets up from the first pass. Only ever ratchets up. 0 = leave the stop frozen.
     default_trail_r_pct: float = 0.10
 
     @classmethod
