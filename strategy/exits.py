@@ -127,7 +127,9 @@ class ExitConfig:
             catastrophe_pct=f("TRADING_CATASTROPHE_STOP_PCT", "0.10"),
             catastrophe_risk_mult=f("TRADING_CATASTROPHE_RISK_MULT", "1.5"),
             enforce_stop_grace_passes=int(f("TRADING_ENFORCE_STOP_GRACE_PASSES", "2")),
-            default_trail_r_pct=f("TRADING_EXIT_DEFAULT_TRAIL_R_PCT", "0.10"),
+            # clamp to [0, 1): a synthetic risk distance must be a positive fraction of
+            # entry below it; >=1 or negative would put the synthetic stop at/above entry.
+            default_trail_r_pct=min(max(f("TRADING_EXIT_DEFAULT_TRAIL_R_PCT", "0.10"), 0.0), 0.95),
         )
 
     def describe(self) -> str:
@@ -152,6 +154,8 @@ class ExitConfig:
             parts.append(f"catastrophe@-{self.catastrophe_pct:.0%}/{self.catastrophe_risk_mult:g}xR")
         if self.enforce_stop_grace_passes:
             parts.append(f"enforce-stop({self.enforce_stop_grace_passes}p)")
+        if self.default_trail_r_pct:
+            parts.append(f"synth-trail {self.default_trail_r_pct:.0%}")
         return ", ".join(parts)
 
 

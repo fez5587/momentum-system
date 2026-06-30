@@ -30,7 +30,6 @@ class _Tracked:
     entry_price: float
     init_stop: float      # original opening-range-low stop (for the R math)
     entry_ts: object      # timestamp we first saw the position (~entry)
-    last_stop: float      # last stop we set at the broker
     scaled: bool = False
 
 
@@ -120,6 +119,10 @@ class LiveExitManager:
         below market when underwater (a sell-stop can't sit above the last price).
         Returns the stop price placed."""
         qty = int(abs(float(p.get("qty") or 0)))
+        if qty < 1:                            # degenerate qty: a 0-qty submit is
+            return round(entry, 2)             # rejected and would churn — bail
+        # cur falsy (price missing / 0 after-hours) falls to the breakeven arm; a stop
+        # at entry is below market when in profit and a safe floor otherwise.
         if cur and cur <= entry:
             pct = self.cfg.catastrophe_pct or 0.10
             stop_px = round(cur * (1 - pct), 2)
@@ -276,16 +279,17 @@ class LiveExitManager:
                 # the move since entry, not since we first noticed the position)
                 entry_ts = self._entry_time(sym, orders) or _last_ts(bars)
                 if cur_stop >= entry:
-                    # already at BREAKEVEN+ with no real R to trail from (the original
-                    # stop was stripped/invalid). Trail on a SYNTHETIC R so the step-trail
-                    # / profit-lock still ratchet the broker stop UP as it rises (only ever
-                    # up, never below the live breakeven stop). 0 = leave it frozen.
+                    # stop is at/above entry (breakeven already reached on a healthy
+                    # trade, OR the original R was lost — stop stripped/invalid), so there
+                    # is no real risk distance to trail from. Trail on a SYNTHETIC R so the
+                    # step-trail / profit-lock still ratchet the broker stop UP as it rises
+                    # (only ever up, never below the live stop). 0 = leave it frozen.
                     if not self.cfg.default_trail_r_pct:
                         continue
                     init = entry * (1.0 - self.cfg.default_trail_r_pct)
-                    self._tracked[sym] = _Tracked(entry, init, entry_ts, cur_stop)
+                    self._tracked[sym] = _Tracked(entry, init, entry_ts)
                 else:
-                    self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts, cur_stop)
+                    self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts)
             tr = self._tracked[sym]
 
             since = _bars_since(bars, tr.entry_ts)
@@ -338,7 +342,6 @@ class LiveExitManager:
                 elif leg_id:
                     try:
                         self.client.replace_order(leg_id, stop_price=round(d.desired_stop, 2))
-                        tr.last_stop = d.desired_stop
                         self._emit(sym, f"stop {sym} {cur_stop:.2f} -> {d.desired_stop:.2f}",
                                    "stop_moved", {"from": cur_stop, "to": d.desired_stop})
                         actions.append(f"{sym} stop->{d.desired_stop:.2f}")

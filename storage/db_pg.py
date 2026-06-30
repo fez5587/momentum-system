@@ -180,6 +180,10 @@ class PgConnection:
 # at a known LAN endpoint, try the configured host first and then the alternate, so the
 # loop self-heals on boot regardless of the current tunnel state (this is the recurring
 # crash-loop landmine). "connection refused" returns instantly, so the fallback is cheap.
+# _LAN_DB_HOSTS is the GATE (superset, incl. localhost): only a DSN pointing at one of
+# these gets host-swapped, so a non-LAN DSN (e.g. a cloud RDS host) is never redirected
+# to the wrong database. _LAN_DB_FALLBACKS is the TRY-ORDER (the two real endpoints).
+# Keep the gate a superset of the fallbacks.
 _LAN_DB_HOSTS = ("127.0.0.1", "localhost", "192.168.1.5")
 _LAN_DB_FALLBACKS = ("192.168.1.5", "127.0.0.1")
 
