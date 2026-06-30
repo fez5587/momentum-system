@@ -162,6 +162,11 @@ class AlpacaPaperClient:
     def get_account(self) -> dict:
         return self._cached("account", lambda: self._trading("GET", "/account"))
 
+    def get_clock(self) -> dict:
+        """Broker market clock: {is_open, next_open, next_close, timestamp}. The
+        authoritative open/closed check (handles weekends, holidays, half-days)."""
+        return self._trading("GET", "/clock")
+
     def get_positions(self, fresh: bool = False) -> list[dict]:
         # fresh=True bypasses the TTL cache — REQUIRED for the naked-stop guard,
         # which must never decide an order is unfilled off a stale snapshot.
@@ -224,6 +229,7 @@ class AlpacaPaperClient:
         order_type: str = "market",
         time_in_force: str = "day",
         limit_price: float | None = None,
+        stop_price: float | None = None,
         stop_loss_price: float | None = None,
         take_profit_price: float | None = None,
         client_order_id: str | None = None,
@@ -238,6 +244,8 @@ class AlpacaPaperClient:
         }
         if limit_price is not None:
             body["limit_price"] = str(round(limit_price, 2))
+        if stop_price is not None:          # standalone stop / stop-limit trigger
+            body["stop_price"] = str(round(stop_price, 2))
         if client_order_id:
             body["client_order_id"] = client_order_id
         if stop_loss_price is not None or take_profit_price is not None:

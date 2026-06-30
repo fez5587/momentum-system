@@ -8,18 +8,29 @@ from strategy.exits import ExitConfig, TRAIL_PRIOR_LOW
 
 
 class _FakeBroker:
-    def __init__(self, positions, stop_leg):
+    def __init__(self, positions, stop_leg, market_open=True):
         self._positions = positions
         self._stop_leg = stop_leg
+        self.market_open = market_open
         self.replaced = []
         self.closed = []
         self.canceled = []
+        self.submitted = []
 
     def get_positions(self):
         return self._positions
 
     def get_orders(self, status="open", limit=200, nested=True, symbols=None):
         return [self._stop_leg]
+
+    def get_clock(self):
+        return {"is_open": self.market_open}
+
+    def submit_order(self, symbol, qty, side="buy", order_type="market",
+                     stop_price=None, time_in_force="day", **kw):
+        self.submitted.append({"symbol": symbol, "qty": qty, "side": side,
+                               "type": order_type, "stop_price": stop_price})
+        return {"id": "s"}
 
     def replace_order(self, order_id, stop_price=None, **kw):
         self.replaced.append((order_id, stop_price))
@@ -93,17 +104,22 @@ def test_flatten_cancels_protective_orders_then_closes():
     assert broker.closed == ["AAA"]                    # then liquidated
 
 
-def test_naked_position_flattened_after_grace():
+class _NakedBroker(_FakeBroker):
+    def get_orders(self, status="open", limit=200, nested=True, symbols=None):
+        # naked until a protective stop is rested, then reflect it (like the real
+        # broker) so the NEXT pass sees the stop and stops re-resting/enforcing.
+        return [{"id": "rested", "symbol": o["symbol"], "type": o["type"],
+                 "side": o["side"], "stop_price": str(o["stop_price"]), "status": "accepted"}
+                for o in self.submitted]
+
+
+def test_naked_position_flattened_after_grace_when_market_open():
     """A held position with NO live protective stop (bracket leg never attached
-    or got stripped) is the NIVF case — flatten it after the grace passes."""
+    or got stripped) is the NIVF case — flatten it after grace WHEN THE MARKET IS OPEN
+    (a market exit can fill)."""
     store = EventStore(":memory:")
     pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "10.1", "qty": "100"}]
-
-    class _NakedBroker(_FakeBroker):
-        def get_orders(self, status="open", limit=200, nested=True, symbols=None):
-            return []   # no protective stop leg at all -> naked
-
-    broker = _NakedBroker(pos, None)
+    broker = _NakedBroker(pos, None, market_open=True)
     mgr = LiveExitManager(
         broker, store, lambda s: _bars([(10.2, 10.0, 10.1)]),
         cfg=ExitConfig(enforce_stop_grace_passes=2, catastrophe_pct=0.10),
@@ -113,6 +129,43 @@ def test_naked_position_flattened_after_grace():
     assert broker.closed == []
     mgr.manage()                         # pass 2: grace reached -> flatten
     assert broker.closed == [("AAA", None)]
+    assert broker.submitted == []        # flattened, not rest-a-stop
+
+
+def test_naked_position_rests_stop_when_market_closed():
+    """When the market is CLOSED a market flatten can't fill (it just churns every
+    pass), so enforcement RESTS a protective stop instead — at breakeven when in
+    profit. The next pass would see the stop and stop enforcing."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "10.4", "qty": "100"}]
+    broker = _NakedBroker(pos, None, market_open=False)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(10.5, 10.3, 10.4)]),
+        cfg=ExitConfig(enforce_stop_grace_passes=2, catastrophe_pct=0.10),
+        session_id="t",
+    )
+    mgr.manage(); mgr.manage()           # grace reached while CLOSED
+    assert broker.closed == []           # NOT flattened (would never fill)
+    assert len(broker.submitted) == 1    # rested a protective stop instead
+    o = broker.submitted[0]
+    assert o["side"] == "sell" and o["type"] == "stop" and o["qty"] == 100
+    assert o["stop_price"] == 10.0       # breakeven (position is in profit)
+
+
+def test_naked_underwater_rests_catastrophe_stop_when_closed():
+    """Closed + naked + UNDERWATER: a sell-stop can't sit above the last price, so
+    enforcement rests it a catastrophe distance BELOW current, not at breakeven."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "9.0", "qty": "100"}]
+    broker = _NakedBroker(pos, None, market_open=False)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(9.1, 8.9, 9.0)]),
+        cfg=ExitConfig(enforce_stop_grace_passes=2, catastrophe_pct=0.10),
+        session_id="t",
+    )
+    mgr.manage(); mgr.manage()
+    assert broker.closed == [] and len(broker.submitted) == 1
+    assert broker.submitted[0]["stop_price"] == 8.1   # 9.0 * (1 - 0.10), below market
 
 
 def test_position_with_stop_not_flattened_as_naked():

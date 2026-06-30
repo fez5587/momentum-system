@@ -97,6 +97,38 @@ class LiveExitManager:
         nested snapshot, reused to avoid a redundant fetch."""
         cancel_protective_and_close(self.client, symbol, orders=orders)
 
+    def _market_open(self) -> bool:
+        """Broker clock — is the regular session open? A market FLATTEN can't fill
+        when closed (it just churns submit/cancel every pass), so the naked-stop
+        enforcement rests a protective stop instead while closed. Falls back to an
+        ET wall-clock check if the clock call fails; assumes OPEN if even that fails
+        (flatten is the safe intraday default)."""
+        try:
+            return bool(self.client.get_clock().get("is_open"))
+        except Exception:  # noqa: BLE001
+            try:
+                from datetime import datetime
+                from zoneinfo import ZoneInfo
+                now = datetime.now(ZoneInfo("America/New_York"))
+                return now.weekday() < 5 and (9, 30) <= (now.hour, now.minute) and now.hour < 16
+            except Exception:  # noqa: BLE001
+                return True
+
+    def _rest_protective_stop(self, symbol: str, p: dict, entry: float, cur: float) -> float:
+        """Place a resting sell-stop on a NAKED long so it survives after-hours and
+        guards the open — at BREAKEVEN when in profit; a catastrophe-distance stop just
+        below market when underwater (a sell-stop can't sit above the last price).
+        Returns the stop price placed."""
+        qty = int(abs(float(p.get("qty") or 0)))
+        if cur and cur <= entry:
+            pct = self.cfg.catastrophe_pct or 0.10
+            stop_px = round(cur * (1 - pct), 2)
+        else:
+            stop_px = round(entry, 2)          # breakeven
+        self.client.submit_order(symbol=symbol, qty=qty, side="sell",
+                                 order_type="stop", stop_price=stop_px, time_in_force="gtc")
+        return stop_px
+
     def _entry_time(self, symbol: str, orders):
         """UTC-naive fill time of the most recent FILLED buy entry for symbol."""
         if orders is None:
@@ -163,15 +195,28 @@ class LiveExitManager:
                                               self.cfg.catastrophe_risk_mult)):
                 loss_pct = (entry - cur) / entry * 100
                 try:
-                    self._flatten(sym, orders)
+                    if self._market_open():
+                        self._flatten(sym, orders)
+                        self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
+                                   f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
+                                   {"price": cur, "entry": entry, "stop": cur_stop})
+                        actions.append(f"{sym} CATASTROPHE-exit @{cur:.2f} (-{loss_pct:.0f}%)")
+                    elif cur_stop is None:
+                        # closed + naked: a market flatten can't fill — rest a protective
+                        # stop below market so it fires at the open instead of churning.
+                        stop_px = self._rest_protective_stop(sym, p, entry, cur)
+                        self._emit(sym, f"CATASTROPHE protect {sym} @{stop_px:.2f} (market "
+                                   f"closed — rested a stop, {loss_pct:.1f}% below entry)",
+                                   "exit_catastrophe", {"price": cur, "entry": entry, "stop": stop_px})
+                        actions.append(f"{sym} CATASTROPHE rest-stop @{stop_px:.2f} (closed)")
+                    else:
+                        # closed but already has a stop — it fires at the open; don't
+                        # market-churn and don't double up the protection.
+                        continue
                     self._tracked.pop(sym, None)
                     self._naked_passes.pop(sym, None)
-                    self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
-                               f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
-                               {"price": cur, "entry": entry, "stop": cur_stop})
-                    actions.append(f"{sym} CATASTROPHE-exit @{cur:.2f} (-{loss_pct:.0f}%)")
                 except Exception as exc:  # noqa: BLE001
-                    logger.warning("catastrophe exit failed %s: %s", sym, exc)
+                    logger.warning("catastrophe enforcement failed %s: %s", sym, exc)
                 continue
 
             # STOP ENFORCEMENT — a held position MUST have a live protective stop.
@@ -185,14 +230,27 @@ class LiveExitManager:
                 self._naked_passes[sym] = n
                 if n >= grace:
                     try:
-                        self._flatten(sym, orders)
+                        if self._market_open():
+                            # session open: a market flatten fills — the safe exit.
+                            self._flatten(sym, orders)
+                            self._emit(sym, f"naked-stop enforced exit {sym} "
+                                       f"(no live stop, {n} passes)", "exit_naked_stop",
+                                       {"passes": n, "price": cur, "entry": entry})
+                            actions.append(f"{sym} naked-stop exit (no live stop)")
+                        else:
+                            # closed: a market sell can't fill (it just churns every
+                            # pass) — REST a protective stop so the position survives
+                            # to the open protected, and the next pass sees the stop
+                            # and stops enforcing.
+                            stop_px = self._rest_protective_stop(sym, p, entry, cur)
+                            self._emit(sym, f"naked-stop PROTECT {sym} @{stop_px:.2f} "
+                                       f"(market closed — rested a stop, {n} passes)",
+                                       "exit_naked_stop", {"passes": n, "stop": stop_px,
+                                                           "entry": entry})
+                            actions.append(f"{sym} rested protective stop @{stop_px:.2f} (closed)")
                         self._tracked.pop(sym, None)
-                        self._emit(sym, f"naked-stop enforced exit {sym} "
-                                   f"(no live stop, {n} passes)", "exit_naked_stop",
-                                   {"passes": n, "price": cur, "entry": entry})
-                        actions.append(f"{sym} naked-stop exit (no live stop)")
                     except Exception as exc:  # noqa: BLE001
-                        logger.warning("naked-stop exit failed %s: %s", sym, exc)
+                        logger.warning("naked-stop enforcement failed %s: %s", sym, exc)
                     self._naked_passes.pop(sym, None)
                 continue  # don't run trail logic on a naked position
             self._naked_passes.pop(sym, None)  # has a live stop
