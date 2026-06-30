@@ -177,6 +177,7 @@ class LiveExitManager:
         # reuse it for every position's stop-leg + entry-time lookups), scoped to
         # the held symbols so a busy day's order volume can't truncate the legs.
         orders = self._all_orders(held.keys())
+        mkt_open = self._market_open()   # once per pass — gates flatten-vs-rest + trailing
 
         actions: list[str] = []
         for sym, p in held.items():
@@ -195,7 +196,7 @@ class LiveExitManager:
                                               self.cfg.catastrophe_risk_mult)):
                 loss_pct = (entry - cur) / entry * 100
                 try:
-                    if self._market_open():
+                    if mkt_open:
                         self._flatten(sym, orders)
                         self._emit(sym, f"CATASTROPHE exit {sym} @~{cur:.4f} "
                                    f"({loss_pct:.1f}% below entry)", "exit_catastrophe",
@@ -230,7 +231,7 @@ class LiveExitManager:
                 self._naked_passes[sym] = n
                 if n >= grace:
                     try:
-                        if self._market_open():
+                        if mkt_open:
                             # session open: a market flatten fills — the safe exit.
                             self._flatten(sym, orders)
                             self._emit(sym, f"naked-stop enforced exit {sym} "
@@ -255,6 +256,13 @@ class LiveExitManager:
                 continue  # don't run trail logic on a naked position
             self._naked_passes.pop(sym, None)  # has a live stop
 
+            # TRAILING runs only while the session is OPEN: after-hours there are no new
+            # highs to trail under, and a resting GTC stop is often not replaceable yet
+            # ("accepted" status -> Alpaca 422 on replace), so attempting it just churns.
+            # The stop stays protective; it ratchets up at the open.
+            if not mkt_open:
+                continue
+
             try:
                 bars = self.bars_fn(sym)
             except Exception:  # noqa: BLE001
@@ -262,12 +270,22 @@ class LiveExitManager:
             if bars is None or len(bars) == 0:
                 continue
             if sym not in self._tracked:
-                if cur_stop is None or cur_stop >= entry:
-                    continue  # protected at breakeven+; broker stop handles it (no trail-from-init)
+                if cur_stop is None:
+                    continue  # naked — handled by the enforcement above
                 # trail from the ACTUAL entry fill time (so high-water/R reflect
                 # the move since entry, not since we first noticed the position)
                 entry_ts = self._entry_time(sym, orders) or _last_ts(bars)
-                self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts, cur_stop)
+                if cur_stop >= entry:
+                    # already at BREAKEVEN+ with no real R to trail from (the original
+                    # stop was stripped/invalid). Trail on a SYNTHETIC R so the step-trail
+                    # / profit-lock still ratchet the broker stop UP as it rises (only ever
+                    # up, never below the live breakeven stop). 0 = leave it frozen.
+                    if not self.cfg.default_trail_r_pct:
+                        continue
+                    init = entry * (1.0 - self.cfg.default_trail_r_pct)
+                    self._tracked[sym] = _Tracked(entry, init, entry_ts, cur_stop)
+                else:
+                    self._tracked[sym] = _Tracked(entry, cur_stop, entry_ts, cur_stop)
             tr = self._tracked[sym]
 
             since = _bars_since(bars, tr.entry_ts)

@@ -168,6 +168,58 @@ def test_naked_underwater_rests_catastrophe_stop_when_closed():
     assert broker.submitted[0]["stop_price"] == 8.1   # 9.0 * (1 - 0.10), below market
 
 
+def test_breakeven_position_trails_up_on_synthetic_r():
+    """A position found already at BREAKEVEN (stop == entry, original R lost) must still
+    trail UP as it rises — on a synthetic R — instead of sitting frozen at breakeven."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "11.0", "qty": "100"}]
+    leg = {"id": "be", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "10.0", "status": "accepted"}    # stop AT entry = breakeven
+    broker = _FakeBroker(pos, leg)
+    bars = _bars([(10.2, 10.0, 10.1), (10.6, 10.2, 10.5), (11.0, 10.6, 11.0)])  # +10%
+    mgr = LiveExitManager(
+        broker, store, lambda s: bars,
+        cfg=ExitConfig(trail_r_step=0.25, breakeven_at_pct=0.05, default_trail_r_pct=0.10),
+        session_id="t",
+    )
+    mgr.manage()
+    assert broker.replaced, "breakeven position should trail up, not freeze"
+    new_stop = broker.replaced[-1][1]
+    assert 10.0 < new_stop < 11.0          # ratcheted ABOVE breakeven, below market
+
+
+def test_no_trail_attempt_when_market_closed():
+    """Trailing runs only while the session is OPEN — after-hours there are no new highs
+    and a resting GTC stop often isn't replaceable, so the manager leaves the stop as-is."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "11.0", "qty": "100"}]
+    leg = {"id": "be", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "10.0", "status": "accepted"}
+    broker = _FakeBroker(pos, leg, market_open=False)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(11.0, 10.6, 11.0)]),
+        cfg=ExitConfig(trail_r_step=0.25, default_trail_r_pct=0.10), session_id="t",
+    )
+    mgr.manage()
+    assert broker.replaced == []           # closed -> no trail attempt (no churn)
+
+
+def test_breakeven_position_frozen_when_disabled():
+    """default_trail_r_pct=0 keeps the old behaviour — a breakeven stop is left frozen."""
+    store = EventStore(":memory:")
+    pos = [{"symbol": "AAA", "avg_entry_price": "10.0", "current_price": "11.0", "qty": "100"}]
+    leg = {"id": "be", "symbol": "AAA", "type": "stop", "side": "sell",
+           "stop_price": "10.0", "status": "accepted"}
+    broker = _FakeBroker(pos, leg)
+    mgr = LiveExitManager(
+        broker, store, lambda s: _bars([(11.0, 10.6, 11.0)]),
+        cfg=ExitConfig(trail_r_step=0.25, default_trail_r_pct=0.0),
+        session_id="t",
+    )
+    mgr.manage()
+    assert broker.replaced == []           # frozen at breakeven
+
+
 def test_position_with_stop_not_flattened_as_naked():
     """A position WITH a live stop must never be naked-flattened."""
     store = EventStore(":memory:")

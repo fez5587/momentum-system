@@ -89,6 +89,13 @@ class ExitConfig:
     # filled bracket's legs can attach first). 0 = off. The preventive complement
     # to the catastrophe stop (which is the -X% backstop).
     enforce_stop_grace_passes: int = 2
+    # When a held position is first seen already protected at BREAKEVEN+ but its
+    # original R is lost (the bracket stop was stripped or invalid — e.g. a fill below
+    # the ORB-low left the stop > entry), there is no real risk distance to trail from,
+    # so the stop would sit frozen at breakeven. Trail it on a SYNTHETIC R of this
+    # fraction of entry instead, so the step-trail / profit-lock ratchet it UP as the
+    # name rises (only ever up, never below the live breakeven stop). 0 = leave frozen.
+    default_trail_r_pct: float = 0.10
 
     @classmethod
     def from_env(cls, env: dict | None = None) -> "ExitConfig":
@@ -120,6 +127,7 @@ class ExitConfig:
             catastrophe_pct=f("TRADING_CATASTROPHE_STOP_PCT", "0.10"),
             catastrophe_risk_mult=f("TRADING_CATASTROPHE_RISK_MULT", "1.5"),
             enforce_stop_grace_passes=int(f("TRADING_ENFORCE_STOP_GRACE_PASSES", "2")),
+            default_trail_r_pct=f("TRADING_EXIT_DEFAULT_TRAIL_R_PCT", "0.10"),
         )
 
     def describe(self) -> str:
