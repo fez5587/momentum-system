@@ -1141,7 +1141,11 @@ class TradingExecutionService:
         )
         # allow the symbol to re-signal later
         self._requested_symbols.discard(entry.get("symbol") or "")
-        return {"ok": True, "order_id": order_id}
+        # Tag the result so callers can tell a rejection apart from a real execution
+        # (both carry ok=True). Without this, process_auto_approvals()'s list counted
+        # cap-rejections as executions, so a tripped daily-entry cap masqueraded as
+        # `auto_executed=1` in the loop log with no matching broker order.
+        return {"ok": True, "order_id": order_id, "rejected": True, "reason": reason}
 
     @_locked
     def process_auto_approvals(self) -> list[dict]:

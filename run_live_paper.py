@@ -573,8 +573,22 @@ def main(argv: list[str] | None = None) -> int:
             return "skipped (no keys)"
         res = rt["execution"].tick()
         backed = len(res.get("backed_out") or [])
+        # `auto` is the raw approve_order() results: a REAL broker submission carries a
+        # broker_order_id; rejections (e.g. the daily-entry cap) are tagged rejected=True.
+        # Count only real submissions as executed, and surface rejections explicitly so a
+        # tripped cap is visible instead of masquerading as auto_executed=1.
+        auto = res.get("auto_executed") or []
+        executed = [r for r in auto if r.get("broker_order_id")]
+        rejected = [r for r in auto if r.get("rejected")]
         line = (f"approvals_requested={res['approvals_requested']} "
-                f"auto_executed={len(res['auto_executed'])}")
+                f"auto_executed={len(executed)}")
+        if rejected:
+            hist: dict[str, int] = {}
+            for r in rejected:
+                k = r.get("reason") or "?"
+                hist[k] = hist.get(k, 0) + 1
+            reasons = ", ".join(f"{k}x{v}" for k, v in sorted(hist.items()))
+            line += f" auto_rejected={len(rejected)} ({reasons})"
         if backed:
             syms = ", ".join(b["symbol"] for b in res["backed_out"])
             line += f" backed_out={backed} ({syms})"

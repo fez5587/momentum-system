@@ -205,6 +205,27 @@ def test_daily_entry_cap_enforced_on_auto_path(store):
     assert json.loads(rejects[0]["payload_json"])["rejection_reason"] == "daily_entry_cap"
 
 
+def test_cap_rejection_distinguishable_from_execution(store):
+    # Log-visibility fix: a cap-rejected auto approval must be tagged rejected=True with
+    # the reason and carry NO broker_order_id, so the loop log counts it as auto_rejected
+    # instead of masquerading as auto_executed=1 with no matching broker order.
+    for sym, e, s in [("AAA", 14.0, 13.45), ("BBB", 8.0, 7.60), ("CCC", 5.0, 4.70)]:
+        emit_signal(store, symbol=sym, entry=e, stop=s)
+    service = make_service(store, FakeExecutor(), auto_approve=True,
+                           max_fresh_entries_per_day=2,
+                           max_concurrent_positions=10, max_orders_per_tick=10)
+    service.request_approvals_for_ready_signals()
+    ids = [q["order_id"] for q in query_approval_queue(store)]
+    results = [service.approve_order(oid, approved_by="auto") for oid in ids]
+    # the exact split run_live_paper.step_execute() uses for the log line
+    executed = [r for r in results if r.get("broker_order_id")]
+    rejected = [r for r in results if r.get("rejected")]
+    assert len(executed) == 2 and len(rejected) == 1     # 2 real submissions, 1 cap-reject
+    assert all(not r.get("rejected") for r in executed)
+    assert rejected[0]["reason"] == "daily_entry_cap"
+    assert "broker_order_id" not in rejected[0]          # no phantom broker order counted
+
+
 def test_daily_cap_never_blocks_manual_approval(store):
     # A human override (approved_by="dashboard") is never capped.
     for sym, e, s in [("AAA", 14.0, 13.45), ("BBB", 8.0, 7.60)]:
