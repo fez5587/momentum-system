@@ -1,0 +1,10 @@
+[Unit]
+Description=Weekday-evening rebuild + re-validate of the premarket (pm1) shadow track
+
+[Timer]
+# after each trading day's premarket data is ingested; Persistent catches missed runs (reboots)
+OnCalendar=Mon-Fri *-*-* 20:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target
