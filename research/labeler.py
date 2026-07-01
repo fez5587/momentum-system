@@ -33,6 +33,7 @@ from research.multi_schema import open_research_db
 from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
+from strategy.evaluation.liquid_breakout import detect_liquid_intraday_breakout
 from strategy.evaluation.runner import detect_leading_gainer_runner
 from strategy.evaluation.runner_quality import calculate_runner_quality
 from strategy.evaluation.runner_propensity import runner_propensity
@@ -86,6 +87,23 @@ RUNNER_PROMO_MIN_1R = 0.50               # (3) +1R-before-(-1R) > 50% (positive 
 RUNNER_PM_EXHAUSTION_FRAC = 0.70         # PM captured > this fraction of the run => "spent"
 # (4) beat vwap_reclaim +1R on the SAME symbol-days, and (5) dropping PM-exhausted fires
 #     must RAISE the +1R rate (else the exhaustion tag earns nothing) — computed in validate.
+
+# liquid intraday-breakout shadow track (liq1): the THESIS-SCOPE lever — catch the LIQUID
+# intraday igniter (MSTR/SSPC-class) the premarket-gapper universe is blind to. Broad candidate
+# definer (~50% of the liquid universe fires), so rvol + dollar-volume are STRATIFICATION levers,
+# not the signal. The whole point is to measure forward: does this population convert to +1R
+# better than the ORB, and does any rvol/liquidity stratum beat it? See thesis-scope memory.
+LIQUID_SETUP_VERSION = "liq1"
+LIQUID_NAME = "liquid_intraday_breakout"
+LIQUID_MIN_BARS = 16                      # detector needs >=16 bars of session history
+LIQUID_MIN_RTH_BARS = 24                  # forward room so outcome labels aren't truncated
+# PRE-REGISTERED promotion bar (locked 2026-07-01, BEFORE forward data). Same null as the last 5
+# levers: separates a population but doesn't convert. To promote off shadow-only, out-of-sample:
+LIQUID_PROMO_MEDIAN_FWDMAX_60M = 0.10     # (1) median max-upside 60m >= +10% (real continuation)
+LIQUID_PROMO_MEDIAN_ADVERSE_60M = -0.06   # (2) median max-drawdown 60m > -6% (survivable stop)
+LIQUID_PROMO_MIN_1R = 0.50                # (3) +1R-before-(-1R) > 50% (positive 1:1 expectancy)
+# (4) beat the ORB v1 +1R on the SAME symbol-days, and (5) the top rvol/liquidity stratum must
+#     clear (3) even if the full population doesn't — computed in validate-liquid.
 
 # No-chase entry shadow-validation (the final mechanic lever). Realistic per-name round-trip
 # cost proxy (minute_bars has no NBBO, so a price-tiered spread/slippage stand-in). PRE-
@@ -775,6 +793,188 @@ def validate_runner(con):
           "not a pass — only OUT-OF-SAMPLE sessions can clear it. Do NOT gate live until cleared.")
 
 
+# ----------------------------------------------------------------------------
+# liquid intraday-breakout shadow track (liq1): slide detect_liquid_intraday_breakout
+# over RTH history, emit a non-tradeable setup on each fresh fire, score with _forward_labels.
+# ----------------------------------------------------------------------------
+
+def compute_liquid_setups(symbol, session_date, df, prior_close, avg_vol,
+                          cats: dict, *, cooldown=10) -> list:
+    """0..N shadow liquid_intraday_breakout setups for one session. Slides the detector over
+    RTH bars (RTH-cumulative VWAP; these are intraday breakouts, not PM gappers), emits on each
+    RISING EDGE with a cooldown. Stores rvol + cumulative dollar-volume as STRATIFICATION
+    features (relative_volume / pullback_volume_ratio). Labels via the SAME _forward_labels
+    (strict RTH time split). PURE."""
+    df = df.copy()
+    df["is_regular_hours"] = df["is_regular_hours"].astype(bool)
+    rth = df[df["is_regular_hours"]].reset_index(drop=True)
+    if len(rth) < LIQUID_MIN_RTH_BARS:
+        return []
+    session_open = float(rth.iloc[0]["open"])
+    if session_open <= 0:
+        return []
+    ohlcv = ["open", "high", "low", "close", "volume"]
+    vwap_full = calculate_vwap(rth).astype(float).to_numpy()   # prefix VWAP, O(n) slide
+    out, prev_fire, last_emit = [], False, -10 ** 9
+    for i in range(LIQUID_MIN_BARS - 1, len(rth)):
+        sig = detect_liquid_intraday_breakout(rth.iloc[:i + 1][ohlcv].astype(float),
+                                              session_vwap=float(vwap_full[i]))
+        firing = sig.is_valid
+        rising = firing and not prev_fire and (i - last_emit) >= cooldown
+        prev_fire = firing
+        if not rising:
+            continue
+        entry_ref = float(sig.entry_level)
+        invalidation = float(sig.stop_level)
+        if entry_ref <= invalidation:
+            continue
+        last_emit = i
+        setup_ts = rth.iloc[i]["timestamp"]
+        sv = sig.signal_values
+        nf = lambda key: (float(sv[key]) if sv.get(key) is not None else None)
+        _, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
+        sid = f"{symbol}:{session_date}:b{i}:{LIQUID_SETUP_VERSION}"
+        setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
+                     setup_name=LIQUID_NAME, setup_version=LIQUID_SETUP_VERSION,
+                     entry_reference_price=entry_ref, invalidation_price=invalidation,
+                     target_r_multiple=0.0, relative_volume=nf("rvol"),
+                     pullback_volume_ratio=nf("cum_dollar_vol"),   # cumulative $-volume (liquidity)
+                     above_vwap_flag=True, vwap_at_trigger=nf("session_vwap"),
+                     catalyst_freshness_at_trigger=cat_fresh, session_minute_number=i + 1)
+        lab = _forward_labels(rth, setup_ts, entry_ref, invalidation, session_open)
+        out.append((setup, dict(setup_id=sid, label_version=LABEL_VERSION, **lab)))
+    return out
+
+
+def build_liquid(con, limit=None, rebuild=False, cooldown=10):
+    if rebuild:
+        con.execute("DELETE FROM outcome_labels WHERE setup_id IN "
+                    "(SELECT setup_id FROM setup_events WHERE setup_version=?)", [LIQUID_SETUP_VERSION])
+        con.execute("DELETE FROM setup_events WHERE setup_version=?", [LIQUID_SETUP_VERSION])
+    daily = _preload_daily(con)
+    cats = _preload_catalysts(con)
+    sessions = con.execute(
+        "SELECT DISTINCT symbol, session_date FROM minute_bars ORDER BY session_date, symbol"
+        + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
+    built = sess_with = 0
+    for sym, d in sessions:
+        rows = con.execute(
+            f"SELECT {', '.join(_MB_COLS)} FROM minute_bars WHERE symbol=? AND session_date=? "
+            "ORDER BY timestamp", [sym, d]).fetchall()
+        if not rows:
+            continue
+        dfb = pd.DataFrame(rows, columns=_MB_COLS)
+        pc, av = daily.get((sym, d), (None, None))
+        try:
+            setups = compute_liquid_setups(sym, d, dfb, pc, av, cats, cooldown=cooldown)
+        except Exception as exc:  # noqa: BLE001 — one bad session can't stop the build
+            print(f"  ! {sym} {d}: {exc}")
+            continue
+        if setups:
+            sess_with += 1
+        for setup, label in setups:
+            _insert(con, "setup_events", setup)
+            _insert(con, "outcome_labels", label)
+            built += 1
+    print(f"built {built} liquid_intraday_breakout shadow fires across {sess_with} sessions "
+          f"(of {len(sessions)} symbol-sessions scanned)")
+    return built
+
+
+def report_liquid(con):
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [LIQUID_SETUP_VERSION]).fetchone()[0]
+    if not n:
+        print("No liquid_intraday_breakout setups — run `build-liquid` first.")
+        return
+    days, syms = con.execute(
+        "SELECT count(DISTINCT session_date), count(DISTINCT symbol) FROM setup_events "
+        "WHERE setup_version=?", [LIQUID_SETUP_VERSION]).fetchone()
+    print(f"=== liquid_intraday_breakout shadow report ({n} fires, {syms} symbols, {days} session-days) ===")
+    row = con.execute(
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.reached_2r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.failed_breakout_flag THEN 1.0 ELSE 0 END), "
+        "avg(l.max_upside_next_15m), avg(l.max_upside_next_60m), avg(l.max_drawdown_next_60m) "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [LIQUID_SETUP_VERSION]).fetchone()
+    print("\nFORWARD OUTCOMES (from each fire, strict RTH time split):")
+    print(f"  reached +1R before -1R : {row[0]*100:.0f}%")
+    print(f"  reached +2R before -1R : {row[1]*100:.0f}%")
+    print(f"  failed (poke then lose stop): {row[2]*100:.0f}%")
+    print(f"  avg max-upside 15m/60m : {(row[3] or 0)*100:.1f}% / {(row[4] or 0)*100:.1f}%")
+    print(f"  avg max-drawdown 60m   : {(row[5] or 0)*100:.1f}%")
+    # STRATIFY by rvol and by liquidity (cum dollar-volume) — does a higher stratum convert better?
+    print("\nBY RVOL stratum:")
+    for lo, hi, lab in [(0, 2, "<2x"), (2, 4, "2-4x"), (4, 1e9, ">=4x")]:
+        r = con.execute(
+            "SELECT count(*), avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END) "
+            "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+            "WHERE se.setup_version=? AND se.relative_volume>=? AND se.relative_volume<?",
+            [LIQUID_SETUP_VERSION, lo, hi]).fetchone()
+        if r and r[0]:
+            print(f"  rvol {lab:5}: n={r[0]:4}  +1R={(r[1] or 0)*100:.0f}%")
+    print("BY LIQUIDITY stratum (cumulative $-volume at fire):")
+    for lo, hi, lab in [(0, 5e6, "<$5M"), (5e6, 2e7, "$5-20M"), (2e7, 1e12, ">=$20M")]:
+        r = con.execute(
+            "SELECT count(*), avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END) "
+            "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+            "WHERE se.setup_version=? AND se.pullback_volume_ratio>=? AND se.pullback_volume_ratio<?",
+            [LIQUID_SETUP_VERSION, lo, hi]).fetchone()
+        if r and r[0]:
+            print(f"  {lab:7}: n={r[0]:4}  +1R={(r[1] or 0)*100:.0f}%")
+    cmp = con.execute(
+        "WITH lq AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN lq ON lq.symbol = se.symbol AND lq.session_date = se.session_date "
+        "WHERE se.setup_version=?", [LIQUID_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    if cmp and cmp[1]:
+        print(f"\nHEAD-TO-HEAD (same symbol-days): ORB '{SETUP_VERSION}' reached +1R = "
+              f"{(cmp[0] or 0)*100:.0f}% over {cmp[1]} ORB setups (vs liquid {row[0]*100:.0f}% above)")
+
+
+def validate_liquid(con):
+    """Score the liquid_intraday_breakout track vs its PRE-REGISTERED bar. ALL must hold
+    out-of-sample to consider promotion; born under the 'separates population, doesn't convert' null."""
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [LIQUID_SETUP_VERSION]).fetchone()[0]
+    print(f"=== validate liquid_intraday_breakout vs the locked bar (n={n}) ===")
+    if not n:
+        print("No fires — run `build-liquid` first.")
+        return
+    rows = con.execute(
+        "SELECT l.max_upside_next_60m, l.max_drawdown_next_60m, "
+        "CASE WHEN l.reached_1r_before_minus_1r THEN 1 ELSE 0 END, se.relative_volume "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [LIQUID_SETUP_VERSION]).fetchall()
+    up = [r[0] for r in rows]; dd = [r[1] for r in rows]; r1 = [r[2] for r in rows]
+    med_up = _median(up) or 0.0; med_dd = _median(dd) or 0.0
+    rate_1r = sum(r1) / len(r1); lb_1r = _wilson_lower(sum(r1), len(r1))
+    top = [r[2] for r in rows if (r[3] or 0) >= 4.0]           # top rvol stratum
+    rate_top = (sum(top) / len(top)) if top else 0.0
+    orb = con.execute(
+        "WITH lq AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN lq ON lq.symbol = se.symbol AND lq.session_date = se.session_date "
+        "WHERE se.setup_version=?", [LIQUID_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    orb_rate = (orb[0] or 0.0) if orb else 0.0; orb_n = (orb[1] or 0) if orb else 0
+    p_up = med_up >= LIQUID_PROMO_MEDIAN_FWDMAX_60M
+    p_dd = med_dd > LIQUID_PROMO_MEDIAN_ADVERSE_60M
+    p_1r = rate_1r > LIQUID_PROMO_MIN_1R
+    p_beat = orb_n > 0 and rate_1r > orb_rate
+    p_top = rate_top > LIQUID_PROMO_MIN_1R
+    mark = lambda ok: "PASS" if ok else "FAIL"
+    print(f"  (1) median max-upside 60m {med_up*100:.1f}% >= {LIQUID_PROMO_MEDIAN_FWDMAX_60M*100:.0f}%  -> [{mark(p_up)}]")
+    print(f"  (2) median max-drawdown 60m {med_dd*100:.1f}% > {LIQUID_PROMO_MEDIAN_ADVERSE_60M*100:.0f}%  -> [{mark(p_dd)}]")
+    print(f"  (3) +1R rate {rate_1r*100:.0f}% (Wilson-95 LB {lb_1r*100:.0f}%) > {LIQUID_PROMO_MIN_1R*100:.0f}%  -> [{mark(p_1r)}]")
+    print(f"  (4) beat ORB +1R: liquid {rate_1r*100:.0f}% vs ORB {orb_rate*100:.0f}% (n={orb_n})  -> [{mark(p_beat)}]")
+    print(f"  (5) top rvol stratum (>=4x, n={len(top)}) +1R {rate_top*100:.0f}% > {LIQUID_PROMO_MIN_1R*100:.0f}%  -> [{mark(p_top)}]")
+    print(f"  OVERALL: [{mark(p_up and p_dd and p_1r and p_beat and p_top)}]")
+    print("  NOTE: bar locked 2026-07-01 BEFORE forward data. Do NOT gate live until cleared out-of-sample.")
+
+
 def validate_no_chase_entry(con, target_r=2.0):
     """Final mechanic lever (shadow): does the NO-CHASE VWAP-pullback entry beat the
     ORB-high breakout in PERCENT return net of a REALISTIC per-name cost? Reuses the live
@@ -1029,6 +1229,11 @@ def main():
     br.add_argument("--cooldown", type=int, default=10)
     sub.add_parser("report-runner", help="forward outcomes of the leading_gainer_runner shadow track")
     sub.add_parser("validate-runner", help="score the runner track vs its locked pre-registered bar")
+    bl = sub.add_parser("build-liquid", help="build the liquid_intraday_breakout shadow track")
+    bl.add_argument("--limit", type=int); bl.add_argument("--rebuild", action="store_true")
+    bl.add_argument("--cooldown", type=int, default=10)
+    sub.add_parser("report-liquid", help="forward outcomes + rvol/liquidity stratification of the liquid track")
+    sub.add_parser("validate-liquid", help="score the liquid track vs its locked pre-registered bar")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -1053,6 +1258,12 @@ def main():
         report_runner(con)
     elif args.cmd == "validate-runner":
         validate_runner(con)
+    elif args.cmd == "build-liquid":
+        build_liquid(con, limit=args.limit, rebuild=args.rebuild, cooldown=args.cooldown)
+    elif args.cmd == "report-liquid":
+        report_liquid(con)
+    elif args.cmd == "validate-liquid":
+        validate_liquid(con)
 
 
 if __name__ == "__main__":
