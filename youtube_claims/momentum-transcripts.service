@@ -1,0 +1,19 @@
+[Unit]
+Description=Momentum YouTube transcript -> claim-extraction pipeline
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/c/code/momentum
+# secrets (DATABASE_URL, YOUTUBE_API_KEY, YT_WATCHLIST) load from the repo's gitignored .env
+# via youtube_claims.config (python-dotenv). Whisper is option A (CPU) by default; flip to the
+# LAN GPU (option B) with YT_WHISPER_MODEL=large-v3 YT_WHISPER_DEVICE=cuda YT_WHISPER_COMPUTE_TYPE=float16.
+ExecStart=/home/philip/.venvs/momentum/bin/python -u -m youtube_claims.run run
+Restart=always
+RestartSec=30
+StandardOutput=append:/mnt/c/code/momentum/data/transcripts_pipeline.log
+StandardError=append:/mnt/c/code/momentum/data/transcripts_pipeline.log
+SyslogIdentifier=momentum-transcripts
+
+[Install]
+WantedBy=default.target

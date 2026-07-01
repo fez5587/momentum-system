@@ -5,9 +5,24 @@ verbatim_quote is dropped: that quote is the chain of custody the reasoning mode
 against ASR error."""
 
 import json
+import re
 import urllib.request
 
 from youtube_claims import config
+
+
+def _norm(s: str) -> str:
+    """Collapse whitespace + lowercase so a verbatim quote still matches across the segment
+    joins and the punctuation-poor text of auto-captions."""
+    return re.sub(r"\s+", " ", s or "").strip().lower()
+
+
+def _quote_supported(verbatim_quote: str, ntext: str) -> bool:
+    """Anti-hallucination: is the quote actually present in the (already whitespace-normalized)
+    source window? Matches a ~40-char prefix to tolerate minor ASR word-boundary noise while
+    still rejecting a fabricated quote."""
+    nvq = _norm(verbatim_quote)
+    return bool(nvq) and (nvq[:40] in ntext or nvq in ntext)
 
 _PROMPT = """You are a precise information extractor. From the TRANSCRIPT below, extract every
 distinct market/trading CLAIM about a specific asset (stock, crypto, ETF, index, commodity, fx).
@@ -94,16 +109,16 @@ def extract_claims(segments: list[dict], watchlist: list[str] | None = None,
     wl = ", ".join(watchlist if watchlist is not None else config.watchlist()) or "(none specified)"
     out: list[dict] = []
     for win, w_start, w_end in _chunks(segments):
-        text = "\n".join(t for _, t in win)
+        text = " ".join(t for _, t in win)
+        ntext = _norm(text)
         try:
             raw = _ollama_generate(_PROMPT.format(watchlist=wl, transcript=text), model, host)
             data = json.loads(raw)
         except Exception:  # noqa: BLE001 — a bad chunk shouldn't kill the whole video
             continue
         for c in (data.get("claims") or []):
-            vq = (c.get("verbatim_quote") or "").strip()
             # keep only claims whose quote is actually present in THIS window (anti-hallucination)
-            if vq and vq[:60].lower() in text.lower():
+            if _quote_supported(c.get("verbatim_quote") or "", ntext):
                 nc = _normalize(c, w_start, w_end)
                 if nc:
                     out.append(nc)
