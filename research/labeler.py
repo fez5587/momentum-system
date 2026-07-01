@@ -33,6 +33,7 @@ from research.multi_schema import open_research_db
 from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
+from strategy.evaluation.runner import detect_leading_gainer_runner
 from strategy.evaluation.runner_propensity import runner_propensity
 from strategy.evaluation.volume_metrics import calculate_time_of_day_rvol
 from strategy.evaluation.vwap_pullback_entry import find_vwap_pullback_entry
@@ -62,6 +63,28 @@ VR_PROMO_MIN_PRICE = 5.0
 VR_PROMO_IMPULSE_LO = 0.15
 VR_PROMO_IMPULSE_HI = 0.26
 VR_PROMO_BASE_2R = 0.349        # the unconditioned +2R base rate the subset must clear
+
+# leading-gainer runner shadow track (run1): slide detect_leading_gainer_runner over
+# history (PM-INCLUSIVE — the run that matters starts pre-market), emit a non-tradeable
+# setup on each fresh fire, score with the SAME forward machinery. The detector separates
+# the runner LABEL cleanly (2026-06-30 in-sample: 5/5 runners fire, 7/7 chop silent) but
+# the OPEN QUESTION is conversion: SVRE/JEM put ~100% of the move in pre-market, so an RTH
+# fire is late (+242%/+346% already run). This track measures whether that late entry pays.
+RUNNER_SETUP_VERSION = "run1"
+RUNNER_NAME = "leading_gainer_runner"
+RUNNER_MIN_BARS = 14            # detector history need (velocity/struct/burst windows)
+RUNNER_MIN_RTH_BARS = 20       # forward room so the outcome labels aren't truncated
+
+# PRE-REGISTERED promotion hypothesis (locked 2026-06-30, BEFORE any forward data). The
+# detector confirms AT/AFTER the top for PM-driven names, so the null is "separates the
+# label, negative through the bracket" — the same trap 4 prior selection levers hit. To
+# promote off shadow-only, out-of-sample fires must clear ALL of:
+RUNNER_PROMO_MEDIAN_FWDMAX_60M = 0.15   # (1) median max-upside 60m >= +15% (real continuation)
+RUNNER_PROMO_MEDIAN_ADVERSE_60M = -0.08  # (2) median max-drawdown 60m > -8% (survivable stop)
+RUNNER_PROMO_MIN_1R = 0.50               # (3) +1R-before-(-1R) > 50% (positive 1:1 expectancy)
+RUNNER_PM_EXHAUSTION_FRAC = 0.70         # PM captured > this fraction of the run => "spent"
+# (4) beat vwap_reclaim +1R on the SAME symbol-days, and (5) dropping PM-exhausted fires
+#     must RAISE the +1R rate (else the exhaustion tag earns nothing) — computed in validate.
 
 # No-chase entry shadow-validation (the final mechanic lever). Realistic per-name round-trip
 # cost proxy (minute_bars has no NBBO, so a price-tiered spread/slippage stand-in). PRE-
@@ -492,6 +515,224 @@ def validate_vwap_reclaim(con, min_r_frac=0.015, min_r_abs=0.02):
           "The bar is locked; only OUT-OF-SAMPLE forward fires can clear it.")
 
 
+# ----------------------------------------------------------------------------
+# leading-gainer runner shadow track (run1): slide the detector over history,
+# emit a non-tradeable setup on each fresh fire, score it with _forward_labels.
+# ----------------------------------------------------------------------------
+
+def compute_runner_setups(symbol, session_date, df, prior_close, avg_vol,
+                          cats: dict, *, cooldown=10) -> list:
+    """0..N shadow leading-gainer-runner setups for one session. Slides
+    detect_leading_gainer_runner over the session (PM-INCLUSIVE: the detector at RTH
+    bar k sees pm+rth[:k+1], so run%/VWAP are full-session), emits on each RISING EDGE
+    (not-valid -> valid) with a bar cooldown so one leg is one setup. Only RTH bars can
+    be decision points (a fire is only tradeable in RTH). Each emit carries the detector's
+    OWN entry (last close) / stop (last higher low); labels come from _forward_labels over
+    RTH-only bars strictly after the fire — identical scoring to the ORB and vwap_reclaim
+    tracks (no skew). PURE. The PM-exhaustion measure (pm_capture) is stored in
+    pullback_depth_pct so validate-runner can test whether skipping spent runners pays."""
+    df = df.copy()
+    df["is_regular_hours"] = df["is_regular_hours"].astype(bool)
+    df["is_premarket"] = df["is_premarket"].astype(bool)
+    full = df.reset_index(drop=True)
+    rth = df[df["is_regular_hours"]].reset_index(drop=True)
+    if len(rth) < RUNNER_MIN_RTH_BARS:
+        return []
+    session_open = float(rth.iloc[0]["open"])
+    if session_open <= 0:
+        return []
+    pm = full[full["is_premarket"]]
+    pm_high = float(pm["high"].max()) if len(pm) else None
+    pc = float(prior_close) if prior_close else None
+    ohlcv = ["open", "high", "low", "close", "volume"]
+    # cumulative VWAP is a PREFIX function -> compute the whole-session array ONCE and hand
+    # the detector vwap[k] per bar; identical to recomputing on each slice, but O(n) not O(n^2).
+    vwap_full = calculate_vwap(full).astype(float).to_numpy()
+
+    rth_positions = [k for k in range(len(full)) if bool(full.iloc[k]["is_regular_hours"])]
+    out, prev_fire, last_emit = [], False, -10 ** 9
+    for j, k in enumerate(rth_positions):
+        if k + 1 < RUNNER_MIN_BARS:
+            continue
+        window = full.iloc[:k + 1][ohlcv].astype(float)
+        sig = detect_leading_gainer_runner(window, day_base=pc, pm_high=pm_high,
+                                           pm_exhaustion_frac=RUNNER_PM_EXHAUSTION_FRAC,
+                                           session_vwap=float(vwap_full[k]))
+        firing = sig.is_valid
+        rising = firing and not prev_fire and (k - last_emit) >= cooldown
+        prev_fire = firing
+        if not rising:
+            continue
+        entry_ref = float(sig.entry_level)
+        invalidation = float(sig.stop_level)
+        if entry_ref <= invalidation:
+            continue
+        last_emit = k
+        setup_ts = full.iloc[k]["timestamp"]
+        sv = sig.signal_values
+        # signal_values carry numpy scalars; psycopg2 can't adapt np.float64 -> cast native
+        nf = lambda key: (float(sv[key]) if sv.get(key) is not None else None)
+        _, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
+        sid = f"{symbol}:{session_date}:b{k}:{RUNNER_SETUP_VERSION}"
+        setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
+                     setup_name=RUNNER_NAME, setup_version=RUNNER_SETUP_VERSION,
+                     entry_reference_price=entry_ref, invalidation_price=invalidation,
+                     target_r_multiple=0.0, impulse_pct=nf("velocity_pct"),
+                     gap_pct=nf("total_run"), relative_volume=nf("volume_burst_ratio"),
+                     above_vwap_flag=True, vwap_at_trigger=nf("session_vwap"),
+                     pullback_depth_pct=nf("pm_capture"),
+                     catalyst_freshness_at_trigger=cat_fresh, session_minute_number=j + 1)
+        lab = _forward_labels(rth, setup_ts, entry_ref, invalidation, session_open)
+        out.append((setup, dict(setup_id=sid, label_version=LABEL_VERSION, **lab)))
+    return out
+
+
+def build_runner(con, limit=None, rebuild=False, cooldown=10):
+    if rebuild:
+        con.execute("DELETE FROM outcome_labels WHERE setup_id IN "
+                    "(SELECT setup_id FROM setup_events WHERE setup_version=?)", [RUNNER_SETUP_VERSION])
+        con.execute("DELETE FROM setup_events WHERE setup_version=?", [RUNNER_SETUP_VERSION])
+    daily = _preload_daily(con)
+    cats = _preload_catalysts(con)
+    sessions = con.execute(
+        "SELECT DISTINCT symbol, session_date FROM minute_bars ORDER BY session_date, symbol"
+        + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
+    built = sess_with = 0
+    for sym, d in sessions:
+        rows = con.execute(
+            f"SELECT {', '.join(_MB_COLS)} FROM minute_bars WHERE symbol=? AND session_date=? "
+            "ORDER BY timestamp", [sym, d]).fetchall()
+        if not rows:
+            continue
+        dfb = pd.DataFrame(rows, columns=_MB_COLS)
+        pc, av = daily.get((sym, d), (None, None))
+        try:
+            setups = compute_runner_setups(sym, d, dfb, pc, av, cats, cooldown=cooldown)
+        except Exception as exc:  # noqa: BLE001 — one bad session can't stop the build
+            print(f"  ! {sym} {d}: {exc}")
+            continue
+        if setups:
+            sess_with += 1
+        for setup, label in setups:
+            _insert(con, "setup_events", setup)
+            _insert(con, "outcome_labels", label)
+            built += 1
+    print(f"built {built} leading_gainer_runner shadow fires across {sess_with} sessions "
+          f"(of {len(sessions)} symbol-sessions scanned)")
+    return built
+
+
+def report_runner(con):
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [RUNNER_SETUP_VERSION]).fetchone()[0]
+    if not n:
+        print("No leading_gainer_runner setups — run `build-runner` first.")
+        return
+    days, syms = con.execute(
+        "SELECT count(DISTINCT session_date), count(DISTINCT symbol) FROM setup_events "
+        "WHERE setup_version=?", [RUNNER_SETUP_VERSION]).fetchone()
+    print(f"=== leading_gainer_runner shadow report ({n} fires, {syms} symbols, {days} session-days) ===")
+    row = con.execute(
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.reached_2r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.failed_breakout_flag THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.held_vwap_15m THEN 1.0 ELSE 0 END), "
+        "avg(l.max_upside_next_15m), avg(l.max_upside_next_60m), avg(l.max_drawdown_next_60m), "
+        "avg(se.gap_pct) "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION]).fetchone()
+    print("\nFORWARD OUTCOMES (from each runner fire, strict RTH time split):")
+    print(f"  reached +1R before -1R : {row[0]*100:.0f}%")
+    print(f"  reached +2R before -1R : {row[1]*100:.0f}%")
+    print(f"  failed (poke then lose stop): {row[2]*100:.0f}%")
+    print(f"  held VWAP 15m          : {row[3]*100:.0f}%")
+    print(f"  avg max-upside 15m/60m : {(row[4] or 0)*100:.1f}% / {(row[5] or 0)*100:.1f}%")
+    print(f"  avg max-drawdown 60m   : {(row[6] or 0)*100:.1f}%")
+    print(f"  avg session run at fire (gap_pct): {(row[7] or 0)*100:.0f}%")
+    # PM-exhaustion split: pm_capture stored in pullback_depth_pct
+    for label, cond in [("PM-exhausted (spent)", f"se.pullback_depth_pct > {RUNNER_PM_EXHAUSTION_FRAC}"),
+                        ("fresh (not spent)",
+                         f"(se.pullback_depth_pct IS NULL OR se.pullback_depth_pct <= {RUNNER_PM_EXHAUSTION_FRAC})")]:
+        r = con.execute(
+            "SELECT count(*), avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END) "
+            "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+            f"WHERE se.setup_version=? AND {cond}", [RUNNER_SETUP_VERSION]).fetchone()
+        if r and r[0]:
+            print(f"  [{label:22}] n={r[0]:4}  +1R={( r[1] or 0)*100:.0f}%")
+    cmp = con.execute(
+        "WITH rn AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN rn ON rn.symbol = se.symbol AND rn.session_date = se.session_date "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    if cmp and cmp[1]:
+        print(f"\nHEAD-TO-HEAD (same symbol-days): ORB '{SETUP_VERSION}' reached +1R = "
+              f"{(cmp[0] or 0)*100:.0f}% over {cmp[1]} ORB setups (vs runner {row[0]*100:.0f}% above)")
+
+
+def _median(xs) -> float | None:
+    xs = sorted(v for v in xs if v is not None)
+    if not xs:
+        return None
+    m = len(xs) // 2
+    return xs[m] if len(xs) % 2 else (xs[m - 1] + xs[m]) / 2.0
+
+
+def validate_runner(con):
+    """Score the leading_gainer_runner shadow track against its PRE-REGISTERED bar.
+    ALL five conditions must PASS out-of-sample to even consider promotion; the track is
+    born under the null 'separates the label, negative through the bracket'."""
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [RUNNER_SETUP_VERSION]).fetchone()[0]
+    print(f"=== validate leading_gainer_runner vs the locked bar (n={n}) ===")
+    if not n:
+        print("No fires — run `build-runner` first.")
+        return
+    rows = con.execute(
+        "SELECT l.max_upside_next_60m, l.max_drawdown_next_60m, "
+        "CASE WHEN l.reached_1r_before_minus_1r THEN 1 ELSE 0 END, se.pullback_depth_pct "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION]).fetchall()
+    up = [r[0] for r in rows]
+    dd = [r[1] for r in rows]
+    r1 = [r[2] for r in rows]
+    med_up = _median(up) or 0.0
+    med_dd = _median(dd) or 0.0
+    rate_1r = sum(r1) / len(r1)
+    lb_1r = _wilson_lower(sum(r1), len(r1))
+    fresh = [r[2] for r in rows if r[3] is None or r[3] <= RUNNER_PM_EXHAUSTION_FRAC]
+    rate_fresh = (sum(fresh) / len(fresh)) if fresh else 0.0
+    orb = con.execute(
+        "WITH rn AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN rn ON rn.symbol = se.symbol AND rn.session_date = se.session_date "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    vr = con.execute(
+        "WITH rn AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN rn ON rn.symbol = se.symbol AND rn.session_date = se.session_date "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION, VR_SETUP_VERSION]).fetchone()
+    vr_rate = (vr[0] or 0.0) if vr else 0.0
+    vr_n = (vr[1] or 0) if vr else 0
+
+    p_up = med_up >= RUNNER_PROMO_MEDIAN_FWDMAX_60M
+    p_dd = med_dd > RUNNER_PROMO_MEDIAN_ADVERSE_60M
+    p_1r = rate_1r > RUNNER_PROMO_MIN_1R
+    p_beat = vr_n > 0 and rate_1r > vr_rate
+    p_pm = rate_fresh > rate_1r
+    mark = lambda ok: "PASS" if ok else "FAIL"
+    print(f"  (1) median max-upside 60m {med_up*100:.1f}% >= {RUNNER_PROMO_MEDIAN_FWDMAX_60M*100:.0f}%  -> [{mark(p_up)}]")
+    print(f"  (2) median max-drawdown 60m {med_dd*100:.1f}% > {RUNNER_PROMO_MEDIAN_ADVERSE_60M*100:.0f}%  -> [{mark(p_dd)}]")
+    print(f"  (3) +1R rate {rate_1r*100:.0f}% (Wilson-95 LB {lb_1r*100:.0f}%) > {RUNNER_PROMO_MIN_1R*100:.0f}%  -> [{mark(p_1r)}]")
+    print(f"  (4) beat vwap_reclaim +1R: runner {rate_1r*100:.0f}% vs vr {vr_rate*100:.0f}% (n={vr_n})  -> [{mark(p_beat)}]")
+    print(f"  (5) PM-exhaustion tag earns keep: fresh +1R {rate_fresh*100:.0f}% > all {rate_1r*100:.0f}%  -> [{mark(p_pm)}]")
+    print(f"  OVERALL: [{mark(p_up and p_dd and p_1r and p_beat and p_pm)}]")
+    print("  NOTE: bar locked 2026-06-30 BEFORE forward data. In-sample fires are a HYPOTHESIS, "
+          "not a pass — only OUT-OF-SAMPLE sessions can clear it. Do NOT gate live until cleared.")
+
+
 def validate_no_chase_entry(con, target_r=2.0):
     """Final mechanic lever (shadow): does the NO-CHASE VWAP-pullback entry beat the
     ORB-high breakout in PERCENT return net of a REALISTIC per-name cost? Reuses the live
@@ -741,6 +982,11 @@ def main():
     sub.add_parser("validate-vr", help="score the pre-registered promotion candidate vs the locked bar")
     sub.add_parser("runner-rank", help="measure the cheap-price + premarket-gap selection lever")
     sub.add_parser("validate-entry", help="shadow-validate the no-chase VWAP-pullback entry vs the locked bar")
+    br = sub.add_parser("build-runner", help="build the leading_gainer_runner shadow track")
+    br.add_argument("--limit", type=int); br.add_argument("--rebuild", action="store_true")
+    br.add_argument("--cooldown", type=int, default=10)
+    sub.add_parser("report-runner", help="forward outcomes of the leading_gainer_runner shadow track")
+    sub.add_parser("validate-runner", help="score the runner track vs its locked pre-registered bar")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -759,6 +1005,12 @@ def main():
         runner_rank_report(con)
     elif args.cmd == "validate-entry":
         validate_no_chase_entry(con)
+    elif args.cmd == "build-runner":
+        build_runner(con, limit=args.limit, rebuild=args.rebuild, cooldown=args.cooldown)
+    elif args.cmd == "report-runner":
+        report_runner(con)
+    elif args.cmd == "validate-runner":
+        validate_runner(con)
 
 
 if __name__ == "__main__":
