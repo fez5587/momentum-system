@@ -34,6 +34,7 @@ from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
 from strategy.evaluation.liquid_breakout import detect_liquid_intraday_breakout
+from strategy.evaluation.premarket_setup import detect_premarket_setup
 from strategy.evaluation.runner import detect_leading_gainer_runner
 from strategy.evaluation.runner_quality import calculate_runner_quality
 from strategy.evaluation.runner_propensity import runner_propensity
@@ -104,6 +105,22 @@ LIQUID_PROMO_MEDIAN_ADVERSE_60M = -0.06   # (2) median max-drawdown 60m > -6% (s
 LIQUID_PROMO_MIN_1R = 0.50                # (3) +1R-before-(-1R) > 50% (positive 1:1 expectancy)
 # (4) beat the ORB v1 +1R on the SAME symbol-days, and (5) the top rvol/liquidity stratum must
 #     clear (3) even if the full population doesn't — computed in validate-liquid.
+
+# premarket setup shadow track (pm1): the ONE lane the 6 refuted RTH levers never touched. Slides
+# detect_premarket_setup over PREMARKET bars, scores forward on PREMARKET bars (the trader trades +
+# exits pre-9:30). Tests whether premarket continuation converts where RTH doesn't (no halts, cleaner
+# tape) — or hits the same wall. NOTE thin premarket liquidity is a real fill caveat the shadow set
+# aside; live premarket also needs extended_hours execution (not built). See thesis-scope memory.
+PREMARKET_SETUP_VERSION = "pm1"
+PREMARKET_NAME = "premarket_setup"
+PREMARKET_MIN_BARS = 12                    # detector needs >=12 premarket bars of history
+PREMARKET_MIN_FWD = 10                     # need >=10 pm bars AFTER the fire to score the outcome
+# PRE-REGISTERED bar (locked 2026-07-01, BEFORE forward data). Premarket is a NEW regime so there's
+# no premarket ORB baseline; the RTH ORB on the same days is shown as CONTEXT, not a pass gate.
+PREMARKET_PROMO_MEDIAN_FWDMAX = 0.10       # (1) median max-upside (within pm) >= +10%
+PREMARKET_PROMO_MEDIAN_ADVERSE = -0.06     # (2) median max-drawdown > -6%
+PREMARKET_PROMO_MIN_1R = 0.50              # (3) +1R-before-(-1R) > 50%
+# (4) top gap-stratum (>=50% gap) must clear (3) — the trader's real premarket runners.
 
 # No-chase entry shadow-validation (the final mechanic lever). Realistic per-name round-trip
 # cost proxy (minute_bars has no NBBO, so a price-tiered spread/slippage stand-in). PRE-
@@ -975,6 +992,171 @@ def validate_liquid(con):
     print("  NOTE: bar locked 2026-07-01 BEFORE forward data. Do NOT gate live until cleared out-of-sample.")
 
 
+# ----------------------------------------------------------------------------
+# premarket setup shadow track (pm1): slide detect_premarket_setup over PREMARKET
+# bars, score forward on PREMARKET bars (the trader's window is pre-9:30).
+# ----------------------------------------------------------------------------
+
+def compute_premarket_setups(symbol, session_date, df, prior_close, avg_vol,
+                             cats: dict, *, cooldown=10) -> list:
+    """0..N shadow premarket_setup fires for one session, on PREMARKET bars only. Forward labels
+    use the SAME _forward_labels but over the premarket bars after the fire (outcome is measured
+    pre-9:30, where the trader enters+exits). Stores gap + premarket volume as stratification. PURE."""
+    df = df.copy()
+    df["is_premarket"] = df["is_premarket"].astype(bool)
+    pm = df[df["is_premarket"]].reset_index(drop=True)
+    if len(pm) < PREMARKET_MIN_BARS + PREMARKET_MIN_FWD:
+        return []
+    pm_open = float(pm.iloc[0]["open"])
+    if pm_open <= 0:
+        return []
+    pc = float(prior_close) if prior_close else None
+    ohlcv = ["open", "high", "low", "close", "volume"]
+    vwap_full = calculate_vwap(pm).astype(float).to_numpy()   # premarket-cumulative prefix VWAP
+    out, prev_fire, last_emit = [], False, -10 ** 9
+    for i in range(PREMARKET_MIN_BARS - 1, len(pm)):
+        sig = detect_premarket_setup(pm.iloc[:i + 1][ohlcv].astype(float),
+                                     prev_close=pc, session_vwap=float(vwap_full[i]))
+        firing = sig.is_valid
+        rising = firing and not prev_fire and (i - last_emit) >= cooldown
+        prev_fire = firing
+        if not rising:
+            continue
+        if len(pm) - 1 - i < PREMARKET_MIN_FWD:   # not enough premarket left to score
+            continue
+        entry_ref = float(sig.entry_level)
+        invalidation = float(sig.stop_level)
+        if entry_ref <= invalidation:
+            continue
+        last_emit = i
+        setup_ts = pm.iloc[i]["timestamp"]
+        sv = sig.signal_values
+        nf = lambda key: (float(sv[key]) if sv.get(key) is not None else None)
+        _, cat_fresh = _catalyst_at(cats, symbol, setup_ts)
+        sid = f"{symbol}:{session_date}:b{i}:{PREMARKET_SETUP_VERSION}"
+        setup = dict(setup_id=sid, symbol=symbol, setup_time=setup_ts, session_date=session_date,
+                     setup_name=PREMARKET_NAME, setup_version=PREMARKET_SETUP_VERSION,
+                     entry_reference_price=entry_ref, invalidation_price=invalidation,
+                     target_r_multiple=0.0, gap_pct=nf("gap"), impulse_pct=nf("velocity"),
+                     relative_volume=nf("cum_pm_volume"), above_vwap_flag=True,
+                     vwap_at_trigger=nf("pm_vwap"),
+                     catalyst_freshness_at_trigger=cat_fresh, session_minute_number=i + 1)
+        lab = _forward_labels(pm, setup_ts, entry_ref, invalidation, pm_open)
+        out.append((setup, dict(setup_id=sid, label_version=LABEL_VERSION, **lab)))
+    return out
+
+
+def build_premarket(con, limit=None, rebuild=False, cooldown=10):
+    if rebuild:
+        con.execute("DELETE FROM outcome_labels WHERE setup_id IN "
+                    "(SELECT setup_id FROM setup_events WHERE setup_version=?)", [PREMARKET_SETUP_VERSION])
+        con.execute("DELETE FROM setup_events WHERE setup_version=?", [PREMARKET_SETUP_VERSION])
+    daily = _preload_daily(con)
+    cats = _preload_catalysts(con)
+    sessions = con.execute(
+        "SELECT DISTINCT symbol, session_date FROM minute_bars ORDER BY session_date, symbol"
+        + (f" LIMIT {int(limit)}" if limit else "")).fetchall()
+    built = sess_with = 0
+    for sym, d in sessions:
+        rows = con.execute(
+            f"SELECT {', '.join(_MB_COLS)} FROM minute_bars WHERE symbol=? AND session_date=? "
+            "ORDER BY timestamp", [sym, d]).fetchall()
+        if not rows:
+            continue
+        dfb = pd.DataFrame(rows, columns=_MB_COLS)
+        pc, av = daily.get((sym, d), (None, None))
+        try:
+            setups = compute_premarket_setups(sym, d, dfb, pc, av, cats, cooldown=cooldown)
+        except Exception as exc:  # noqa: BLE001
+            print(f"  ! {sym} {d}: {exc}")
+            continue
+        if setups:
+            sess_with += 1
+        for setup, label in setups:
+            _insert(con, "setup_events", setup)
+            _insert(con, "outcome_labels", label)
+            built += 1
+    print(f"built {built} premarket_setup shadow fires across {sess_with} sessions "
+          f"(of {len(sessions)} symbol-sessions scanned)")
+    return built
+
+
+def report_premarket(con):
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [PREMARKET_SETUP_VERSION]).fetchone()[0]
+    if not n:
+        print("No premarket_setup setups — run `build-premarket` first.")
+        return
+    days, syms = con.execute(
+        "SELECT count(DISTINCT session_date), count(DISTINCT symbol) FROM setup_events "
+        "WHERE setup_version=?", [PREMARKET_SETUP_VERSION]).fetchone()
+    print(f"=== premarket_setup shadow report ({n} fires, {syms} symbols, {days} session-days) ===")
+    row = con.execute(
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.reached_2r_before_minus_1r THEN 1.0 ELSE 0 END), "
+        "avg(CASE WHEN l.failed_breakout_flag THEN 1.0 ELSE 0 END), "
+        "avg(l.max_upside_next_15m), avg(l.max_upside_next_60m), avg(l.max_drawdown_next_60m), avg(se.gap_pct) "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [PREMARKET_SETUP_VERSION]).fetchone()
+    print("\nFORWARD OUTCOMES (within premarket, strict time split):")
+    print(f"  reached +1R before -1R : {row[0]*100:.0f}%")
+    print(f"  reached +2R before -1R : {row[1]*100:.0f}%")
+    print(f"  failed (poke then lose stop): {row[2]*100:.0f}%")
+    print(f"  avg max-upside 15m/60m : {(row[3] or 0)*100:.1f}% / {(row[4] or 0)*100:.1f}%")
+    print(f"  avg max-drawdown 60m   : {(row[5] or 0)*100:.1f}%")
+    print(f"  avg gap at fire        : {(row[6] or 0)*100:.0f}%")
+    print("\nBY GAP stratum:")
+    for lo, hi, lab in [(0, 0.5, "<50%"), (0.5, 1.5, "50-150%"), (1.5, 1e9, ">=150%")]:
+        r = con.execute(
+            "SELECT count(*), avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END) "
+            "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+            "WHERE se.setup_version=? AND se.gap_pct>=? AND se.gap_pct<?",
+            [PREMARKET_SETUP_VERSION, lo, hi]).fetchone()
+        if r and r[0]:
+            print(f"  gap {lab:8}: n={r[0]:4}  +1R={(r[1] or 0)*100:.0f}%")
+    cmp = con.execute(
+        "WITH pm AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
+        "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "JOIN pm ON pm.symbol = se.symbol AND pm.session_date = se.session_date "
+        "WHERE se.setup_version=?", [PREMARKET_SETUP_VERSION, SETUP_VERSION]).fetchone()
+    if cmp and cmp[1]:
+        print(f"\nCONTEXT (same symbol-days): RTH ORB '{SETUP_VERSION}' +1R = {(cmp[0] or 0)*100:.0f}% "
+              f"over {cmp[1]} setups (premarket {row[0]*100:.0f}% above — different regime, not a baseline)")
+
+
+def validate_premarket(con):
+    """Score the premarket_setup track vs its PRE-REGISTERED bar. The one unexplored lane."""
+    n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
+                    [PREMARKET_SETUP_VERSION]).fetchone()[0]
+    print(f"=== validate premarket_setup vs the locked bar (n={n}) ===")
+    if not n:
+        print("No fires — run `build-premarket` first.")
+        return
+    rows = con.execute(
+        "SELECT l.max_upside_next_60m, l.max_drawdown_next_60m, "
+        "CASE WHEN l.reached_1r_before_minus_1r THEN 1 ELSE 0 END, se.gap_pct "
+        "FROM outcome_labels l JOIN setup_events se ON se.setup_id = l.setup_id "
+        "WHERE se.setup_version=?", [PREMARKET_SETUP_VERSION]).fetchall()
+    up = [r[0] for r in rows]; dd = [r[1] for r in rows]; r1 = [r[2] for r in rows]
+    med_up = _median(up) or 0.0; med_dd = _median(dd) or 0.0
+    rate_1r = sum(r1) / len(r1); lb_1r = _wilson_lower(sum(r1), len(r1))
+    big = [r[2] for r in rows if (r[3] or 0) >= 0.5]
+    rate_big = (sum(big) / len(big)) if big else 0.0
+    p_up = med_up >= PREMARKET_PROMO_MEDIAN_FWDMAX
+    p_dd = med_dd > PREMARKET_PROMO_MEDIAN_ADVERSE
+    p_1r = rate_1r > PREMARKET_PROMO_MIN_1R
+    p_big = rate_big > PREMARKET_PROMO_MIN_1R
+    mark = lambda ok: "PASS" if ok else "FAIL"
+    print(f"  (1) median max-upside 60m {med_up*100:.1f}% >= {PREMARKET_PROMO_MEDIAN_FWDMAX*100:.0f}%  -> [{mark(p_up)}]")
+    print(f"  (2) median max-drawdown 60m {med_dd*100:.1f}% > {PREMARKET_PROMO_MEDIAN_ADVERSE*100:.0f}%  -> [{mark(p_dd)}]")
+    print(f"  (3) +1R rate {rate_1r*100:.0f}% (Wilson-95 LB {lb_1r*100:.0f}%) > {PREMARKET_PROMO_MIN_1R*100:.0f}%  -> [{mark(p_1r)}]")
+    print(f"  (4) big-gap subset (>=50%, n={len(big)}) +1R {rate_big*100:.0f}% > {PREMARKET_PROMO_MIN_1R*100:.0f}%  -> [{mark(p_big)}]")
+    print(f"  OVERALL: [{mark(p_up and p_dd and p_1r and p_big)}]")
+    print("  NOTE: bar locked 2026-07-01 BEFORE forward data; thin premarket fills + no extended_hours "
+          "execution are real caveats. Do NOT gate live until cleared out-of-sample.")
+
+
 def validate_no_chase_entry(con, target_r=2.0):
     """Final mechanic lever (shadow): does the NO-CHASE VWAP-pullback entry beat the
     ORB-high breakout in PERCENT return net of a REALISTIC per-name cost? Reuses the live
@@ -1234,6 +1416,11 @@ def main():
     bl.add_argument("--cooldown", type=int, default=10)
     sub.add_parser("report-liquid", help="forward outcomes + rvol/liquidity stratification of the liquid track")
     sub.add_parser("validate-liquid", help="score the liquid track vs its locked pre-registered bar")
+    bp = sub.add_parser("build-premarket", help="build the premarket_setup shadow track (premarket bars)")
+    bp.add_argument("--limit", type=int); bp.add_argument("--rebuild", action="store_true")
+    bp.add_argument("--cooldown", type=int, default=10)
+    sub.add_parser("report-premarket", help="forward outcomes + gap stratification of the premarket track")
+    sub.add_parser("validate-premarket", help="score the premarket track vs its locked pre-registered bar")
     args = ap.parse_args()
     con = open_research_db("market")
     if args.cmd == "build":
@@ -1264,6 +1451,12 @@ def main():
         report_liquid(con)
     elif args.cmd == "validate-liquid":
         validate_liquid(con)
+    elif args.cmd == "build-premarket":
+        build_premarket(con, limit=args.limit, rebuild=args.rebuild, cooldown=args.cooldown)
+    elif args.cmd == "report-premarket":
+        report_premarket(con)
+    elif args.cmd == "validate-premarket":
+        validate_premarket(con)
 
 
 if __name__ == "__main__":
