@@ -87,6 +87,15 @@ class ExecutionSettings:
     # measurement; entries are only SKIPPED when this is True. Fail-open: a signal
     # with above_vwap=None (missing the field) is never blocked.
     require_above_vwap: bool = False
+    # QUALITY-GRADE GATE — "trade fewer, higher-quality setups". The per-signal setup
+    # grade (A>=0.80, B>=0.65, C>=0.50, else F) is on the ready-signal snapshot; a signal
+    # scoring below this is a low-quality/chop setup. Every sub-threshold signal is
+    # shadow-logged (rule_type=quality_below) for measurement; entries are only SKIPPED
+    # when min_quality_score > 0. Fail-open: a signal with no quality_score is never
+    # blocked. NOTE: the grade rewards a clean impulse-pullback structure + RVOL, so it
+    # does NOT recognise a vertical catalyst RUNNER (those grade F) — this gate cuts
+    # chop, it does not select leading gainers.
+    min_quality_score: float = 0.0
     # UNIFIED ENTRY: run the fast path's shared anti-chase gates (over_extended,
     # day-extension, halt) on the LIVE auto path too. These previously ran ONLY on
     # the fast trigger path, leaving live auto entries unprotected (see the
@@ -210,6 +219,12 @@ class ExecutionSettings:
         def flag(key: str, default: str) -> bool:
             return values.get(key, default).strip().lower() in {"1", "true", "yes", "on"}
 
+        def _qfloat(v: str) -> float:
+            try:
+                return max(0.0, min(1.0, float(v)))
+            except (TypeError, ValueError):
+                return 0.0
+
         order_type = values.get("TRADING_ENTRY_ORDER_TYPE", "limit").strip().lower()
         if order_type not in {"limit", "market"}:
             order_type = "limit"
@@ -240,6 +255,7 @@ class ExecutionSettings:
             concentrate_top_n=int(values.get("TRADING_CONCENTRATE_TOP_N", "0")),
             max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
             require_above_vwap=flag("TRADING_REQUIRE_ABOVE_VWAP", "1"),
+            min_quality_score=_qfloat(values.get("TRADING_MIN_QUALITY_SCORE", "0.0")),
             unified_entry=flag("TRADING_UNIFIED_ENTRY", "1"),
             entry_fill_model=values.get("TRADING_ENTRY_FILL_MODEL", "resting"),
             liquidity_max_volume_pct=float(
@@ -695,6 +711,28 @@ class TradingExecutionService:
                 if enforced:
                     self._requested_symbols.add(symbol)  # don't re-evaluate every tick
                     continue
+
+            # QUALITY-GRADE gate — trade fewer, higher-quality setups. Shadow-logged
+            # always; entries only SKIPPED when min_quality_score > 0. Fail-open: a
+            # signal with no quality_score is never blocked.
+            qs = signal.get("quality_score")
+            if qs is not None and self.settings.min_quality_score > 0 and qs < self.settings.min_quality_score:
+                self.store.emit(
+                    RiskRuleTriggeredEvent(
+                        timestamp=datetime.now(),
+                        mode=self.mode,
+                        correlation_id=self.session_id,
+                        message=(f"{symbol} ready below quality gate "
+                                 f"(score {qs:.2f} < {self.settings.min_quality_score:.2f}) — skipped"),
+                        rule_type="quality_below",
+                        rule_value=float(qs),
+                        current_state={"symbol": symbol, "quality_score": float(qs),
+                                       "min": self.settings.min_quality_score},
+                        action_taken="skipped_entry",
+                    )
+                )
+                self._requested_symbols.add(symbol)  # don't re-evaluate every tick
+                continue
 
             # Anti-chase / halt gates on the LIVE auto path (the entry-path
             # unification — these ran ONLY on the fast trigger path before). The

@@ -67,11 +67,11 @@ class Clock:
 
 
 def emit_signal(store, symbol="GOOD", entry=14.0, stop=13.45,
-                above_vwap=None, vwap=None, day_open=None, cum_volume=None):
+                above_vwap=None, vwap=None, day_open=None, cum_volume=None, quality_score=0.7):
     signal_data = {
         "entry_price": entry,
         "stop_loss_price": stop,
-        "quality_score": 0.7,
+        "quality_score": quality_score,
     }
     if above_vwap is not None:
         signal_data["above_vwap"] = above_vwap
@@ -238,6 +238,29 @@ def test_vwap_gate_shadow_logs_but_allows_when_off(store):
     vb = [json.loads(e["payload_json"]) for e in store.query_events(event_type="risk_rule_triggered")
           if json.loads(e["payload_json"])["rule_type"] == "vwap_below"]
     assert len(vb) == 1 and vb[0]["action_taken"] == "shadow_logged"
+
+
+def test_quality_gate_skips_low_grade_when_enforced(store):
+    emit_signal(store, symbol="CHOP", quality_score=0.30)     # F-grade chop
+    service = make_service(store, min_quality_score=0.50)
+    created = service.request_approvals_for_ready_signals()
+    assert created == []                                      # entry skipped
+    assert query_approval_queue(store) == []
+    qb = [json.loads(e["payload_json"]) for e in store.query_events(event_type="risk_rule_triggered")
+          if json.loads(e["payload_json"])["rule_type"] == "quality_below"]
+    assert len(qb) == 1 and qb[0]["action_taken"] == "skipped_entry"
+
+
+def test_quality_gate_off_allows_low_grade(store):
+    emit_signal(store, symbol="CHOP", quality_score=0.30)
+    created = make_service(store, min_quality_score=0.0).request_approvals_for_ready_signals()
+    assert len(created) == 1                                  # gate off -> still enters
+
+
+def test_quality_gate_allows_at_or_above_threshold(store):
+    emit_signal(store, symbol="GOOD", quality_score=0.72)     # B-grade
+    created = make_service(store, min_quality_score=0.50).request_approvals_for_ready_signals()
+    assert len(created) == 1
 
 
 def test_vwap_gate_allows_above_vwap(store):
