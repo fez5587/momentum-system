@@ -7,6 +7,31 @@ from typing import Any
 import yaml
 from pydantic import BaseModel, ConfigDict
 
+# Ollama runs on the LAN host reached via EITHER the 127.0.0.1 netsh tunnel OR the direct
+# 192.168.1.5 — and which works FLIPS across WSL/host reboots (same landmine as the DB).
+# The two use DIFFERENT ports (tunnel 30069 -> direct 30068), so we probe known endpoints
+# and pick the first reachable, so enrichment self-heals on boot instead of silently failing.
+_OLLAMA_CANDIDATES = ("http://192.168.1.5:30068", "http://127.0.0.1:30069")
+
+
+def _ollama_ok(base: str) -> bool:
+    import urllib.request
+    try:
+        with urllib.request.urlopen(base.rstrip("/") + "/api/tags", timeout=2) as r:
+            return r.status == 200
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _resolve_ollama_host(host: str) -> str:
+    """Return the configured host if reachable, else the first reachable known endpoint."""
+    if _ollama_ok(host):
+        return host
+    for cand in _OLLAMA_CANDIDATES:
+        if cand != host and _ollama_ok(cand):
+            return cand
+    return host
+
 
 class SlippageConfig(BaseModel):
     base_spread_pct: float = 0.0015
@@ -197,7 +222,7 @@ class OllamaConfig(BaseModel):
 
         return cls(
             enabled=b("OLLAMA_ENABLED", False),
-            host=v.get("OLLAMA_HOST", cls.model_fields["host"].default),
+            host=_resolve_ollama_host(v.get("OLLAMA_HOST", cls.model_fields["host"].default)),
             model=v.get("OLLAMA_MODEL", cls.model_fields["model"].default),
             timeout_seconds=i("OLLAMA_TIMEOUT_SECONDS", 30),
             max_tokens=i("OLLAMA_MAX_TOKENS", 256),
