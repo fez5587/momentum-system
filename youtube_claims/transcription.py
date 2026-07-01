@@ -25,6 +25,7 @@ def _download_audio(video_id: str, out_dir: str) -> str | None:
     import yt_dlp
     tmpl = os.path.join(out_dir, f"{video_id}.%(ext)s")
     opts = {"format": config.YT_DLP_FORMAT, "outtmpl": tmpl, "quiet": True, "no_warnings": True,
+            "ffmpeg_location": config.FFMPEG_LOCATION,   # systemd PATH omits /usr/bin
             "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}]}
     with yt_dlp.YoutubeDL(opts) as ydl:
         ydl.download([f"https://www.youtube.com/watch?v={video_id}"])

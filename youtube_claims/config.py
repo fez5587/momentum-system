@@ -2,8 +2,14 @@
 secrets (YOUTUBE_API_KEY) come from .env only, never hard-coded."""
 
 import os
+import shutil
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+# yt-dlp's audio postprocessor needs the ffmpeg BINARY. The systemd user service runs with a
+# minimal PATH that omits /usr/bin, so pass the location explicitly instead of relying on PATH.
+_ff = shutil.which("ffmpeg")
+FFMPEG_LOCATION = os.getenv("YT_FFMPEG_LOCATION") or (os.path.dirname(_ff) if _ff else "/usr/bin")
 
 # load .env once (the same file the trading app uses; gitignored)
 try:
