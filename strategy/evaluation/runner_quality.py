@@ -28,8 +28,8 @@ from strategy.evaluation.quality import QualityScore, QualityThresholds
 
 def calculate_runner_quality(
     gap_pct: float,
-    velocity: float,
     vol_burst: float,
+    velocity: float,
     above_vwap: bool,
     catalyst_score: float = 0.0,
     data_quality: float = 1.0,

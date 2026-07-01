@@ -34,6 +34,7 @@ from strategy.evaluation.data_quality import calculate_data_quality_score
 from strategy.evaluation.levels import calculate_vwap, compute_key_levels
 from strategy.evaluation.structure import opening_range
 from strategy.evaluation.runner import detect_leading_gainer_runner
+from strategy.evaluation.runner_quality import calculate_runner_quality
 from strategy.evaluation.runner_propensity import runner_propensity
 from strategy.evaluation.volume_metrics import calculate_time_of_day_rvol
 from strategy.evaluation.vwap_pullback_entry import find_vwap_pullback_entry
@@ -622,6 +623,28 @@ def build_runner(con, limit=None, rebuild=False, cooldown=10):
     return built
 
 
+def _runner_grade_of(gap_pct, velocity, vol_burst, above_vwap) -> str:
+    """Recompute the runner-aware GRADE from a stored fire's components (exact — the
+    grade is a pure fn of these + catalyst, and catalyst is OFF live so cat=0). Lets
+    report/validate stratify conversion by grade WITHOUT a rebuild: the build_plan's
+    'attach the runner grade' realized analytically, since gap/velocity/burst/vwap are
+    all persisted on the setup_event."""
+    return calculate_runner_quality(
+        gap_pct=float(gap_pct or 0.0), vol_burst=float(vol_burst or 0.0),
+        velocity=float(velocity or 0.0), above_vwap=bool(above_vwap),
+        catalyst_score=0.0).grade
+
+
+def _runner_grade_rows(con):
+    """(grade, reached_1r, max_upside_60m) per run1 fire — for grade-stratified reads."""
+    rows = con.execute(
+        "SELECT se.gap_pct, se.impulse_pct, se.relative_volume, se.above_vwap_flag, "
+        "CASE WHEN l.reached_1r_before_minus_1r THEN 1 ELSE 0 END, l.max_upside_next_60m "
+        "FROM setup_events se JOIN outcome_labels l ON l.setup_id = se.setup_id "
+        "WHERE se.setup_version=?", [RUNNER_SETUP_VERSION]).fetchall()
+    return [(_runner_grade_of(r[0], r[1], r[2], r[3]), r[4], r[5]) for r in rows]
+
+
 def report_runner(con):
     n = con.execute("SELECT count(*) FROM setup_events WHERE setup_version=?",
                     [RUNNER_SETUP_VERSION]).fetchone()[0]
@@ -659,6 +682,16 @@ def report_runner(con):
             f"WHERE se.setup_version=? AND {cond}", [RUNNER_SETUP_VERSION]).fetchone()
         if r and r[0]:
             print(f"  [{label:22}] n={r[0]:4}  +1R={( r[1] or 0)*100:.0f}%")
+    # grade-stratified conversion (the "focus on A-quality runners" test): does a higher
+    # runner grade convert to a higher forward +1R rate, or is grade orthogonal to outcome?
+    grows = _runner_grade_rows(con)
+    print("\nBY RUNNER GRADE (recomputed, catalyst-OFF):")
+    for g in ("A", "B", "C", "F"):
+        sub = [x for x in grows if x[0] == g]
+        if sub:
+            r1 = sum(x[1] for x in sub) / len(sub)
+            up = _median([x[2] for x in sub]) or 0.0
+            print(f"  grade {g}: n={len(sub):4}  +1R={r1*100:.0f}%  median max-upside 60m={up*100:.1f}%")
     cmp = con.execute(
         "WITH rn AS (SELECT DISTINCT symbol, session_date FROM setup_events WHERE setup_version=?) "
         "SELECT avg(CASE WHEN l.reached_1r_before_minus_1r THEN 1.0 ELSE 0 END), count(*) "
@@ -729,6 +762,15 @@ def validate_runner(con):
     print(f"  (4) beat vwap_reclaim +1R: runner {rate_1r*100:.0f}% vs vr {vr_rate*100:.0f}% (n={vr_n})  -> [{mark(p_beat)}]")
     print(f"  (5) PM-exhaustion tag earns keep: fresh +1R {rate_fresh*100:.0f}% > all {rate_1r*100:.0f}%  -> [{mark(p_pm)}]")
     print(f"  OVERALL: [{mark(p_up and p_dd and p_1r and p_beat and p_pm)}]")
+    # does restricting to A/B-graded fires salvage the bar? (the "focus on A-quality" test)
+    grows = _runner_grade_rows(con)
+    ab = [x for x in grows if x[0] in ("A", "B")]
+    if ab:
+        ab_1r = sum(x[1] for x in ab) / len(ab)
+        ab_up = _median([x[2] for x in ab]) or 0.0
+        p_ab = ab_1r > RUNNER_PROMO_MIN_1R and ab_up >= RUNNER_PROMO_MEDIAN_FWDMAX_60M
+        print(f"  A/B-subset (n={len(ab)}): +1R {ab_1r*100:.0f}% (>{RUNNER_PROMO_MIN_1R*100:.0f}%?), "
+              f"median max-upside 60m {ab_up*100:.1f}% (>={RUNNER_PROMO_MEDIAN_FWDMAX_60M*100:.0f}%?)  -> [{mark(p_ab)}]")
     print("  NOTE: bar locked 2026-06-30 BEFORE forward data. In-sample fires are a HYPOTHESIS, "
           "not a pass — only OUT-OF-SAMPLE sessions can clear it. Do NOT gate live until cleared.")
 
