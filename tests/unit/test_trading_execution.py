@@ -460,6 +460,52 @@ def test_unfilled_entry_is_armed_then_times_out(store):
     assert service._armed == {}
 
 
+def test_late_confirmation_skips_signal(store):
+    # Confirmation-speed gate: the signal went ready at T0=09:45 (minute 15 of the
+    # session); with the gate at 10 minutes it must be SKIPPED and shadow-logged,
+    # never executed. This is the backtested +EV filter (early confirms +0.42R,
+    # late confirms dead).
+    emit_signal(store)                                   # ready at T0 = minute 15
+    executor = FakeExecutor()
+    service = make_service(store, executor, auto_approve=True,
+                           entry_confirm_by_minute=10)
+    service.tick()
+    assert executor.executed == []                       # never reached the broker
+    rejects = store.query_events(event_type="risk_rule_triggered")
+    assert any(json.loads(r["payload_json"]).get("rule_type") == "late_confirmation"
+               for r in rejects)
+
+
+def test_early_confirmation_passes(store):
+    # same signal, gate at 20 minutes -> minute-15 confirmation is fine
+    emit_signal(store)
+    executor = FakeExecutor()
+    service = make_service(store, executor, auto_approve=True,
+                           entry_confirm_by_minute=20)
+    service.tick()
+    assert len(executor.executed) == 1
+
+
+def test_confirmation_gate_off_by_default(store):
+    emit_signal(store)
+    executor = FakeExecutor()
+    service = make_service(store, executor, auto_approve=True)   # gate default 0 = off
+    service.tick()
+    assert len(executor.executed) == 1
+
+
+def test_fast_path_blocks_late_breakout(store):
+    # the live trigger path uses now() as the confirmation time
+    executor = FakeExecutor()
+    clock = Clock(datetime(2026, 6, 11, 11, 0))          # 11:00 = minute 90
+    service = make_service(store, executor, now_fn=clock, entry_confirm_by_minute=15)
+    out = service.submit_breakout_now("GOOD", trigger=14.0, stop=13.45, last_price=14.01)
+    assert out.get("skipped") == "late_confirmation"
+    clock.t = datetime(2026, 6, 11, 9, 40)               # minute 10 -> inside the window
+    out2 = service.submit_breakout_now("GOOD", trigger=14.0, stop=13.45, last_price=14.01)
+    assert out2.get("skipped") != "late_confirmation"
+
+
 def test_backed_out_unfilled_entry_frees_its_cap_slot(store):
     # Behavior fix: the daily cap counts FILLS, not submissions. Two resting entries consume
     # the cap, but when they back out UNFILLED their slots are freed (the 2026-07-01/02 bug

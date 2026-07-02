@@ -96,6 +96,15 @@ class ExecutionSettings:
     # does NOT recognise a vertical catalyst RUNNER (those grade F) — this gate cuts
     # chop, it does not select leading gainers.
     min_quality_score: float = 0.0
+    # CONFIRMATION-SPEED GATE — the one backtested POSITIVE-EV filter (2026-07-02,
+    # 6217 ORB setups, adversarially verified across 3 seeds): setups whose breakout
+    # CONFIRMS within ~10 bars of the open run +1R 71% / +0.42R expectancy — even
+    # C-grade ones — while late-confirming setups are dead regardless of grade
+    # (bar-26+: 9% +1R, -0.81R; time-of-day expectancy decays monotonically to
+    # -0.94R late-day). Minutes after the 09:30 open by which a signal must have
+    # gone READY to be tradeable; later signals (incl. midday re-triggers) are
+    # skipped + shadow-logged (rule_type=late_confirmation). 0 = disabled.
+    entry_confirm_by_minute: int = 0
     # UNIFIED ENTRY: run the fast path's shared anti-chase gates (over_extended,
     # day-extension, halt) on the LIVE auto path too. These previously ran ONLY on
     # the fast trigger path, leaving live auto entries unprotected (see the
@@ -256,6 +265,7 @@ class ExecutionSettings:
             max_fresh_entries_per_day=int(values.get("TRADING_MAX_FRESH_ENTRIES_PER_DAY", "0")),
             require_above_vwap=flag("TRADING_REQUIRE_ABOVE_VWAP", "1"),
             min_quality_score=_qfloat(values.get("TRADING_MIN_QUALITY_SCORE", "0.0")),
+            entry_confirm_by_minute=int(values.get("TRADING_ENTRY_CONFIRM_BY_MINUTE", "0")),
             unified_entry=flag("TRADING_UNIFIED_ENTRY", "1"),
             entry_fill_model=values.get("TRADING_ENTRY_FILL_MODEL", "resting"),
             liquidity_max_volume_pct=float(
@@ -637,6 +647,29 @@ class TradingExecutionService:
             )
         )
 
+    def _confirm_minute_of(self, ts) -> float | None:
+        """Minutes after the 09:30 session open that `ts` (a ready/confirmation time)
+        landed. None if unparseable (fail-open — never block on missing data)."""
+        if ts is None:
+            return None
+        try:
+            if isinstance(ts, str):
+                ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            if ts.tzinfo is not None:            # store times are local-naive; normalize
+                ts = ts.astimezone().replace(tzinfo=None)
+            open_dt = ts.replace(hour=9, minute=30, second=0, microsecond=0)
+            return (ts - open_dt).total_seconds() / 60.0
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _late_confirmation(self, ts) -> bool:
+        """True when the confirmation-speed gate is ON and `ts` confirmed too late."""
+        limit = self.settings.entry_confirm_by_minute
+        if limit <= 0:
+            return False
+        m = self._confirm_minute_of(ts)
+        return m is not None and m > limit
+
     def request_approvals_for_ready_signals(self) -> list[str]:
         """Turn fresh ready signals into approval requests. Returns order ids."""
         if not self.settings.enabled:
@@ -682,6 +715,28 @@ class TradingExecutionService:
             entry = signal.get("entry_price")
             stop = signal.get("stop_loss_price")
             if not entry or not stop or stop >= entry:
+                continue
+
+            # CONFIRMATION-SPEED gate — the one backtested +EV filter: only setups
+            # whose breakout confirmed EARLY convert (+0.42R by ~bar 10); late
+            # confirmations and midday re-triggers are dead (-0.8R). Skip + log.
+            if self._late_confirmation(signal.get("timestamp")):
+                self.store.emit(
+                    RiskRuleTriggeredEvent(
+                        timestamp=datetime.now(),
+                        mode=self.mode,
+                        correlation_id=self.session_id,
+                        message=(f"{symbol} ready too late "
+                                 f"(confirm minute {self._confirm_minute_of(signal.get('timestamp')):.0f}"
+                                 f" > {self.settings.entry_confirm_by_minute}) — skipped"),
+                        rule_type="late_confirmation",
+                        rule_value=float(self.settings.entry_confirm_by_minute),
+                        current_state={"symbol": symbol,
+                                       "ready_at": str(signal.get("timestamp"))},
+                        action_taken="skipped_entry",
+                    )
+                )
+                self._requested_symbols.add(symbol)   # don't re-log every tick
                 continue
 
             # VWAP selection gate — the one validated entry-quality signal (above-
@@ -963,6 +1018,10 @@ class TradingExecutionService:
             return {"ok": False, "skipped": "halted"}
         if self._open_position_count() >= self.settings.max_concurrent_positions:
             return {"ok": False, "skipped": "max_positions"}
+        # CONFIRMATION-SPEED gate (same as the auto path): a live trigger fires in
+        # near-real-time, so now() IS the confirmation time. Late breaks are dead.
+        if self._late_confirmation(self._now()):
+            return {"ok": False, "skipped": "late_confirmation"}
 
         # CONCENTRATE-BY-RANK: only the top-N armed names may enter, and risk is
         # scaled down by rank. Stops the equal-size spray across mediocre gappers
