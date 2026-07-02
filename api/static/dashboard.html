@@ -506,8 +506,46 @@
     <summary><h2>Order Lifecycle <span id="ol-count" class="count">0</span></h2></summary>
     <div id="order-lifecycle"></div>
   </details>
+
+  <details class="panel full" id="p-attrib">
+    <summary><h2>Component Attribution <span class="hint">per-stage ratings: discovery &rarr; signals (early vs late) &rarr; gates &rarr; execution &rarr; P&amp;L &middot; loads on open</span></h2></summary>
+    <div id="attrib"><span class="empty">Open to load the last 7 days.</span></div>
+  </details>
 </main>
 <script>
+(function(){
+  // Component Attribution — lazy-load on first open (it queries the event store)
+  var ap = document.getElementById('p-attrib'), loadedAttrib = false;
+  function esc(s){ return String(s == null ? '' : s).replace(/[&<>]/g, function(c){ return {'&':'&amp;','<':'&lt;','>':'&gt;'}[c]; }); }
+  function renderAttrib(a){
+    var days = Object.keys(a.days || {}).sort().reverse();
+    if (!days.length) { document.getElementById('attrib').innerHTML = '<span class="empty">No events in window.</span>'; return; }
+    var h = '<table><tr><th>day</th><th>disc</th><th>ready</th><th>early%</th><th>gate cuts</th><th>subm</th><th>fill%</th><th>trades</th><th>win%</th><th>P&amp;L</th></tr>';
+    days.forEach(function(d){
+      var st = a.days[d], c = st.counts || {}, r = st.rating || {}, oc = st.outcomes || {};
+      var gates = Object.entries(st.gates || {}).sort(function(x, y){ return y[1] - x[1]; })
+        .map(function(kv){ return esc(kv[0]) + '&times;' + kv[1]; }).join(', ');
+      var pnl = (r.pnl == null) ? '-' : ('$' + (r.pnl >= 0 ? '+' : '') + r.pnl.toFixed(0));
+      var cls = (r.pnl == null) ? '' : (r.pnl >= 0 ? ' style="color:#2f9e44"' : ' style="color:#e03131"');
+      h += '<tr title="' + gates + '"><td>' + d + '</td><td>' + (c.symbol_discovered || 0) + '</td><td>' + (c.signal_ready || 0) +
+           '</td><td>' + (r.signals_early_pct == null ? '-' : r.signals_early_pct + '%') +
+           '</td><td>' + Object.values(st.gates || {}).reduce(function(s, v){ return s + v; }, 0) +
+           '</td><td>' + (c.order_submitted || 0) +
+           '</td><td>' + (r.fill_efficiency_pct == null ? '-' : r.fill_efficiency_pct + '%') +
+           '</td><td>' + (oc.trades || 0) + '</td><td>' + (r.win_rate_pct == null ? '-' : r.win_rate_pct + '%') +
+           '</td><td' + cls + '>' + pnl + '</td></tr>';
+    });
+    h += '</table><div class="hint" style="margin-top:6px">early% = ready signals inside the ' + a.confirm_minute + 'm confirmation window (the only +EV ones) &middot; hover a row for its gate histogram</div>';
+    document.getElementById('attrib').innerHTML = h;
+  }
+  if (ap) ap.addEventListener('toggle', function(){
+    if (!ap.open || loadedAttrib) return;
+    loadedAttrib = true;
+    document.getElementById('attrib').innerHTML = '<span class="empty">Loading…</span>';
+    fetch('/api/attribution?days=7').then(function(r){ return r.json(); }).then(renderAttrib)
+      .catch(function(e){ document.getElementById('attrib').innerHTML = '<span class="empty">failed: ' + esc(e) + '</span>'; loadedAttrib = false; });
+  });
+})();
 (function(){
   // Collapsible panels — remember each panel's open/closed state across refreshes,
   // and an expand/collapse-all toggle. Pure UI; the live app JS keys off the inner ids.

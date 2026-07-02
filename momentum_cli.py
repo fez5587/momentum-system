@@ -716,6 +716,26 @@ def _render_board(con):
         rk.add_row(str(ts)[11:19], rule)
 
     n_eval = len(_latest_eval_board(con))
+    # component-attribution pulse: today's signal timing (early = inside the
+    # confirmation window, the only +EV ones) + what each gate cut. Two tiny
+    # date-scoped queries; full history lives at /api/attribution + the CLI.
+    from datetime import date as _date
+    _today = _date.today().isoformat()
+    gates: dict = {}
+    for (pj,) in con.execute(
+            "SELECT payload_json FROM events WHERE event_type='risk_rule_triggered' "
+            "AND timestamp >= ?", [_today]).fetchall():
+        rt = (json.loads(pj or "{}").get("rule_type")) or "?"
+        gates[rt] = gates.get(rt, 0) + 1
+    early = late = 0
+    for (ts,) in con.execute(
+            "SELECT timestamp FROM events WHERE event_type='signal_ready' "
+            "AND timestamp >= ?", [_today]).fetchall():
+        m = (ts.hour - 9) * 60 + ts.minute - 30
+        early, late = (early + 1, late) if 0 <= m <= 15 else (early, late + 1)
+    gate_bits = ", ".join(f"{k}×{v}" for k, v in sorted(gates.items(), key=lambda x: -x[1])[:4])
+    attrib_line = (f"\n[dim]signals {early} early / {late} late · gates: "
+                   f"{gate_bits or 'none yet'}[/dim]")
     # naked/under-protected alarm — the failure that cost us this session and the
     # board never showed. A red banner the instant a held long lacks stop coverage.
     naked = _unprotected_positions(con)
@@ -731,7 +751,7 @@ def _render_board(con):
         f"day P&L [bold {dcol}]{day_pnl:+,.0f}[/]   "
         f"[{hb_color}]♥ {hb_text}[/{hb_color}]   "
         f"[bold cyan]{armed_n} armed[/bold cyan] · {n_eval} scan"
-        f"{naked_line}",
+        f"{attrib_line}{naked_line}",
         style="red" if naked else "cyan")
     # order = safety-first: header (protected? green? live?) → armed (about to fire?) →
     # risk/circuit-breaker (promoted above trades, it's a safety surface) → trades log.

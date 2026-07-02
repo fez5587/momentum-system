@@ -391,6 +391,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 symbol = (q.get("symbol") or [""])[0]
                 minutes = int((q.get("minutes") or ["60"])[0])
                 self._send_json(self.state.bars(symbol, minutes))
+            elif route == "/api/attribution":
+                # per-component stage ratings (research/attribution.py); computed on
+                # demand — a handful of indexed event queries, fine per click
+                from research.attribution import compute_attribution
+                days = int((self._query().get("days") or ["7"])[0])
+                self._send_json(compute_attribution(days=days))
             elif route == "/api/health":
                 self._send_json({"ok": True, "mode": self.state.execution_mode})
             else:
