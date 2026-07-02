@@ -54,6 +54,18 @@ def _metrics(con) -> dict:
 
 def main() -> None:
     con = open_research_db("market")
+    # upgrade today's bars to the SIP consolidated tape first (live ingest is IEX-only,
+    # ~2-5% of true volume) so the pm1 rebuild + every downstream signal sees real volume
+    try:
+        from alpaca_paper.client import AlpacaPaperClient
+        from alpaca_paper.settings import AlpacaPaperSettings
+        from datetime import date as _date
+        from research.sip_backfill import refetch_minute_session
+        _client = AlpacaPaperClient(AlpacaPaperSettings.from_env())
+        n, rows = refetch_minute_session(con, _client, _date.today())
+        print(f"SIP refetch today: {n} symbols -> {rows} rows")
+    except Exception as exc:  # noqa: BLE001 — never let the refetch break the eval
+        print(f"SIP refetch skipped: {exc}")
     labeler.build_premarket(con, rebuild=True)          # rebuild from the grown DB
     m = _metrics(con)
     ts = datetime.now(timezone.utc).isoformat(timespec="seconds")

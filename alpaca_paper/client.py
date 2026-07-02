@@ -397,9 +397,13 @@ class AlpacaPaperClient:
         return payload.get("news") or []
 
     def get_daily_bars(
-        self, symbols: list[str], start_iso: str, end_iso: str | None = None
+        self, symbols: list[str], start_iso: str, end_iso: str | None = None,
+        feed: str | None = None,
     ) -> dict[str, list[dict]]:
-        """Daily bars, batching symbols (cap-safe) + following pagination."""
+        """Daily bars, batching symbols (cap-safe) + following pagination.
+
+        `feed`: None -> settings.feed (iex on free keys, ~2-5% of true volume).
+        Pass "sip" for consolidated-tape volume (free keys allow historical SIP)."""
         all_bars: dict[str, list[dict]] = {}
         for chunk in self._chunked(symbols, 100):
             page_token = None
@@ -413,7 +417,7 @@ class AlpacaPaperClient:
                         "start": start_iso,
                         "end": end_iso,
                         "limit": 10_000,
-                        "feed": self.settings.feed,
+                        "feed": feed or self.settings.feed,
                         "adjustment": "raw",
                         "page_token": page_token,
                     },
