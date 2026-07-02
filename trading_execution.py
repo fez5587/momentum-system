@@ -900,6 +900,8 @@ class TradingExecutionService:
             and isinstance(self._fresh_entries.get("n"), int)
         ):
             self._fresh_entries["n"] += 1   # count toward the per-day cap
+            if order_id in self._armed:      # a resting limit -> free the slot if it backs out
+                self._armed[order_id]["counted"] = True
         return {
             "ok": result.ok,
             "order_id": order_id,
@@ -1105,6 +1107,8 @@ class TradingExecutionService:
         if result.ok and self.settings.max_fresh_entries_per_day > 0:
             if isinstance(self._fresh_entries.get("n"), int):
                 self._fresh_entries["n"] += 1   # count toward the per-day cap
+                if request.order_id in self._armed:
+                    self._armed[request.order_id]["counted"] = True
         logger.info(
             "live ORB break %s qty=%s -> ok=%s status=%s rank=%s",
             symbol, request.quantity, result.ok, result.status, rank,
@@ -1380,6 +1384,16 @@ class TradingExecutionService:
             ))
         self._prev_held = held
 
+    def _release_cap_slot(self, armed: dict | None) -> None:
+        """Free a per-day cap slot for an entry that consumed one but backed out UNFILLED.
+        This makes the cap count FILLS, not submissions: an unfilled/canceled limit no longer
+        permanently burns a slot (the 2026-07-01/07-02 bug where 2 phantom entries capped the
+        day). Fills keep their slot (their armed dict is popped without calling this)."""
+        if (armed and armed.get("counted")
+                and isinstance(self._fresh_entries.get("n"), int)
+                and self._fresh_entries["n"] > 0):
+            self._fresh_entries["n"] -= 1
+
     def expire_stale_entries(self) -> list[dict]:
         """Back out of unfilled entries that timed out or broke their trigger.
 
@@ -1423,7 +1437,7 @@ class TradingExecutionService:
                 self._armed.pop(order_id, None)
                 continue
             if order_id in cancelled:
-                self._armed.pop(order_id, None)
+                self._release_cap_slot(self._armed.pop(order_id, None))  # unfilled -> free slot
                 self._requested_symbols.discard(symbol)
                 continue
             # FILLED at the broker (position open) -> stop tracking, NEVER cancel
@@ -1484,6 +1498,7 @@ class TradingExecutionService:
                         action_taken="cancelled_unfilled_entry",
                     )
                 )
+                self._release_cap_slot(armed)   # backed out unfilled -> free the cap slot
                 self._armed.pop(order_id, None)
                 self._requested_symbols.discard(symbol)
                 actions.append({"order_id": order_id, "symbol": symbol,

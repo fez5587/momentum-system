@@ -460,6 +460,29 @@ def test_unfilled_entry_is_armed_then_times_out(store):
     assert service._armed == {}
 
 
+def test_backed_out_unfilled_entry_frees_its_cap_slot(store):
+    # Behavior fix: the daily cap counts FILLS, not submissions. Two resting entries consume
+    # the cap, but when they back out UNFILLED their slots are freed (the 2026-07-01/02 bug
+    # where phantom unfilled limits capped the day after only a few real trades).
+    for sym, e, s in [("AAA", 14.0, 13.45), ("BBB", 8.0, 7.60), ("CCC", 5.0, 4.70)]:
+        emit_signal(store, symbol=sym, entry=e, stop=s)
+    executor = FakeExecutor(status="accepted")   # resting limits, never fill
+    clock = Clock()
+    service = make_service(store, executor, auto_approve=True, now_fn=clock,
+                           max_fresh_entries_per_day=2, max_concurrent_positions=10,
+                           max_orders_per_tick=10, entry_timeout_bars=2, entry_invalidate_pct=-1.0)
+    service.request_approvals_for_ready_signals()
+    ids = [q["order_id"] for q in query_approval_queue(store)]
+    results = [service.approve_order(oid, approved_by="auto") for oid in ids]
+    assert service._fresh_entries["n"] == 2                     # 2 armed+counted, cap hit
+    assert sum(1 for r in results if r.get("rejected")) == 1    # 3rd was cap-rejected
+    assert len(service._armed) == 2
+    clock.advance(3)                                            # both time out unfilled
+    service.expire_stale_entries()
+    assert service._armed == {}
+    assert service._fresh_entries["n"] == 0                     # <-- the fix: slots freed
+
+
 def test_fast_guard_does_not_shorten_timeout(store):
     """Checking many times a second must not trip the wall-clock timeout early."""
     emit_signal(store)
