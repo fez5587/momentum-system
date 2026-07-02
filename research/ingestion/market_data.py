@@ -112,6 +112,37 @@ def upsert_minute_bars(
     return len(rows)
 
 
+def refresh_rolling_volume(con, symbol: str | None = None) -> int:
+    """(Re)compute daily_bars.rolling_avg_volume_20d from raw daily volume.
+
+    The column was NULL for every row ever ingested (upsert_daily_bars never set it),
+    which silently weakened everything downstream: scan_gappers RVOL, the quality
+    gate's relative_volume component, and the labeler baselines all fell back to
+    within-session proxies. Value = average of the PRIOR 20 sessions (excluding the
+    row itself, so it's knowable at that day's open), requires >=5 prior sessions.
+    Called per-symbol after each upsert so new rows stay populated; symbol=None
+    backfills the whole table (one-off)."""
+    scope = "AND d.symbol = ?" if symbol else ""
+    params = [symbol] if symbol else []
+    cur = con.execute(
+        f"""
+        UPDATE daily_bars d SET rolling_avg_volume_20d = s.avg20
+        FROM (
+            SELECT symbol, trade_date,
+                   AVG(volume) OVER w AS avg20,
+                   COUNT(volume) OVER w AS cnt
+            FROM daily_bars
+            WINDOW w AS (PARTITION BY symbol ORDER BY trade_date
+                         ROWS BETWEEN 20 PRECEDING AND 1 PRECEDING)
+        ) s
+        WHERE d.symbol = s.symbol AND d.trade_date = s.trade_date
+          AND s.cnt >= 5 {scope}
+        """,
+        params,
+    )
+    return getattr(cur, "rowcount", 0) or 0
+
+
 def upsert_daily_bars(con, symbol: str, bars: list[dict]) -> int:
     """Insert/replace Alpaca daily bars, deriving previous_close per row."""
     ordered = sorted(bars, key=lambda b: b["t"])
@@ -149,6 +180,11 @@ def upsert_daily_bars(con, symbol: str, bars: list[dict]) -> int:
         """,
         rows,
     )
+    # keep the 20d rolling volume live for this symbol (see refresh_rolling_volume)
+    try:
+        refresh_rolling_volume(con, symbol)
+    except Exception:  # noqa: BLE001 — never let a stats refresh break ingestion
+        pass
     return len(rows)
 
 
