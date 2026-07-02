@@ -1,7 +1,8 @@
 """Pure-helper tests for the claim extractor — the anti-hallucination quote match + chunking.
 The Ollama call itself is integration-tested live (not mocked here)."""
 
-from youtube_claims.extraction import _chunks, _norm, _normalize, _quote_supported
+from youtube_claims.extraction import (
+    _chunks, _clean_ticker, _norm, _normalize, _quote_supported)
 
 
 def test_norm_collapses_whitespace():
@@ -24,6 +25,23 @@ def test_normalize_drops_claim_without_verbatim_quote():
     assert _normalize({"asset_ticker": "aapl", "verbatim_quote": ""}, 0, 6) is None
     ok = _normalize({"asset_ticker": "aapl", "verbatim_quote": "aapl broke out"}, 0, 6)
     assert ok and ok["asset_ticker"] == "AAPL" and ok["timestamp_start"] == 0
+
+
+def test_clean_ticker_coerces_nullish_and_spacing():
+    assert _clean_ticker("NULL") is None and _clean_ticker("none") is None
+    assert _clean_ticker("$AAPL") == "AAPL"
+    assert _clean_ticker("B VC") == "BVC"          # ASR space-mangling
+    assert _clean_ticker("") is None
+
+
+def test_asset_specific_filter_drops_generic_commentary():
+    # a "NULL"-ticker generic tutorial line with no asset is dropped
+    generic = {"asset_ticker": "NULL", "asset_name": None, "verbatim_quote": "buy the dip"}
+    assert _normalize(generic, 0, 6) is None
+    # a real asset claim survives, ticker cleaned
+    real = {"asset_ticker": "null", "asset_name": "Apple", "verbatim_quote": "apple broke out"}
+    keep = _normalize(real, 0, 6)
+    assert keep and keep["asset_ticker"] is None and keep["asset_name"] == "Apple"
 
 
 def test_chunks_group_segments_with_time_span():

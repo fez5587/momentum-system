@@ -80,14 +80,35 @@ def _chunks(segments: list[dict], max_chars: int = 8000):
         yield buf, start, buf[-1][0].get("end")
 
 
-def _normalize(c: dict, win_start, win_end) -> dict | None:
+_NULLISH = {"", "NULL", "NONE", "N/A", "NA", "-", "--", "UNKNOWN", "TBD", "IT", "THE STOCK"}
+
+
+def _clean_ticker(raw) -> str | None:
+    """The LLM sometimes returns the literal string 'NULL' or a space-mangled ASR ticker
+    ('B VC'); coerce those to a real None / contiguous symbol."""
+    t = (raw or "").strip().upper().lstrip("$")
+    if t in _NULLISH:
+        return None
+    t = t.replace(" ", "")               # 'B VC' -> 'BVC' (tickers are single tokens)
+    return t or None
+
+
+def _clean_name(raw) -> str | None:
+    n = (raw or "").strip()
+    return None if (not n or n.upper() in _NULLISH) else n
+
+
+def _normalize(c: dict, win_start, win_end, require_asset: bool = True) -> dict | None:
     vq = (c.get("verbatim_quote") or "").strip()
     if not vq:
         return None                      # mandatory — drop unsupported claims
-    tkr = (c.get("asset_ticker") or "").strip().upper() or None
+    tkr = _clean_ticker(c.get("asset_ticker"))
+    name = _clean_name(c.get("asset_name"))
+    if require_asset and not tkr and not name:
+        return None                      # not an asset-specific claim (generic commentary)
     return {
         "asset_ticker": tkr,
-        "asset_name": (c.get("asset_name") or None),
+        "asset_name": name,
         "asset_class": (c.get("asset_class") or None),
         "direction": (c.get("direction") or None),
         "claim_text": (c.get("claim_text") or None),
