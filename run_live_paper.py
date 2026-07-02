@@ -150,6 +150,17 @@ def build_runtime(args: argparse.Namespace) -> dict:
     event_db = os.environ.get("WATCHER_EVENT_DB_PATH", "momentum")
     store = EventStore(event_db)
     research_con = open_research_db("market")
+    # NBBO quote-size snapshots for tracked/held names — the free proxy for order-book
+    # depth imbalance (the trader's "big seller at $6" read). Recording-only; a shadow
+    # study consumes it later. See step_quotes.
+    research_con.execute(
+        """CREATE TABLE IF NOT EXISTS quote_snapshots (
+               symbol TEXT NOT NULL,
+               ts TIMESTAMPTZ NOT NULL DEFAULT now(),
+               bid_price DOUBLE PRECISION, bid_size DOUBLE PRECISION,
+               ask_price DOUBLE PRECISION, ask_size DOUBLE PRECISION)""")
+    research_con.execute(
+        "CREATE INDEX IF NOT EXISTS quote_snaps_sym_ts ON quote_snapshots(symbol, ts)")
 
     session_id = f"paper-{_now_session_date().isoformat()}-{uuid.uuid4().hex[:6]}"
 
@@ -750,6 +761,35 @@ def main(argv: list[str] | None = None) -> int:
         n_news = sum(1 for c in candidates if c.get("catalyst"))
         return f"tracking={len(book.triggers)} armed={armed}" + (f" news={n_news}" if n_news else "")
 
+    def step_quotes():
+        """Record NBBO bid/ask SIZES for tracked + held names (order-book-imbalance
+        proxy — full L2 depth needs a paid feed; NBBO sizes are the free approximation).
+        Recording only, zero trading impact; premarket included (that's where the
+        edge data lives). A future shadow study tests ask/bid-size imbalance as a
+        pop-vs-fade predictor."""
+        syms = set(book.triggers.keys())
+        if rt["execution"] is not None:
+            try:
+                syms |= set(rt["execution"]._held_symbols())
+            except Exception:  # noqa: BLE001
+                pass
+        if not syms:
+            return None
+        try:
+            quotes = client.get_latest_quotes(sorted(syms))
+        except Exception as exc:  # noqa: BLE001
+            return f"quotes fetch failed: {exc}"
+        n = 0
+        for sym, q in (quotes or {}).items():
+            if not q:
+                continue
+            rt["research_con"].execute(
+                "INSERT INTO quote_snapshots (symbol, bid_price, bid_size, ask_price, ask_size) "
+                "VALUES (?, ?, ?, ?, ?)",
+                [sym, q.get("bp"), q.get("bs"), q.get("ap"), q.get("as")])
+            n += 1
+        return f"{n} quotes ({len(syms)} names)"
+
     # The trigger runs on its OWN thread, not the scheduler, so a slow ingest
     # can never freeze breakout detection. It only touches the (thread-safe)
     # book, execution service, and event store — never research_con.
@@ -1018,6 +1058,8 @@ def main(argv: list[str] | None = None) -> int:
                   enabled=_flag("TRIGGER_ENABLED", "1"))
     scheduler.add("sync", step_sync, float(os.environ.get("ALPACA_PAPER_SYNC_INTERVAL_SECONDS", "60")),
                   enabled=_flag("ALPACA_PAPER_SYNC_ENABLED", "1"))
+    scheduler.add("quotes", step_quotes, float(os.environ.get("QUOTE_SNAPSHOT_INTERVAL_SECONDS", "15")),
+                  enabled=_flag("QUOTE_SNAPSHOT_ENABLED", "1"))
     scheduler.add("execute", step_execute, float(os.environ.get("TRADING_EXECUTION_INTERVAL_SECONDS", "30")),
                   enabled=_flag("TRADING_EXECUTION_ENABLED", "1"))
     scheduler.add("guard", step_guard, float(os.environ.get("TRADING_ENTRY_GUARD_INTERVAL_SECONDS", "5")),
