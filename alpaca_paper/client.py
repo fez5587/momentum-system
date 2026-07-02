@@ -361,6 +361,19 @@ class AlpacaPaperClient:
         )
         return payload.get("most_actives") or []
 
+    def get_movers(self, top: int = 15) -> list[dict]:
+        """Top %-change gainers (the 'wildcard' movers). Ranked by PERCENT change, not
+        share volume — a thin reverse-split name squeezing on a headline (CX on
+        2026-07-02: $3->$6, the source trader's whole day, invisible to
+        most-actives-by-volume) shows up here and nowhere else.
+        Items: {symbol, percent_change, change, price}."""
+        payload = self._data(
+            "GET",
+            "/v1beta1/screener/stocks/movers",
+            params={"top": top},
+        )
+        return payload.get("gainers") or []
+
     def get_news(
         self,
         symbols: list[str] | None = None,

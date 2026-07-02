@@ -273,9 +273,24 @@ def discover_active_symbols(
     static symbol list.
     """
     try:
+        # WILDCARD movers first: top %-GAINERS regardless of absolute share volume.
+        # A thin name squeezing on a headline (CX 2026-07-02: $3->$6, the source
+        # trader's entire day) never cracks a volume-ranked top-N — this is the feed
+        # that sees it. Discovery/ingestion only; every trading gate still applies.
+        gainers: list[str] = []
+        try:
+            for g in client.get_movers(top=15):
+                sym = (g.get("symbol") or "").strip()
+                # drop warrants/units/rights noise (BKSY.WS, EVLVW-style)
+                if not sym or "." in sym or (len(sym) >= 5 and sym.endswith("W")):
+                    continue
+                gainers.append(sym)
+        except Exception:  # noqa: BLE001 — movers is additive; actives still work
+            pass
         # Alpaca caps the most-actives `top` at 100; never request more.
         actives = client.get_most_actives(top=min(top * 3, 100), by="volume")
-        symbols = [a["symbol"] for a in actives if a.get("symbol")]
+        symbols = list(dict.fromkeys(
+            gainers + [a["symbol"] for a in actives if a.get("symbol")]))
         if not symbols:
             return []
         trades = client.get_latest_trades(symbols)  # batched internally; price them all
